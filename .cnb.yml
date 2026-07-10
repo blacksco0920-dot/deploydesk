@@ -6,6 +6,8 @@ $:
       image: node:22-slim
     env:
       ABCDEPLOY_SERVER_FINGERPRINT: SHA256:HEb1XRqWqz7adPpLS99kCz9tReGnsnV+62BNKxXaAiI
+      ABCDEPLOY_PILOT_SERVER_HOST: abcdeploy.finagent.cloud
+      ABCDEPLOY_PILOT_SERVER_USER: ubuntu
       DEPLOYDESK_ENV: production
     imports:
     - https://cnb.cool/blacksco0920/finagent-secrets/-/blob/main/envs.yml
@@ -65,9 +67,9 @@ $:
           printf 'DEPLOYDESK_SITE_IMAGE=%s\n' "${DEPLOYDESK_SITE_IMAGE}"
         } > "$RUNTIME_DIRECTORY/.release.env"
         chmod 600 "$RUNTIME_DIRECTORY/.release.env"
-        SERVER_HOST="${PRODUCTION_SERVER_HOST:-${SERVER_HOST:-}}"
+        SERVER_HOST="${ABCDEPLOY_PILOT_SERVER_HOST:-${PRODUCTION_SERVER_HOST:-${SERVER_HOST:-}}}"
         SERVER_PORT="${PRODUCTION_SERVER_PORT:-${SERVER_PORT:-22}}"
-        SERVER_USER="${PRODUCTION_SERVER_USER:-${SERVER_USER:-}}"
+        SERVER_USER="${ABCDEPLOY_PILOT_SERVER_USER:-${PRODUCTION_SERVER_USER:-${SERVER_USER:-}}}"
         SERVER_SSH_KEY="${PRODUCTION_SERVER_SSH_KEY:-${SERVER_SSH_KEY:-}}"
         SERVER_KNOWN_HOSTS="${PRODUCTION_SERVER_KNOWN_HOSTS:-${SERVER_KNOWN_HOSTS:-}}"
         test -n "$SERVER_HOST" || { echo '缺少生产服务器地址（PRODUCTION_SERVER_HOST 或 SERVER_HOST）' >&2; exit 1; }
@@ -143,6 +145,8 @@ $:
       image: node:22-slim
     env:
       ABCDEPLOY_SERVER_FINGERPRINT: SHA256:HEb1XRqWqz7adPpLS99kCz9tReGnsnV+62BNKxXaAiI
+      ABCDEPLOY_PILOT_SERVER_HOST: abcdeploy.finagent.cloud
+      ABCDEPLOY_PILOT_SERVER_USER: ubuntu
       DEPLOYDESK_ENV: staging
     imports:
     - https://cnb.cool/blacksco0920/ecatSecret/-/blob/main/envs.yml
@@ -216,9 +220,9 @@ $:
           printf 'DEPLOYDESK_SITE_IMAGE=%s\n' "${DEPLOYDESK_SITE_IMAGE}"
         } > "$RUNTIME_DIRECTORY/.release.env"
         chmod 600 "$RUNTIME_DIRECTORY/.release.env"
-        SERVER_HOST="${STAGING_SERVER_HOST:-${SERVER_HOST:-}}"
+        SERVER_HOST="${ABCDEPLOY_PILOT_SERVER_HOST:-${STAGING_SERVER_HOST:-${SERVER_HOST:-}}}"
         SERVER_PORT="${STAGING_SERVER_PORT:-${SERVER_PORT:-22}}"
-        SERVER_USER="${STAGING_SERVER_USER:-${SERVER_USER:-}}"
+        SERVER_USER="${ABCDEPLOY_PILOT_SERVER_USER:-${STAGING_SERVER_USER:-${SERVER_USER:-}}}"
         SERVER_SSH_KEY="${STAGING_SERVER_SSH_KEY:-${SERVER_SSH_KEY:-}}"
         SERVER_KNOWN_HOSTS="${STAGING_SERVER_KNOWN_HOSTS:-${SERVER_KNOWN_HOSTS:-}}"
         test -n "$SERVER_HOST" || { echo '缺少测试服务器地址（STAGING_SERVER_HOST 或 SERVER_HOST）' >&2; exit 1; }
@@ -307,6 +311,8 @@ main:
       image: node:22-slim
     env:
       ABCDEPLOY_SERVER_FINGERPRINT: SHA256:HEb1XRqWqz7adPpLS99kCz9tReGnsnV+62BNKxXaAiI
+      ABCDEPLOY_PILOT_SERVER_HOST: abcdeploy.finagent.cloud
+      ABCDEPLOY_PILOT_SERVER_USER: ubuntu
       DEPLOYDESK_ENV: staging
     imports:
     - https://cnb.cool/blacksco0920/ecatSecret/-/blob/main/envs.yml
@@ -380,9 +386,9 @@ main:
           printf 'DEPLOYDESK_SITE_IMAGE=%s\n' "${DEPLOYDESK_SITE_IMAGE}"
         } > "$RUNTIME_DIRECTORY/.release.env"
         chmod 600 "$RUNTIME_DIRECTORY/.release.env"
-        SERVER_HOST="${STAGING_SERVER_HOST:-${SERVER_HOST:-}}"
+        SERVER_HOST="${ABCDEPLOY_PILOT_SERVER_HOST:-${STAGING_SERVER_HOST:-${SERVER_HOST:-}}}"
         SERVER_PORT="${STAGING_SERVER_PORT:-${SERVER_PORT:-22}}"
-        SERVER_USER="${STAGING_SERVER_USER:-${SERVER_USER:-}}"
+        SERVER_USER="${ABCDEPLOY_PILOT_SERVER_USER:-${STAGING_SERVER_USER:-${SERVER_USER:-}}}"
         SERVER_SSH_KEY="${STAGING_SERVER_SSH_KEY:-${SERVER_SSH_KEY:-}}"
         SERVER_KNOWN_HOSTS="${STAGING_SERVER_KNOWN_HOSTS:-${SERVER_KNOWN_HOSTS:-}}"
         test -n "$SERVER_HOST" || { echo '缺少测试服务器地址（STAGING_SERVER_HOST 或 SERVER_HOST）' >&2; exit 1; }
