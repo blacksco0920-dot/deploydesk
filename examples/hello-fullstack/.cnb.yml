@@ -72,10 +72,10 @@ $:
         SERVER_USER="${PRODUCTION_SERVER_USER:-}"
         SERVER_SSH_KEY="${PRODUCTION_SERVER_SSH_KEY:-}"
         SERVER_KNOWN_HOSTS="${PRODUCTION_SERVER_KNOWN_HOSTS:-}"
-        test -n "$SERVER_HOST"
-        test -n "$SERVER_USER"
-        test -n "$SERVER_SSH_KEY"
-        test -n "$SERVER_KNOWN_HOSTS"
+        test -n "$SERVER_HOST" || { echo '缺少目标环境的 SERVER_HOST' >&2; exit 1; }
+        test -n "$SERVER_USER" || { echo '缺少目标环境的 SERVER_USER' >&2; exit 1; }
+        test -n "$SERVER_SSH_KEY" || { echo '缺少目标环境的 SERVER_SSH_KEY' >&2; exit 1; }
+        test -n "$SERVER_KNOWN_HOSTS" || { echo '缺少已确认的 SERVER_KNOWN_HOSTS' >&2; exit 1; }
         case "$SERVER_PORT" in ''|*[!0-9]*) echo 'SSH 端口格式不正确' >&2; exit 1 ;; esac
         SSH_KEY_FILE="$RUNTIME_DIRECTORY/deploydesk_key"
         KNOWN_HOSTS_FILE="$RUNTIME_DIRECTORY/known_hosts"
@@ -227,10 +227,10 @@ $:
         SERVER_USER="${STAGING_SERVER_USER:-}"
         SERVER_SSH_KEY="${STAGING_SERVER_SSH_KEY:-}"
         SERVER_KNOWN_HOSTS="${STAGING_SERVER_KNOWN_HOSTS:-}"
-        test -n "$SERVER_HOST"
-        test -n "$SERVER_USER"
-        test -n "$SERVER_SSH_KEY"
-        test -n "$SERVER_KNOWN_HOSTS"
+        test -n "$SERVER_HOST" || { echo '缺少目标环境的 SERVER_HOST' >&2; exit 1; }
+        test -n "$SERVER_USER" || { echo '缺少目标环境的 SERVER_USER' >&2; exit 1; }
+        test -n "$SERVER_SSH_KEY" || { echo '缺少目标环境的 SERVER_SSH_KEY' >&2; exit 1; }
+        test -n "$SERVER_KNOWN_HOSTS" || { echo '缺少已确认的 SERVER_KNOWN_HOSTS' >&2; exit 1; }
         case "$SERVER_PORT" in ''|*[!0-9]*) echo 'SSH 端口格式不正确' >&2; exit 1 ;; esac
         SSH_KEY_FILE="$RUNTIME_DIRECTORY/deploydesk_key"
         KNOWN_HOSTS_FILE="$RUNTIME_DIRECTORY/known_hosts"
@@ -401,10 +401,10 @@ main:
         SERVER_USER="${STAGING_SERVER_USER:-}"
         SERVER_SSH_KEY="${STAGING_SERVER_SSH_KEY:-}"
         SERVER_KNOWN_HOSTS="${STAGING_SERVER_KNOWN_HOSTS:-}"
-        test -n "$SERVER_HOST"
-        test -n "$SERVER_USER"
-        test -n "$SERVER_SSH_KEY"
-        test -n "$SERVER_KNOWN_HOSTS"
+        test -n "$SERVER_HOST" || { echo '缺少目标环境的 SERVER_HOST' >&2; exit 1; }
+        test -n "$SERVER_USER" || { echo '缺少目标环境的 SERVER_USER' >&2; exit 1; }
+        test -n "$SERVER_SSH_KEY" || { echo '缺少目标环境的 SERVER_SSH_KEY' >&2; exit 1; }
+        test -n "$SERVER_KNOWN_HOSTS" || { echo '缺少已确认的 SERVER_KNOWN_HOSTS' >&2; exit 1; }
         case "$SERVER_PORT" in ''|*[!0-9]*) echo 'SSH 端口格式不正确' >&2; exit 1 ;; esac
         SSH_KEY_FILE="$RUNTIME_DIRECTORY/deploydesk_key"
         KNOWN_HOSTS_FILE="$RUNTIME_DIRECTORY/known_hosts"

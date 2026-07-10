@@ -591,10 +591,14 @@ fn deploy_script(
         format!("SERVER_USER=\"${{{prefix}_SERVER_USER:-}}\""),
         format!("SERVER_SSH_KEY=\"${{{prefix}_SERVER_SSH_KEY:-}}\""),
         format!("SERVER_KNOWN_HOSTS=\"${{{prefix}_SERVER_KNOWN_HOSTS:-}}\""),
-        "test -n \"$SERVER_HOST\"".to_string(),
-        "test -n \"$SERVER_USER\"".to_string(),
-        "test -n \"$SERVER_SSH_KEY\"".to_string(),
-        "test -n \"$SERVER_KNOWN_HOSTS\"".to_string(),
+        "test -n \"$SERVER_HOST\" || { echo '缺少目标环境的 SERVER_HOST' >&2; exit 1; }"
+            .to_string(),
+        "test -n \"$SERVER_USER\" || { echo '缺少目标环境的 SERVER_USER' >&2; exit 1; }"
+            .to_string(),
+        "test -n \"$SERVER_SSH_KEY\" || { echo '缺少目标环境的 SERVER_SSH_KEY' >&2; exit 1; }"
+            .to_string(),
+        "test -n \"$SERVER_KNOWN_HOSTS\" || { echo '缺少已确认的 SERVER_KNOWN_HOSTS' >&2; exit 1; }"
+            .to_string(),
         "case \"$SERVER_PORT\" in ''|*[!0-9]*) echo 'SSH 端口格式不正确' >&2; exit 1 ;; esac"
             .to_string(),
         "SSH_KEY_FILE=\"$RUNTIME_DIRECTORY/deploydesk_key\"".to_string(),
