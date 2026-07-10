@@ -53,11 +53,11 @@ $:
         }
         fs.writeFileSync(outputPath, `${lines.join("\n")}\n`, { mode: 0o600 });
         DEPLOYDESK_NODE
-        DEPLOYDESK_API_IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-api'
+        DEPLOYDESK_API_IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-api'
         DEPLOYDESK_API_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_API_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
         case "${DEPLOYDESK_API_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 api 的镜像摘要无效' >&2; exit 1 ;; esac
         DEPLOYDESK_API_IMAGE="${DEPLOYDESK_API_IMAGE_REPOSITORY}@${DEPLOYDESK_API_IMAGE_DIGEST}"
-        DEPLOYDESK_WEB_IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-web'
+        DEPLOYDESK_WEB_IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-web'
         DEPLOYDESK_WEB_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_WEB_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
         case "${DEPLOYDESK_WEB_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 web 的镜像摘要无效' >&2; exit 1 ;; esac
         DEPLOYDESK_WEB_IMAGE="${DEPLOYDESK_WEB_IMAGE_REPOSITORY}@${DEPLOYDESK_WEB_IMAGE_DIGEST}"
@@ -84,15 +84,15 @@ $:
         chmod 600 "$SSH_KEY_FILE" "$KNOWN_HOSTS_FILE"
         DESTINATION="$SERVER_USER@$SERVER_HOST"
         ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
-        mkdir -p '"'"'.deploydesk/apps/deploydesk-hello-fullstack/production'"'"' "$HOME/.deploydesk/caddy/sites"
-        docker network inspect '"'"'deploydesk-deploydesk-hello-fullstack-production'"'"' >/dev/null 2>&1 || docker network create '"'"'deploydesk-deploydesk-hello-fullstack-production'"'"' >/dev/null'
+        mkdir -p '"'"'.deploydesk/apps/abcdeploy-hello-fullstack/production'"'"' "$HOME/.deploydesk/caddy/sites"
+        docker network inspect '"'"'deploydesk-abcdeploy-hello-fullstack-production'"'"' >/dev/null 2>&1 || docker network create '"'"'deploydesk-abcdeploy-hello-fullstack-production'"'"' >/dev/null'
         printf '%s' "$CNB_TOKEN" | ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'docker login docker.cnb.cool --username cnb --password-stdin'
-        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/production/docker-compose.yml' "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/production/docker-compose.yml.next"
-        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/production/Caddyfile' "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/production/Caddyfile.next"
-        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.runtime.env" "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/production/.runtime.env.next"
-        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.release.env" "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/production/.release.env.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/production/docker-compose.yml' "$DESTINATION:.deploydesk/apps/abcdeploy-hello-fullstack/production/docker-compose.yml.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/production/Caddyfile' "$DESTINATION:.deploydesk/apps/abcdeploy-hello-fullstack/production/Caddyfile.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.runtime.env" "$DESTINATION:.deploydesk/apps/abcdeploy-hello-fullstack/production/.runtime.env.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.release.env" "$DESTINATION:.deploydesk/apps/abcdeploy-hello-fullstack/production/.release.env.next"
         ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
-        cd '"'"'.deploydesk/apps/deploydesk-hello-fullstack/production'"'"'
+        cd '"'"'.deploydesk/apps/abcdeploy-hello-fullstack/production'"'"'
         backup_file() {
           if [ -f "$1" ]; then cp "$1" "$1.previous"; else rm -f "$1.previous"; fi
         }
@@ -125,13 +125,13 @@ $:
         cp .release.env ".history/$release_id.env"
         old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
         if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
-        cp Caddyfile "$HOME/.deploydesk/caddy/sites/deploydesk-hello-fullstack-production.caddy"
+        cp Caddyfile "$HOME/.deploydesk/caddy/sites/abcdeploy-hello-fullstack-production.caddy"
         if docker inspect deploydesk-caddy >/dev/null 2>&1; then
-          docker network connect '"'"'deploydesk-deploydesk-hello-fullstack-production'"'"' deploydesk-caddy 2>/dev/null || true
+          docker network connect '"'"'deploydesk-abcdeploy-hello-fullstack-production'"'"' deploydesk-caddy 2>/dev/null || true
           docker exec deploydesk-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
           docker exec deploydesk-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
         else
-          echo '"'"'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 DeployDesk Caddy。'"'"'
+          echo '"'"'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 ABCDeploy Caddy。'"'"'
         fi'
   api_trigger_staging:
   - docker:
@@ -165,7 +165,7 @@ $:
       script:
       - |-
         IMAGE_TAG="sha-${CNB_COMMIT}"
-        IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-api'
+        IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-api'
         IMAGE_REFERENCE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
         docker build --file 'apps/api/Dockerfile' --tag "$IMAGE_REFERENCE" '.'
         docker push "$IMAGE_REFERENCE"
@@ -173,7 +173,7 @@ $:
       script:
       - |-
         IMAGE_TAG="sha-${CNB_COMMIT}"
-        IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-web'
+        IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-web'
         IMAGE_REFERENCE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
         docker build --file 'apps/web/Dockerfile' --tag "$IMAGE_REFERENCE" '.'
         docker push "$IMAGE_REFERENCE"
@@ -208,11 +208,11 @@ $:
         }
         fs.writeFileSync(outputPath, `${lines.join("\n")}\n`, { mode: 0o600 });
         DEPLOYDESK_NODE
-        DEPLOYDESK_API_IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-api'
+        DEPLOYDESK_API_IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-api'
         DEPLOYDESK_API_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_API_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
         case "${DEPLOYDESK_API_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 api 的镜像摘要无效' >&2; exit 1 ;; esac
         DEPLOYDESK_API_IMAGE="${DEPLOYDESK_API_IMAGE_REPOSITORY}@${DEPLOYDESK_API_IMAGE_DIGEST}"
-        DEPLOYDESK_WEB_IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-web'
+        DEPLOYDESK_WEB_IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-web'
         DEPLOYDESK_WEB_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_WEB_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
         case "${DEPLOYDESK_WEB_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 web 的镜像摘要无效' >&2; exit 1 ;; esac
         DEPLOYDESK_WEB_IMAGE="${DEPLOYDESK_WEB_IMAGE_REPOSITORY}@${DEPLOYDESK_WEB_IMAGE_DIGEST}"
@@ -239,15 +239,15 @@ $:
         chmod 600 "$SSH_KEY_FILE" "$KNOWN_HOSTS_FILE"
         DESTINATION="$SERVER_USER@$SERVER_HOST"
         ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
-        mkdir -p '"'"'.deploydesk/apps/deploydesk-hello-fullstack/staging'"'"' "$HOME/.deploydesk/caddy/sites"
-        docker network inspect '"'"'deploydesk-deploydesk-hello-fullstack-staging'"'"' >/dev/null 2>&1 || docker network create '"'"'deploydesk-deploydesk-hello-fullstack-staging'"'"' >/dev/null'
+        mkdir -p '"'"'.deploydesk/apps/abcdeploy-hello-fullstack/staging'"'"' "$HOME/.deploydesk/caddy/sites"
+        docker network inspect '"'"'deploydesk-abcdeploy-hello-fullstack-staging'"'"' >/dev/null 2>&1 || docker network create '"'"'deploydesk-abcdeploy-hello-fullstack-staging'"'"' >/dev/null'
         printf '%s' "$CNB_TOKEN" | ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'docker login docker.cnb.cool --username cnb --password-stdin'
-        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/staging/docker-compose.yml' "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/staging/docker-compose.yml.next"
-        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/staging/Caddyfile' "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/staging/Caddyfile.next"
-        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.runtime.env" "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/staging/.runtime.env.next"
-        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.release.env" "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/staging/.release.env.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/staging/docker-compose.yml' "$DESTINATION:.deploydesk/apps/abcdeploy-hello-fullstack/staging/docker-compose.yml.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/staging/Caddyfile' "$DESTINATION:.deploydesk/apps/abcdeploy-hello-fullstack/staging/Caddyfile.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.runtime.env" "$DESTINATION:.deploydesk/apps/abcdeploy-hello-fullstack/staging/.runtime.env.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.release.env" "$DESTINATION:.deploydesk/apps/abcdeploy-hello-fullstack/staging/.release.env.next"
         ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
-        cd '"'"'.deploydesk/apps/deploydesk-hello-fullstack/staging'"'"'
+        cd '"'"'.deploydesk/apps/abcdeploy-hello-fullstack/staging'"'"'
         backup_file() {
           if [ -f "$1" ]; then cp "$1" "$1.previous"; else rm -f "$1.previous"; fi
         }
@@ -280,13 +280,13 @@ $:
         cp .release.env ".history/$release_id.env"
         old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
         if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
-        cp Caddyfile "$HOME/.deploydesk/caddy/sites/deploydesk-hello-fullstack-staging.caddy"
+        cp Caddyfile "$HOME/.deploydesk/caddy/sites/abcdeploy-hello-fullstack-staging.caddy"
         if docker inspect deploydesk-caddy >/dev/null 2>&1; then
-          docker network connect '"'"'deploydesk-deploydesk-hello-fullstack-staging'"'"' deploydesk-caddy 2>/dev/null || true
+          docker network connect '"'"'deploydesk-abcdeploy-hello-fullstack-staging'"'"' deploydesk-caddy 2>/dev/null || true
           docker exec deploydesk-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
           docker exec deploydesk-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
         else
-          echo '"'"'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 DeployDesk Caddy。'"'"'
+          echo '"'"'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 ABCDeploy Caddy。'"'"'
         fi'
     - name: 标记已验证镜像摘要
       script:
@@ -294,13 +294,13 @@ $:
         set -eu
         IMAGE_TAG="sha-${CNB_COMMIT}"
         VERIFIED_TAG="verified-${IMAGE_TAG}"
-        IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-api'
+        IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-api'
         IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
         case "$IMAGE_DIGEST" in sha256:*) ;; *) echo '镜像摘要解析失败' >&2; exit 1 ;; esac
         docker buildx imagetools create --prefer-index=false --tag "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
         VERIFIED_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" --format '{{.Manifest.Digest}}')"
         test "$VERIFIED_DIGEST" = "$IMAGE_DIGEST"
-        IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-web'
+        IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-web'
         IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
         case "$IMAGE_DIGEST" in sha256:*) ;; *) echo '镜像摘要解析失败' >&2; exit 1 ;; esac
         docker buildx imagetools create --prefer-index=false --tag "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
@@ -339,7 +339,7 @@ main:
       script:
       - |-
         IMAGE_TAG="sha-${CNB_COMMIT}"
-        IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-api'
+        IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-api'
         IMAGE_REFERENCE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
         docker build --file 'apps/api/Dockerfile' --tag "$IMAGE_REFERENCE" '.'
         docker push "$IMAGE_REFERENCE"
@@ -347,7 +347,7 @@ main:
       script:
       - |-
         IMAGE_TAG="sha-${CNB_COMMIT}"
-        IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-web'
+        IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-web'
         IMAGE_REFERENCE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
         docker build --file 'apps/web/Dockerfile' --tag "$IMAGE_REFERENCE" '.'
         docker push "$IMAGE_REFERENCE"
@@ -382,11 +382,11 @@ main:
         }
         fs.writeFileSync(outputPath, `${lines.join("\n")}\n`, { mode: 0o600 });
         DEPLOYDESK_NODE
-        DEPLOYDESK_API_IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-api'
+        DEPLOYDESK_API_IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-api'
         DEPLOYDESK_API_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_API_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
         case "${DEPLOYDESK_API_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 api 的镜像摘要无效' >&2; exit 1 ;; esac
         DEPLOYDESK_API_IMAGE="${DEPLOYDESK_API_IMAGE_REPOSITORY}@${DEPLOYDESK_API_IMAGE_DIGEST}"
-        DEPLOYDESK_WEB_IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-web'
+        DEPLOYDESK_WEB_IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-web'
         DEPLOYDESK_WEB_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_WEB_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
         case "${DEPLOYDESK_WEB_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 web 的镜像摘要无效' >&2; exit 1 ;; esac
         DEPLOYDESK_WEB_IMAGE="${DEPLOYDESK_WEB_IMAGE_REPOSITORY}@${DEPLOYDESK_WEB_IMAGE_DIGEST}"
@@ -413,15 +413,15 @@ main:
         chmod 600 "$SSH_KEY_FILE" "$KNOWN_HOSTS_FILE"
         DESTINATION="$SERVER_USER@$SERVER_HOST"
         ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
-        mkdir -p '"'"'.deploydesk/apps/deploydesk-hello-fullstack/staging'"'"' "$HOME/.deploydesk/caddy/sites"
-        docker network inspect '"'"'deploydesk-deploydesk-hello-fullstack-staging'"'"' >/dev/null 2>&1 || docker network create '"'"'deploydesk-deploydesk-hello-fullstack-staging'"'"' >/dev/null'
+        mkdir -p '"'"'.deploydesk/apps/abcdeploy-hello-fullstack/staging'"'"' "$HOME/.deploydesk/caddy/sites"
+        docker network inspect '"'"'deploydesk-abcdeploy-hello-fullstack-staging'"'"' >/dev/null 2>&1 || docker network create '"'"'deploydesk-abcdeploy-hello-fullstack-staging'"'"' >/dev/null'
         printf '%s' "$CNB_TOKEN" | ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'docker login docker.cnb.cool --username cnb --password-stdin'
-        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/staging/docker-compose.yml' "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/staging/docker-compose.yml.next"
-        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/staging/Caddyfile' "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/staging/Caddyfile.next"
-        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.runtime.env" "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/staging/.runtime.env.next"
-        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.release.env" "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/staging/.release.env.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/staging/docker-compose.yml' "$DESTINATION:.deploydesk/apps/abcdeploy-hello-fullstack/staging/docker-compose.yml.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/staging/Caddyfile' "$DESTINATION:.deploydesk/apps/abcdeploy-hello-fullstack/staging/Caddyfile.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.runtime.env" "$DESTINATION:.deploydesk/apps/abcdeploy-hello-fullstack/staging/.runtime.env.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.release.env" "$DESTINATION:.deploydesk/apps/abcdeploy-hello-fullstack/staging/.release.env.next"
         ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
-        cd '"'"'.deploydesk/apps/deploydesk-hello-fullstack/staging'"'"'
+        cd '"'"'.deploydesk/apps/abcdeploy-hello-fullstack/staging'"'"'
         backup_file() {
           if [ -f "$1" ]; then cp "$1" "$1.previous"; else rm -f "$1.previous"; fi
         }
@@ -454,13 +454,13 @@ main:
         cp .release.env ".history/$release_id.env"
         old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
         if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
-        cp Caddyfile "$HOME/.deploydesk/caddy/sites/deploydesk-hello-fullstack-staging.caddy"
+        cp Caddyfile "$HOME/.deploydesk/caddy/sites/abcdeploy-hello-fullstack-staging.caddy"
         if docker inspect deploydesk-caddy >/dev/null 2>&1; then
-          docker network connect '"'"'deploydesk-deploydesk-hello-fullstack-staging'"'"' deploydesk-caddy 2>/dev/null || true
+          docker network connect '"'"'deploydesk-abcdeploy-hello-fullstack-staging'"'"' deploydesk-caddy 2>/dev/null || true
           docker exec deploydesk-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
           docker exec deploydesk-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
         else
-          echo '"'"'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 DeployDesk Caddy。'"'"'
+          echo '"'"'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 ABCDeploy Caddy。'"'"'
         fi'
     - name: 标记已验证镜像摘要
       script:
@@ -468,13 +468,13 @@ main:
         set -eu
         IMAGE_TAG="sha-${CNB_COMMIT}"
         VERIFIED_TAG="verified-${IMAGE_TAG}"
-        IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-api'
+        IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-api'
         IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
         case "$IMAGE_DIGEST" in sha256:*) ;; *) echo '镜像摘要解析失败' >&2; exit 1 ;; esac
         docker buildx imagetools create --prefer-index=false --tag "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
         VERIFIED_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" --format '{{.Manifest.Digest}}')"
         test "$VERIFIED_DIGEST" = "$IMAGE_DIGEST"
-        IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-web'
+        IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-web'
         IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
         case "$IMAGE_DIGEST" in sha256:*) ;; *) echo '镜像摘要解析失败' >&2; exit 1 ;; esac
         docker buildx imagetools create --prefer-index=false --tag "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"

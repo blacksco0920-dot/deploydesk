@@ -16,7 +16,7 @@ use deploy_core::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "deployctl", version, about = "DeployDesk 的跨平台部署内核")]
+#[command(name = "deployctl", version, about = "ABCDeploy 的跨平台部署内核")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -174,9 +174,9 @@ enum CnbCommand {
         repository: String,
         #[arg(long, default_value = "main")]
         branch: String,
-        #[arg(long, default_value = "api_trigger_deploydesk")]
+        #[arg(long, default_value = "api_trigger_abcdeploy")]
         event: String,
-        #[arg(long, default_value = "DeployDesk 手动触发")]
+        #[arg(long, default_value = "ABCDeploy 手动触发")]
         title: String,
     },
 }

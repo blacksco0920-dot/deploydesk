@@ -21,8 +21,12 @@ describe("ABCDeploy beginner flow", () => {
       ).toBeInTheDocument(),
     );
     expect(screen.getByText("api", { selector: "strong" })).toBeInTheDocument();
-    expect(screen.getByText("admin", { selector: "strong" })).toBeInTheDocument();
-    expect(screen.getByText("miniapp", { selector: "strong" })).toBeInTheDocument();
+    expect(
+      screen.getByText("admin", { selector: "strong" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("miniapp", { selector: "strong" }),
+    ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /结果正确，继续/ }));
     await waitFor(() =>
@@ -36,7 +40,9 @@ describe("ABCDeploy beginner flow", () => {
       target: { value: "demo-token" },
     });
     fireEvent.click(screen.getByRole("button", { name: /验证并连接/ }));
-    await waitFor(() => expect(screen.getByText("已连接账号 示例用户")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByText("已连接账号 示例用户")).toBeInTheDocument(),
+    );
 
     fireEvent.change(screen.getByPlaceholderText("例如 123.123.123.123"), {
       target: { value: "203.0.113.10" },
@@ -46,7 +52,9 @@ describe("ABCDeploy beginner flow", () => {
       expect(screen.getByText("确认服务器身份")).toBeInTheDocument(),
     );
     fireEvent.click(screen.getByRole("button", { name: /确认并连接/ }));
-    await waitFor(() => expect(screen.getByText("服务器连接正常")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByText("服务器连接正常")).toBeInTheDocument(),
+    );
 
     const continueButton = screen.getByRole("button", { name: /使用这些连接/ });
     await waitFor(() => expect(continueButton).toBeEnabled());

@@ -1,0 +1,30 @@
+# 由 ABCDeploy 生成。真实 .env 只保存在目标环境。
+name: abcdeploy-development
+services:
+  site:
+    image: ${DEPLOYDESK_SITE_IMAGE:?请填写不可变镜像地址}
+    restart: unless-stopped
+    env_file:
+    - .runtime.env
+    environment:
+      DEPLOYDESK_ENV: development
+    networks:
+      apps:
+        aliases:
+        - abcdeploy-development-site
+    labels:
+      deploydesk.environment: development
+      deploydesk.project: abcdeploy
+      deploydesk.service: site
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - wget -q --spider http://127.0.0.1:80/
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+networks:
+  apps:
+    external: true
+    name: deploydesk-abcdeploy-development

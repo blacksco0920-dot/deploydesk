@@ -1,19 +1,19 @@
 # 贡献指南
 
-感谢参与 DeployDesk。项目面向第一次接触部署的用户，技术正确性和可理解性同等重要。
+感谢参与 ABCDeploy。项目面向第一次接触部署的用户，技术正确性和可理解性同等重要。
 
 ## 开发环境
 
 - Node.js 22
 - pnpm（版本由根 `packageManager` 固定）
-- Rust 1.88+
+- Rust 1.97+
 - Tauri 2 对应平台依赖
 - 可选 Docker，用于生成 Compose 的集成校验
 
 ```bash
 pnpm install
 cargo test --workspace
-pnpm --filter @deploydesk/desktop test
+pnpm --filter @abcdeploy/desktop test
 pnpm dev
 ```
 
@@ -23,8 +23,9 @@ pnpm dev
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-pnpm --filter @deploydesk/desktop test
-pnpm --filter @deploydesk/desktop build
+pnpm --filter @abcdeploy/desktop test
+pnpm --filter @abcdeploy/desktop build
+pnpm --filter @abcdeploy/site build
 pnpm --dir examples/hello-fullstack install --frozen-lockfile
 pnpm --dir examples/hello-fullstack build
 bash -n scripts/server-bootstrap.sh

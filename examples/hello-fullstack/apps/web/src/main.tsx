@@ -6,7 +6,7 @@ function App() {
   return (
     <main>
       <span>development / staging / production</span>
-      <h1>DeployDesk 示例已运行</h1>
+      <h1>ABCDeploy 示例已运行</h1>
       <p>这个页面来自 Vite 静态容器，API 健康端点位于 /api/health。</p>
     </main>
   );

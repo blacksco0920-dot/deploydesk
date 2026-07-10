@@ -91,7 +91,7 @@ jobs:
             ABCDeploy 小白部署 Alpha 安装包。
 
             当前构建未配置商业代码签名证书，请下载后校验 GitHub Release 资产摘要。
-          releaseDraft: true
+          releaseDraft: false
           prerelease: true
           generateReleaseNotes: true
           args: ${{ matrix.args }}

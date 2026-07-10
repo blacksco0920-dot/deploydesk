@@ -59,7 +59,7 @@ function brand(dark = false) {
     <button class="brand-lockup text-button" type="button" data-go="home" aria-label="返回项目首页">
       <span class="brand-mark">${icon("layers-3")}</span>
       <span class="brand-copy">
-        <strong>DeployDesk</strong>
+        <strong>ABCDeploy</strong>
         <span>${dark ? "部署工作台" : "让上线更清楚"}</span>
       </span>
     </button>
@@ -235,7 +235,7 @@ function chooseProject() {
   const content = `
     <div class="eyebrow">第 1 步</div>
     <h1>你的项目代码在哪里？</h1>
-    <p class="lead">DeployDesk 会先只读检查项目，不会修改文件。识别完成后，你再决定是否继续。</p>
+    <p class="lead">ABCDeploy 会先只读检查项目，不会修改文件。识别完成后，你再决定是否继续。</p>
     <div class="option-list">
       <button class="option-card" type="button" data-action="select-local">
         <span class="option-icon">${icon("folder-open")}</span>
@@ -286,7 +286,7 @@ function detected() {
       <div class="result-item">${icon("database")}<div><strong>PostgreSQL</strong><span>项目需要关系型数据库</span></div></div>
       <div class="result-item">${icon("git-branch")}<div><strong>main 分支</strong><span>尚未配置测试环境</span></div></div>
     </div>
-    <div class="notice">${icon("info")}<span>发现一个前端和一个 API。DeployDesk 会分别提供访问地址，但仍把它们作为同一个项目管理。</span></div>
+    <div class="notice">${icon("info")}<span>发现一个前端和一个 API。ABCDeploy 会分别提供访问地址，但仍把它们作为同一个项目管理。</span></div>
     <button class="text-button" type="button">有一项不对</button>
   `;
   return onboardingShell(content, {
@@ -304,7 +304,7 @@ function cnbConnection() {
   const content = `
     <div class="eyebrow">连接 1 / 2</div>
     <h1>${connected ? "CNB 已连接" : "连接 CNB，自动构建每个版本"}</h1>
-    <p class="lead">授权后，DeployDesk 可以为这个项目准备仓库和构建流程。你会在浏览器中登录并确认权限。</p>
+    <p class="lead">授权后，ABCDeploy 可以为这个项目准备仓库和构建流程。你会在浏览器中登录并确认权限。</p>
     <div class="connection-panel ${connected ? "connected" : ""}">
       <div class="connection-heading">
         <div class="connection-identity">
@@ -319,7 +319,7 @@ function cnbConnection() {
         <div class="permission-item">${icon("check")}查看部署状态</div>
       </div>
     </div>
-    ${connected ? `<div class="notice success">${icon("shield-check")}<span>权限检查通过。访问凭据已保存在这台电脑的系统密钥库中，不会写入项目文件。</span></div>` : `<div class="notice">${icon("shield-check")}<span>DeployDesk 不会读取你的 CNB 密码。授权页面由 CNB 提供，完成后会自动返回这里。</span></div><button class="text-button" type="button" data-action="show-token-fallback">无法使用网页登录？</button>`}
+    ${connected ? `<div class="notice success">${icon("shield-check")}<span>权限检查通过。访问凭据已保存在这台电脑的系统密钥库中，不会写入项目文件。</span></div>` : `<div class="notice">${icon("shield-check")}<span>ABCDeploy 不会读取你的 CNB 密码。授权页面由 CNB 提供，完成后会自动返回这里。</span></div><button class="text-button" type="button" data-action="show-token-fallback">无法使用网页登录？</button>`}
   `;
   return onboardingShell(content, {
     footer: footer({
@@ -336,7 +336,7 @@ function serverConnection() {
   const content = `
     <div class="eyebrow">连接 2 / 2</div>
     <h1>${connected ? "服务器连接成功" : "连接运行应用的服务器"}</h1>
-    <p class="lead">输入服务器 IP 或域名即可。DeployDesk 会先自动寻找这台电脑上已有的安全连接。</p>
+    <p class="lead">输入服务器 IP 或域名即可。ABCDeploy 会先自动寻找这台电脑上已有的安全连接。</p>
     <div class="connection-panel ${connected ? "connected" : ""}">
       <div class="field-group">
         <label for="server-host">服务器 IP 或域名</label>
@@ -344,7 +344,7 @@ function serverConnection() {
         <p class="field-hint">可以在云服务器控制台的实例详情中找到公网 IP。</p>
       </div>
       <div class="server-discovery">
-        <div>${icon(connected ? "shield-check" : "key-round")}<span><strong>${connected ? "DeployDesk 安全连接" : "未找到可用的 SSH Key"}</strong><span>${connected ? "专用密钥已生成并验证，后续无需密码" : "可以自动创建，不需要手工寻找私钥文件"}</span></span></div>
+        <div>${icon(connected ? "shield-check" : "key-round")}<span><strong>${connected ? "ABCDeploy 安全连接" : "未找到可用的 SSH Key"}</strong><span>${connected ? "专用密钥已生成并验证，后续无需密码" : "可以自动创建，不需要手工寻找私钥文件"}</span></span></div>
         ${connected ? `<span class="status-inline">${icon("circle-check")}已验证</span>` : `<button class="primary-button" type="button" data-action="create-server-key">${icon("key-round")}创建安全连接</button>`}
       </div>
     </div>
@@ -524,7 +524,7 @@ function deploying() {
         <div class="deployment-heading">
           <span class="large-status running">${icon("loader-circle")}</span>
           <h1>正在部署测试环境</h1>
-          <p>关闭 DeployDesk 不会中断任务，下次打开会回到这里。</p>
+          <p>关闭 ABCDeploy 不会中断任务，下次打开会回到这里。</p>
         </div>
         <div class="timeline">${rows}</div>
         <div class="deployment-actions">
@@ -575,7 +575,7 @@ function dnsError() {
         <div class="error-guide">
           <div class="error-step"><span class="error-step-number">1</span><div><strong>系统已经完成</strong><p>应用、数据库和 Caddy 配置均已准备好，当前无需重新部署。</p></div></div>
           <div class="error-step"><span class="error-step-number">2</span><div><strong>请在 DNS 控制台修改一条记录</strong><p>把测试域名的 A 记录指向下面的服务器 IP。</p><div class="copy-value"><span>203.0.113.24</span><button type="button" data-action="copy-ip" title="复制 IP" aria-label="复制 IP">${icon("copy")}</button></div></div></div>
-          <div class="error-step"><span class="error-step-number">3</span><div><strong>DeployDesk 会自动复查</strong><p>每 30 秒检查一次。解析生效后将继续配置 HTTPS 和健康检查。</p></div></div>
+          <div class="error-step"><span class="error-step-number">3</span><div><strong>ABCDeploy 会自动复查</strong><p>每 30 秒检查一次。解析生效后将继续配置 HTTPS 和健康检查。</p></div></div>
         </div>
         <div class="deployment-actions">
           <button class="secondary-button" type="button" data-go="home">稍后处理</button>

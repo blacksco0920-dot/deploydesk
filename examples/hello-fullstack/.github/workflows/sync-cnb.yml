@@ -12,7 +12,7 @@ jobs:
         fetch-depth: 0
     - env:
         CNB_PUSH_TOKEN: ${{ secrets.CNB_PUSH_TOKEN }}
-        CNB_REPOSITORY: owner/deploydesk-hello-fullstack
+        CNB_REPOSITORY: owner/abcdeploy-hello-fullstack
       name: Sync branch to CNB
       run: |-
         set -eu

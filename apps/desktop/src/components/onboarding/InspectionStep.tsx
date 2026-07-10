@@ -31,7 +31,8 @@ export function InspectionStep({ workspace }: { workspace: WorkspacePreview }) {
       </span>
       <h1 className="m-0 text-2xl font-semibold">项目结构已经识别完成</h1>
       <p className="mb-8 mt-2 text-sm leading-6 text-[var(--muted-foreground)]">
-        发现 {inspection.services.length} 个可部署服务。系统只读取了文件结构和变量名称，没有读取任何密钥值。
+        发现 {inspection.services.length}{" "}
+        个可部署服务。系统只读取了文件结构和变量名称，没有读取任何密钥值。
       </p>
 
       <section className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
@@ -44,9 +45,12 @@ export function InspectionStep({ workspace }: { workspace: WorkspacePreview }) {
               <Boxes className="size-4" />
             </span>
             <span className="min-w-0 flex-1">
-              <strong className="block truncate text-sm font-medium">{service.id}</strong>
+              <strong className="block truncate text-sm font-medium">
+                {service.id}
+              </strong>
               <span className="mt-0.5 block truncate text-xs text-[var(--muted-foreground)]">
-                {frameworkNames[service.framework]} · {service.path || "项目根目录"}
+                {frameworkNames[service.framework]} ·{" "}
+                {service.path || "项目根目录"}
               </span>
             </span>
             <span className="text-xs text-[var(--subtle-foreground)]">
@@ -58,8 +62,16 @@ export function InspectionStep({ workspace }: { workspace: WorkspacePreview }) {
       </section>
 
       <div className="mt-5 grid grid-cols-3 divide-x divide-[var(--border)] border-y border-[var(--border)] py-4">
-        <Summary icon={Database} label="数据库结构" value={inspection.prisma_schemas.length} />
-        <Summary icon={FileKey2} label="环境变量" value={inspection.environment_variables.length} />
+        <Summary
+          icon={Database}
+          label="数据库结构"
+          value={inspection.prisma_schemas.length}
+        />
+        <Summary
+          icon={FileKey2}
+          label="环境变量"
+          value={inspection.environment_variables.length}
+        />
         <Summary icon={FileKey2} label="敏感变量" value={secretCount} />
       </div>
 
@@ -71,11 +83,15 @@ export function InspectionStep({ workspace }: { workspace: WorkspacePreview }) {
         <div className="mt-2 space-y-2 border-l border-[var(--border)] pl-5 text-xs leading-6 text-[var(--muted-foreground)]">
           {inspection.frameworks.map((item) => (
             <p className="m-0" key={`${item.framework}-${item.path}`}>
-              <strong className="text-[var(--foreground)]">{frameworkNames[item.framework]}</strong>
+              <strong className="text-[var(--foreground)]">
+                {frameworkNames[item.framework]}
+              </strong>
               {` · ${item.confidence}% · ${item.evidence.join("，")}`}
             </p>
           ))}
-          {!inspection.frameworks.length ? <p className="m-0">未识别到已知框架。</p> : null}
+          {!inspection.frameworks.length ? (
+            <p className="m-0">未识别到已知框架。</p>
+          ) : null}
         </div>
       </details>
     </div>
@@ -95,7 +111,9 @@ function Summary({
     <div className="flex items-center justify-center gap-2 px-2">
       <Icon className="size-4 text-[var(--subtle-foreground)]" />
       <span className="text-sm font-medium">{value}</span>
-      <span className="hidden text-xs text-[var(--muted-foreground)] sm:inline">{label}</span>
+      <span className="hidden text-xs text-[var(--muted-foreground)] sm:inline">
+        {label}
+      </span>
     </div>
   );
 }

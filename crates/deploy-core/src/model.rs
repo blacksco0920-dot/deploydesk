@@ -545,6 +545,15 @@ pub struct HealthcheckResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct PublicRouteCheck {
+    pub url: String,
+    pub reachable: bool,
+    pub phase: String,
+    pub status: Option<u16>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ProviderCheck {
     pub provider: String,
     pub ok: bool,

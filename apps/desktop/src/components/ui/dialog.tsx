@@ -55,7 +55,10 @@ export const DialogDescription = React.forwardRef<
   React.ComponentPropsWithoutRef<typeof DialogPrimitive.Description>
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Description
-    className={cn("text-sm leading-6 text-[var(--muted-foreground)]", className)}
+    className={cn(
+      "text-sm leading-6 text-[var(--muted-foreground)]",
+      className,
+    )}
     ref={ref}
     {...props}
   />
@@ -67,9 +70,6 @@ export function DialogFooter({
   ...props
 }: React.HTMLAttributes<HTMLDivElement>) {
   return (
-    <div
-      className={cn("mt-2 flex justify-end gap-2", className)}
-      {...props}
-    />
+    <div className={cn("mt-2 flex justify-end gap-2", className)} {...props} />
   );
 }

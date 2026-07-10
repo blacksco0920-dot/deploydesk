@@ -174,7 +174,7 @@ fn render_compose(
         path: format!("generated/{}/docker-compose.yml", name.as_str()).into(),
         source,
     })?;
-    content.insert_str(0, "# 由 DeployDesk 生成。真实 .env 只保存在目标环境。\n");
+    content.insert_str(0, "# 由 ABCDeploy 生成。真实 .env 只保存在目标环境。\n");
     Ok(content)
 }
 
@@ -184,7 +184,7 @@ fn render_env_example(
     environment: &EnvironmentConfig,
 ) -> String {
     let mut lines = vec![
-        "# 由 DeployDesk 生成，仅包含变量名和非敏感默认值。".to_string(),
+        "# 由 ABCDeploy 生成，仅包含变量名和非敏感默认值。".to_string(),
         format!("DEPLOYDESK_ENV={}", name.as_str()),
     ];
     for service in &manifest.services {
@@ -272,7 +272,7 @@ fn render_caddy(
     environment: &EnvironmentConfig,
 ) -> String {
     let mut lines = vec![format!(
-        "# {} / {}，由 DeployDesk 生成",
+        "# {} / {}，由 ABCDeploy 生成",
         manifest.project.name,
         name.display_name()
     )];
@@ -819,7 +819,7 @@ if docker inspect deploydesk-caddy >/dev/null 2>&1; then
   docker exec deploydesk-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
   docker exec deploydesk-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
 else
-  echo 'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 DeployDesk Caddy。'
+  echo 'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 ABCDeploy Caddy。'
 fi"#,
         remote_directory = shell_quote(remote_directory),
         compose = compose,

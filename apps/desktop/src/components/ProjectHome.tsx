@@ -138,7 +138,8 @@ export function ProjectHome({
                           ) : null}
                         </span>
                         <span className="mt-1 block truncate text-xs text-[var(--muted-foreground)]">
-                          {project.serviceCount} 个服务 · {stepLabel(project.currentStep)}
+                          {project.serviceCount} 个服务 ·{" "}
+                          {stepLabel(project.currentStep)}
                         </span>
                       </span>
                       <span className="hidden items-center gap-1.5 text-xs text-[var(--subtle-foreground)] sm:flex">
@@ -220,7 +221,8 @@ export function ProjectHome({
           <DialogHeader>
             <DialogTitle>从最近项目中移除？</DialogTitle>
             <DialogDescription>
-              只会删除 ABCDeploy 在本机保存的项目记录，不会删除代码、部署文件或服务器数据。
+              只会删除 ABCDeploy
+              在本机保存的项目记录，不会删除代码、部署文件或服务器数据。
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -265,5 +267,7 @@ function formatRelativeTime(value: string) {
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `${hours} 小时前`;
   const days = Math.floor(hours / 24);
-  return days < 30 ? `${days} 天前` : new Date(value).toLocaleDateString("zh-CN");
+  return days < 30
+    ? `${days} 天前`
+    : new Date(value).toLocaleDateString("zh-CN");
 }

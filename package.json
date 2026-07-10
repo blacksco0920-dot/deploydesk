@@ -10,6 +10,8 @@
     "format": "cargo fmt --all && pnpm --filter @abcdeploy/desktop format",
     "lint": "cargo clippy --workspace --all-targets -- -D warnings && pnpm --filter @abcdeploy/desktop lint",
     "test": "cargo test --workspace && pnpm --filter @abcdeploy/desktop test",
+    "site:build": "pnpm --filter @abcdeploy/site build",
+    "site:dev": "pnpm --filter @abcdeploy/site dev",
     "tauri:build": "pnpm --filter @abcdeploy/desktop tauri build",
     "tauri:build:mac": "CI=true APPLE_SIGNING_IDENTITY=- pnpm --filter @abcdeploy/desktop tauri build --bundles app,dmg --ci"
   }

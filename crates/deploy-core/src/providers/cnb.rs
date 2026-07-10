@@ -57,7 +57,7 @@ impl CnbClient {
         }
         Ok(Self {
             client: reqwest::Client::builder()
-                .user_agent("DeployDesk/0.1")
+                .user_agent("ABCDeploy/0.1")
                 .timeout(Duration::from_secs(30))
                 .build()?,
             api_base: api_base.into().trim_end_matches('/').to_string(),

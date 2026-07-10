@@ -57,11 +57,19 @@ export function OnboardingLayout({
             </span>
           </div>
           <div className="absolute bottom-[-1px] left-0 right-0">
-            <Progress className="h-0.5 rounded-none bg-transparent" value={progress} />
+            <Progress
+              className="h-0.5 rounded-none bg-transparent"
+              value={progress}
+            />
           </div>
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button aria-label="返回项目首页" onClick={onClose} size="icon" variant="ghost">
+              <Button
+                aria-label="返回项目首页"
+                onClick={onClose}
+                size="icon"
+                variant="ghost"
+              >
                 <X />
               </Button>
             </TooltipTrigger>

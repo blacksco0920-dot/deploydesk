@@ -34,7 +34,7 @@ CADDYFILE
 fi
 
 if [[ ! -f "$CADDY_DIR/sites/_placeholder.caddy" ]]; then
-  printf '# DeployDesk 会把项目路由写入此目录。\n' >"$CADDY_DIR/sites/_placeholder.caddy"
+  printf '# ABCDeploy 会把项目路由写入此目录。\n' >"$CADDY_DIR/sites/_placeholder.caddy"
 fi
 
 cat >"$CADDY_DIR/docker-compose.yml" <<'COMPOSE'
@@ -72,4 +72,4 @@ docker compose config --quiet
 docker compose up -d --wait --wait-timeout 120
 docker exec deploydesk-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
-echo "DeployDesk Caddy 已就绪：$CADDY_DIR"
+echo "ABCDeploy Caddy 已就绪：$CADDY_DIR"

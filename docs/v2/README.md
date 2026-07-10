@@ -1,8 +1,8 @@
-# DeployDesk V2 产品定义
+# ABCDeploy V2 产品定义
 
 > 状态：设计评审中。V2 应用代码冻结，未通过本文定义的设计门禁前不进入研发。
 
-DeployDesk V2 的目标不是让用户“能够配置部署”，而是让没有 DevOps 经验的 vibe coding 用户，在理解少量必要概念的前提下，可靠地完成首次上线并持续管理多个项目。
+ABCDeploy V2 的目标不是让用户“能够配置部署”，而是让没有 DevOps 经验的 vibe coding 用户，在理解少量必要概念的前提下，可靠地完成首次上线并持续管理多个项目。
 
 ## 产品承诺
 
@@ -47,4 +47,4 @@ DeployDesk V2 的目标不是让用户“能够配置部署”，而是让没有
 - [Zeabur](https://zeabur.com/docs/en-US/get-started/quick-start) 自动识别语言、框架和构建方案。
 - [Coolify](https://coolify.io/docs/knowledge-base/server/introduction) 可以在用户没有 SSH Key 时生成专用密钥。
 
-DeployDesk 不复制任何单一产品，而是把这些低门槛模式应用到“用户自有服务器 + CNB + Caddy”的国内部署场景。
+ABCDeploy 不复制任何单一产品，而是把这些低门槛模式应用到“用户自有服务器 + CNB + Caddy”的国内部署场景。

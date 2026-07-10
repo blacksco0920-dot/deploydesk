@@ -1,0 +1,30 @@
+# 由 ABCDeploy 生成。真实 .env 只保存在目标环境。
+name: abcdeploy-staging
+services:
+  site:
+    image: ${DEPLOYDESK_SITE_IMAGE:?请填写不可变镜像地址}
+    restart: unless-stopped
+    env_file:
+    - .runtime.env
+    environment:
+      DEPLOYDESK_ENV: staging
+    networks:
+      apps:
+        aliases:
+        - abcdeploy-staging-site
+    labels:
+      deploydesk.environment: staging
+      deploydesk.project: abcdeploy
+      deploydesk.service: site
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - wget -q --spider http://127.0.0.1:80/
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+networks:
+  apps:
+    external: true
+    name: deploydesk-abcdeploy-staging

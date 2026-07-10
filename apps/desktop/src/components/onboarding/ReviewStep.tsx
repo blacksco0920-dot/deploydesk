@@ -21,7 +21,8 @@ interface ReviewStepProps {
 export function ReviewStep({ applying, onApply, workspace }: ReviewStepProps) {
   const [confirmed, setConfirmed] = useState(false);
   const changed = useMemo(
-    () => workspace.plan.changes.filter((change) => change.kind !== "unchanged"),
+    () =>
+      workspace.plan.changes.filter((change) => change.kind !== "unchanged"),
     [workspace.plan.changes],
   );
 
@@ -85,9 +86,15 @@ export function ReviewStep({ applying, onApply, workspace }: ReviewStepProps) {
               key={change.path}
             >
               <FileCode2 className="size-4 text-[var(--muted-foreground)]" />
-              <code className="min-w-0 flex-1 truncate text-xs">{change.path}</code>
+              <code className="min-w-0 flex-1 truncate text-xs">
+                {change.path}
+              </code>
               <span className="text-xs text-[var(--muted-foreground)]">
-                {change.kind === "create" ? "新增" : change.kind === "update" ? "更新" : "不变"}
+                {change.kind === "create"
+                  ? "新增"
+                  : change.kind === "update"
+                    ? "更新"
+                    : "不变"}
               </span>
             </div>
           ))}
@@ -102,7 +109,9 @@ export function ReviewStep({ applying, onApply, workspace }: ReviewStepProps) {
           type="checkbox"
         />
         <span>
-          <strong className="block text-sm font-medium">我已查看本次变更</strong>
+          <strong className="block text-sm font-medium">
+            我已查看本次变更
+          </strong>
           <span className="mt-1 block text-xs leading-5 text-[var(--muted-foreground)]">
             允许写入部署文件并开始准备测试环境；可恢复的步骤失败后会从检查点继续。
           </span>
@@ -110,8 +119,16 @@ export function ReviewStep({ applying, onApply, workspace }: ReviewStepProps) {
       </label>
 
       <div className="mt-5 flex justify-end">
-        <Button disabled={!confirmed || applying || !changed.length} onClick={onApply} size="lg">
-          {applying ? <LoaderCircle className="animate-spin-slow" /> : <Rocket />}
+        <Button
+          disabled={!confirmed || applying || !changed.length}
+          onClick={onApply}
+          size="lg"
+        >
+          {applying ? (
+            <LoaderCircle className="animate-spin-slow" />
+          ) : (
+            <Rocket />
+          )}
           {applying ? "正在准备首次部署" : "开始部署测试"}
         </Button>
       </div>

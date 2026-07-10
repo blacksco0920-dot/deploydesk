@@ -222,7 +222,9 @@ function App() {
       setStep("deploying");
       setScreen("onboarding");
       await refreshProjects();
-      toast.success(`服务器与部署配置已准备完成，共更新 ${result.writtenFiles.length} 个文件`);
+      toast.success(
+        `服务器与部署配置已准备完成，共更新 ${result.writtenFiles.length} 个文件`,
+      );
     } catch (error) {
       reportError(toMessage(error));
     } finally {
@@ -263,6 +265,10 @@ function App() {
     if (!projectPath) return;
     setApplying(true);
     try {
+      if (currentRun?.actionKind === "route-check") {
+        await refreshCurrentDeployment();
+        return;
+      }
       const run = await startStagingDeployment(projectPath);
       setCurrentRun(run);
       setDeploymentRuns((current) => [run, ...current]);
@@ -418,7 +424,9 @@ function App() {
         projectName={workspace.inspection.project_name}
         step={step}
       >
-        {step === "inspection" ? <InspectionStep workspace={workspace} /> : null}
+        {step === "inspection" ? (
+          <InspectionStep workspace={workspace} />
+        ) : null}
         {step === "connections" ? (
           <ConnectionStep
             initialServer={lastServer}
@@ -492,7 +500,9 @@ function App() {
         <WorkspaceShell
           onDeploy={() => goToStep("review")}
           onForget={() => {
-            const current = projects.find((project) => project.path === projectPath);
+            const current = projects.find(
+              (project) => project.path === projectPath,
+            );
             if (current) void forgetRecent(current);
           }}
           onHome={() => setScreen("home")}

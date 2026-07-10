@@ -1,6 +1,6 @@
 [package]
 name = "deployctl"
-description = "Headless CLI for DeployDesk"
+description = "Headless CLI for ABCDeploy"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

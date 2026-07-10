@@ -2,7 +2,7 @@
 
 ## 目标
 
-DeployDesk 把部署拆成可检查的模型、确定性生成和受控执行三层。桌面端负责引导，不直接拼接部署脚本；CLI 和桌面端共同调用 Rust 核心，确保同一项目得到同一 Plan。
+ABCDeploy 把部署拆成可检查的模型、确定性生成和受控执行三层。桌面端负责引导，不直接拼接部署脚本；CLI 和桌面端共同调用 Rust 核心，确保同一项目得到同一 Plan。
 
 ## 模块
 
@@ -40,7 +40,7 @@ flowchart TB
 
 ### `apps/desktop`
 
-React 只持有表单草稿和展示状态。项目扫描、Schema 校验、Plan、写入、密钥库和外部连接都通过 Tauri IPC 进入 Rust。
+React 只持有当前表单草稿和展示状态。项目扫描、Schema 校验、Plan、写入、密钥库和外部连接都通过 Tauri IPC 进入 Rust。最近项目、服务器资源和部署记录由 Rust 写入本机 SQLite，重新打开应用可以恢复到原步骤。
 
 真实 Token 使用操作系统密钥库：
 
@@ -56,7 +56,8 @@ React 只持有表单草稿和展示状态。项目扫描、Schema 校验、Plan
 4. Schema 校验环境隔离、仓库路径、域名、镜像标签和密钥引用。
 5. Render 生成候选文件；Plan 读取现有文件并产生脱敏 Diff。
 6. 用户确认后，Apply 先备份已有文件，再逐个原子替换。
-7. 提交配置后，GitHub 同步到 CNB；CNB 构建镜像并执行受控部署。
+7. 桌面端只暂存并提交自己拥有的部署文件，通过临时认证 Header 同步到 CNB。
+8. CNB 构建一次不可变镜像，先部署测试环境；生产从成功记录取得完整提交 SHA 并精确晋级。
 
 ## 三环境模型
 
@@ -78,7 +79,7 @@ EnvironmentConfig
 
 ## 服务器目录
 
-DeployDesk 使用远程登录用户自己的目录，不默认要求 root：
+ABCDeploy 使用远程登录用户自己的目录，不默认要求 root：
 
 ```text
 ~/.deploydesk/
@@ -95,6 +96,8 @@ DeployDesk 使用远程登录用户自己的目录，不默认要求 root：
     data/
     config/
 ```
+
+`.deploydesk` 是已发布部署协议的兼容路径。V2 保留它以避免破坏在线项目，产品品牌和新接口统一使用 ABCDeploy。
 
 每个项目/环境有唯一 Docker 网络和服务别名，例如 `shop-production-api`。中央 Caddy 可以连接多个网络，而不会把不同项目都叫作 `api` 的服务解析错。
 

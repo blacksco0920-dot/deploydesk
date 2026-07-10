@@ -39,7 +39,8 @@ import {
   TooltipTrigger,
 } from "./ui/tooltip";
 
-type WorkspaceSection = "project" | "deployments" | "environments" | "resources" | "settings";
+type WorkspaceSection =
+  "project" | "deployments" | "environments" | "resources" | "settings";
 
 const navigation = [
   { id: "project" as const, label: "项目", icon: Home },
@@ -131,7 +132,10 @@ export function WorkspaceShell({
                       <span className="max-[780px]:hidden">{item.label}</span>
                     </button>
                   </TooltipTrigger>
-                  <TooltipContent className="hidden max-[780px]:block" side="right">
+                  <TooltipContent
+                    className="hidden max-[780px]:block"
+                    side="right"
+                  >
                     {item.label}
                   </TooltipContent>
                 </Tooltip>
@@ -148,7 +152,9 @@ export function WorkspaceShell({
               }`}
             />
             <span className="truncate text-[11px] text-[var(--muted-foreground)] max-[780px]:hidden">
-              {preflight?.ready_for_cloud_deploy ? "本机能力正常" : "本机能力待处理"}
+              {preflight?.ready_for_cloud_deploy
+                ? "本机能力正常"
+                : "本机能力待处理"}
             </span>
           </div>
         </aside>
@@ -169,7 +175,12 @@ export function WorkspaceShell({
             <div className="flex items-center gap-1">
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button aria-label="重新识别项目" onClick={onRefresh} size="icon" variant="ghost">
+                  <Button
+                    aria-label="重新识别项目"
+                    onClick={onRefresh}
+                    size="icon"
+                    variant="ghost"
+                  >
                     <RefreshCw />
                   </Button>
                 </TooltipTrigger>
@@ -216,7 +227,8 @@ export function WorkspaceShell({
           <DialogHeader>
             <DialogTitle>移除这个项目？</DialogTitle>
             <DialogDescription>
-              只会删除 ABCDeploy 的本机项目记录，不会删除代码、部署文件、服务器容器或数据。
+              只会删除 ABCDeploy
+              的本机项目记录，不会删除代码、部署文件、服务器容器或数据。
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -287,12 +299,15 @@ function ProjectView({
     <div>
       <div className="mb-8 flex items-start justify-between gap-5">
         <div>
-          <p className="m-0 text-xs font-medium text-[var(--accent)]">项目状态</p>
+          <p className="m-0 text-xs font-medium text-[var(--accent)]">
+            项目状态
+          </p>
           <h1 className="mb-0 mt-2 text-2xl font-semibold">
             {workspace.inspection.project_name}
           </h1>
           <p className="mb-0 mt-2 text-sm text-[var(--muted-foreground)]">
-            {workspace.inspection.services.length} 个服务 · {workspace.inspection.package_manager}
+            {workspace.inspection.services.length} 个服务 ·{" "}
+            {workspace.inspection.package_manager}
           </p>
         </div>
         <span
@@ -303,7 +318,9 @@ function ProjectView({
           }`}
         >
           <CheckCircle2 className="size-4" />
-          {staging?.status === "success" ? "测试环境运行正常" : "等待首次测试部署"}
+          {staging?.status === "success"
+            ? "测试环境运行正常"
+            : "等待首次测试部署"}
         </span>
       </div>
 
@@ -330,7 +347,11 @@ function ProjectView({
             staging?.status === "success" &&
             staging.commitSha &&
             production?.status !== "success" ? (
-              <Button onClick={() => onPromote(staging)} size="sm" variant="secondary">
+              <Button
+                onClick={() => onPromote(staging)}
+                size="sm"
+                variant="secondary"
+              >
                 <Rocket />
                 发布生产
               </Button>
@@ -366,7 +387,9 @@ function ProjectView({
             >
               <Activity className="size-4 text-[var(--subtle-foreground)]" />
               <span className="min-w-0 flex-1">
-                <strong className="block truncate text-sm font-medium">{service.id}</strong>
+                <strong className="block truncate text-sm font-medium">
+                  {service.id}
+                </strong>
                 <span className="block truncate text-xs text-[var(--muted-foreground)]">
                   {service.path || "项目根目录"}
                 </span>
@@ -396,45 +419,61 @@ function DeploymentsView({
         title="部署记录"
       />
       <div className="border-y border-[var(--border)]">
-        {runs.length ? runs.map((run) => (
-          <div
-            className="flex min-h-[62px] items-center gap-3 border-b border-[var(--border)] px-2 last:border-b-0"
-            key={run.id}
-          >
-            <span className={`grid size-7 shrink-0 place-items-center rounded-full ${
-              run.status === "success"
-                ? "bg-[var(--success-soft)] text-[var(--success)]"
-                : run.status === "failed" || run.status === "needs_action"
-                  ? "bg-[var(--warning-soft)] text-[var(--warning)]"
-                  : "bg-[var(--accent-soft)] text-[var(--accent)]"
-            }`}>
-              {run.status === "success" ? <CheckCircle2 className="size-4" /> : <Activity className="size-4" />}
-            </span>
-            <span className="min-w-0 flex-1">
-              <strong className="block text-sm font-medium">
-                {run.environment === "production" ? "生产发布" : "测试部署"}
-              </strong>
-              <span className="block truncate text-xs text-[var(--muted-foreground)]">
-                {run.message}
-              </span>
-            </span>
-            <span className="text-xs text-[var(--subtle-foreground)]">
-              {new Date(run.startedAt).toLocaleString("zh-CN")}
-            </span>
-          </div>
-        )) : workspace.plan.steps.map((step, index) => (
-          <div
-            className="flex min-h-[62px] items-center gap-3 border-b border-[var(--border)] px-2 last:border-b-0"
-            key={step.id}
-          >
-            <span className="grid size-7 shrink-0 place-items-center rounded-full bg-[var(--muted)] text-xs font-medium text-[var(--muted-foreground)]">{index + 1}</span>
-            <span className="min-w-0 flex-1">
-              <strong className="block text-sm font-medium">{step.title}</strong>
-              <span className="block truncate text-xs text-[var(--muted-foreground)]">{step.detail}</span>
-            </span>
-            <span className="text-xs text-[var(--subtle-foreground)]">等待首次运行</span>
-          </div>
-        ))}
+        {runs.length
+          ? runs.map((run) => (
+              <div
+                className="flex min-h-[62px] items-center gap-3 border-b border-[var(--border)] px-2 last:border-b-0"
+                key={run.id}
+              >
+                <span
+                  className={`grid size-7 shrink-0 place-items-center rounded-full ${
+                    run.status === "success"
+                      ? "bg-[var(--success-soft)] text-[var(--success)]"
+                      : run.status === "failed" || run.status === "needs_action"
+                        ? "bg-[var(--warning-soft)] text-[var(--warning)]"
+                        : "bg-[var(--accent-soft)] text-[var(--accent)]"
+                  }`}
+                >
+                  {run.status === "success" ? (
+                    <CheckCircle2 className="size-4" />
+                  ) : (
+                    <Activity className="size-4" />
+                  )}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <strong className="block text-sm font-medium">
+                    {run.environment === "production" ? "生产发布" : "测试部署"}
+                  </strong>
+                  <span className="block truncate text-xs text-[var(--muted-foreground)]">
+                    {run.message}
+                  </span>
+                </span>
+                <span className="text-xs text-[var(--subtle-foreground)]">
+                  {new Date(run.startedAt).toLocaleString("zh-CN")}
+                </span>
+              </div>
+            ))
+          : workspace.plan.steps.map((step, index) => (
+              <div
+                className="flex min-h-[62px] items-center gap-3 border-b border-[var(--border)] px-2 last:border-b-0"
+                key={step.id}
+              >
+                <span className="grid size-7 shrink-0 place-items-center rounded-full bg-[var(--muted)] text-xs font-medium text-[var(--muted-foreground)]">
+                  {index + 1}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <strong className="block text-sm font-medium">
+                    {step.title}
+                  </strong>
+                  <span className="block truncate text-xs text-[var(--muted-foreground)]">
+                    {step.detail}
+                  </span>
+                </span>
+                <span className="text-xs text-[var(--subtle-foreground)]">
+                  等待首次运行
+                </span>
+              </div>
+            ))}
       </div>
     </div>
   );
@@ -459,18 +498,23 @@ function EnvironmentsView({
             className="grid min-h-[72px] grid-cols-[140px_1fr_120px] items-center gap-3 border-b border-[var(--border)] px-4 last:border-b-0 max-sm:grid-cols-[1fr_auto]"
             key={environment.name}
           >
-            <strong className="text-sm font-medium">{environmentLabel(environment.name)}</strong>
+            <strong className="text-sm font-medium">
+              {environmentLabel(environment.name)}
+            </strong>
             <span className="truncate text-xs text-[var(--muted-foreground)] max-sm:hidden">
               {environment.target}
             </span>
             <span className="text-right text-xs text-[var(--muted-foreground)]">
-              {environment.name !== "development" && runs.find((run) => run.environment === environment.name)
-                ? runStatus(runs.find((run) => run.environment === environment.name))
+              {environment.name !== "development" &&
+              runs.find((run) => run.environment === environment.name)
+                ? runStatus(
+                    runs.find((run) => run.environment === environment.name),
+                  )
                 : environment.approval_required
-                ? "发布前确认"
-                : environment.automatic
-                  ? "自动更新"
-                  : "本机运行"}
+                  ? "发布前确认"
+                  : environment.automatic
+                    ? "自动更新"
+                    : "本机运行"}
             </span>
           </div>
         ))}
@@ -487,9 +531,21 @@ function ResourcesView() {
         title="资源"
       />
       <div className="border-y border-[var(--border)]">
-        <ResourceRow icon={Cloud} label="CNB 构建账号" status="已保存在系统密钥库" />
-        <ResourceRow icon={Server} label="目标服务器" status="首次部署前重新验证" />
-        <ResourceRow icon={ShieldCheck} label="Caddy 与 HTTPS" status="由服务器统一管理" />
+        <ResourceRow
+          icon={Cloud}
+          label="CNB 构建账号"
+          status="已保存在系统密钥库"
+        />
+        <ResourceRow
+          icon={Server}
+          label="目标服务器"
+          status="首次部署前重新验证"
+        />
+        <ResourceRow
+          icon={ShieldCheck}
+          label="Caddy 与 HTTPS"
+          status="由服务器统一管理"
+        />
       </div>
     </div>
   );
@@ -506,7 +562,10 @@ function SettingsView({
 }) {
   return (
     <div>
-      <PageHeading description="调整项目记录和重新识别，不在这里暴露原始密钥。" title="项目设置" />
+      <PageHeading
+        description="调整项目记录和重新识别，不在这里暴露原始密钥。"
+        title="项目设置"
+      />
       <div className="space-y-5">
         <div>
           <span className="mb-1 block text-xs font-medium">本机目录</span>
@@ -520,7 +579,9 @@ function SettingsView({
           </div>
         </div>
         <div className="border-t border-[var(--border)] pt-5">
-          <h2 className="m-0 text-sm font-semibold text-[var(--destructive)]">移除项目记录</h2>
+          <h2 className="m-0 text-sm font-semibold text-[var(--destructive)]">
+            移除项目记录
+          </h2>
           <p className="mb-3 mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
             不删除代码和服务器数据，只让 ABCDeploy 忘记这个本机项目。
           </p>
@@ -549,9 +610,13 @@ function EnvironmentSummary({
     <div className="bg-[var(--surface)] p-5">
       <div className="flex items-center justify-between gap-3">
         <strong className="text-sm font-medium">{name}</strong>
-        {action ?? <span className="text-xs text-[var(--success)]">{status}</span>}
+        {action ?? (
+          <span className="text-xs text-[var(--success)]">{status}</span>
+        )}
       </div>
-      <p className="mb-0 mt-2 text-xs text-[var(--muted-foreground)]">{description}</p>
+      <p className="mb-0 mt-2 text-xs text-[var(--muted-foreground)]">
+        {description}
+      </p>
     </div>
   );
 }
@@ -587,15 +652,27 @@ function ResourceRow({
   );
 }
 
-function PageHeading({ description, title }: { description: string; title: string }) {
+function PageHeading({
+  description,
+  title,
+}: {
+  description: string;
+  title: string;
+}) {
   return (
     <div className="mb-7">
       <h1 className="m-0 text-xl font-semibold">{title}</h1>
-      <p className="mb-0 mt-2 text-sm leading-6 text-[var(--muted-foreground)]">{description}</p>
+      <p className="mb-0 mt-2 text-sm leading-6 text-[var(--muted-foreground)]">
+        {description}
+      </p>
     </div>
   );
 }
 
 function environmentLabel(value: string) {
-  return { development: "开发环境", staging: "测试环境", production: "生产环境" }[value] ?? value;
+  return (
+    { development: "开发环境", staging: "测试环境", production: "生产环境" }[
+      value
+    ] ?? value
+  );
 }

@@ -62,7 +62,9 @@ describe("CloudSetupAction", () => {
     );
 
     await waitFor(() =>
-      expect(screen.getByDisplayValue("demo/sample-deploy-secrets")).toBeInTheDocument(),
+      expect(
+        screen.getByDisplayValue("demo/sample-deploy-secrets"),
+      ).toBeInTheDocument(),
     );
     fireEvent.click(screen.getByRole("button", { name: "自动准备" }));
     await waitFor(() => expect(screen.getByText("已准备")).toBeInTheDocument());

@@ -1,5 +1,5 @@
 {
-  "name": "deploydesk-hello-fullstack",
+  "name": "abcdeploy-hello-fullstack",
   "private": true,
   "packageManager": "pnpm@10.28.1",
   "scripts": {

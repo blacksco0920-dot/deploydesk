@@ -73,8 +73,10 @@ export function DeploymentProgress({
       <section className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
         {stages.map((stage, index) => {
           const completed = run.completedSteps.includes(stage.key) || success;
-          const active = !completed && run.currentStage === stage.active && !failed;
-          const stopped = !completed && run.currentStage === stage.active && failed;
+          const active =
+            !completed && run.currentStage === stage.active && !failed;
+          const stopped =
+            !completed && run.currentStage === stage.active && failed;
           return (
             <div
               className="relative flex min-h-[58px] items-center gap-3 border-b border-[var(--border)] px-4 last:border-b-0"
@@ -105,7 +107,9 @@ export function DeploymentProgress({
                 )}
               </span>
               <span className="min-w-0 flex-1">
-                <strong className="block text-sm font-medium">{stage.title}</strong>
+                <strong className="block text-sm font-medium">
+                  {stage.title}
+                </strong>
                 <span className="mt-0.5 block text-xs text-[var(--muted-foreground)]">
                   {completed
                     ? "已完成"
@@ -130,7 +134,9 @@ export function DeploymentProgress({
           <div className="mt-1 space-y-1 border-l border-[var(--border)] pl-5 text-[11px] leading-5 text-[var(--muted-foreground)]">
             <p className="m-0">CNB 仓库：{run.repository}</p>
             <p className="m-0">发布分支：{run.branch}</p>
-            <p className="m-0">构建编号：{run.buildSerial ?? "等待 CNB 返回"}</p>
+            <p className="m-0">
+              构建编号：{run.buildSerial ?? "等待 CNB 返回"}
+            </p>
             <p className="m-0">
               提交版本：{run.commitSha?.slice(0, 12) ?? "等待 CNB 返回"}
             </p>
@@ -140,7 +146,9 @@ export function DeploymentProgress({
           {failed ? (
             <Button onClick={onRetry} variant="secondary">
               <RefreshCw />
-              从失败步骤重试
+              {run.actionKind === "route-check"
+                ? "重新检查域名与 HTTPS"
+                : "从失败步骤重试"}
             </Button>
           ) : null}
           {!failed && !success ? (
@@ -160,7 +168,8 @@ export function DeploymentProgress({
 
       {!success ? (
         <p className="mt-6 text-xs leading-5 text-[var(--muted-foreground)]">
-          可以关闭 ABCDeploy。CNB 和服务器会继续执行，重新打开后将恢复到这次部署。
+          可以关闭 ABCDeploy。CNB
+          和服务器会继续执行，重新打开后将恢复到这次部署。
         </p>
       ) : null}
     </div>

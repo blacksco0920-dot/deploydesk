@@ -1,4 +1,4 @@
-# DeployDesk V2 设计审计记录
+# ABCDeploy V2 设计审计记录
 
 > 审计对象：`docs/v2/prototype/index.html`<br>
 > 审计日期：2026-07-10<br>

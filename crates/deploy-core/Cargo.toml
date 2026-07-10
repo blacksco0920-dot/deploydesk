@@ -1,6 +1,6 @@
 [package]
 name = "deploy-core"
-description = "Deterministic deployment planning and provider integrations for DeployDesk"
+description = "Deterministic deployment planning and provider integrations for ABCDeploy"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

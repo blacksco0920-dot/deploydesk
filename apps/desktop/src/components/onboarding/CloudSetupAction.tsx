@@ -22,7 +22,10 @@ import { Input } from "../ui/input";
 interface CloudSetupActionProps {
   completing: boolean;
   onBackToRequirements: () => void;
-  onComplete: (codeRepository: string, secretRepository: string) => Promise<void>;
+  onComplete: (
+    codeRepository: string,
+    secretRepository: string,
+  ) => Promise<void>;
   onError: (message: string) => void;
   path: string;
   server: ServerForm;
@@ -134,7 +137,8 @@ export function CloudSetupAction({
       </span>
       <h1 className="m-0 text-2xl font-semibold">完成一次性持续部署连接</h1>
       <p className="mb-8 mt-2 text-sm leading-6 text-[var(--muted-foreground)]">
-        CNB 要求密钥文件在受审计的网页中创建。完成这一次后，测试和生产发布都会自动使用各自配置。
+        CNB
+        要求密钥文件在受审计的网页中创建。完成这一次后，测试和生产发布都会自动使用各自配置。
       </p>
 
       <section className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
@@ -169,7 +173,9 @@ export function CloudSetupAction({
           <div className="flex items-start gap-3">
             <FileKey2 className="mt-0.5 size-4 shrink-0 text-[var(--muted-foreground)]" />
             <div className="min-w-0 flex-1">
-              <strong className="block text-sm font-medium">创建 CNB 密钥仓库</strong>
+              <strong className="block text-sm font-medium">
+                创建 CNB 密钥仓库
+              </strong>
               <span className="mt-0.5 block text-xs leading-5 text-[var(--muted-foreground)]">
                 仓库类型请选择“密钥仓库”，建议名称 {suggestedSecretName}
               </span>
@@ -231,7 +237,9 @@ export function CloudSetupAction({
                 </Button>
                 <Button
                   disabled={!validRepository(secretRepository)}
-                  onClick={() => openUrl(`https://cnb.cool/${secretRepository}`)}
+                  onClick={() =>
+                    openUrl(`https://cnb.cool/${secretRepository}`)
+                  }
                   size="icon"
                   title="打开密钥仓库"
                   variant="ghost"
@@ -283,7 +291,11 @@ export function CloudSetupAction({
           onClick={finish}
           size="lg"
         >
-          {completing ? <LoaderCircle className="animate-spin-slow" /> : <Check />}
+          {completing ? (
+            <LoaderCircle className="animate-spin-slow" />
+          ) : (
+            <Check />
+          )}
           {completing ? "正在验证并继续" : "完成并继续部署"}
         </Button>
       </div>

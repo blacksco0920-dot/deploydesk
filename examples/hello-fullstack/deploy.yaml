@@ -1,7 +1,7 @@
-# DeployDesk 项目部署协议。这里只声明变量名，不保存真实密钥。
+# ABCDeploy 项目部署协议。这里只声明变量名，不保存真实密钥。
 version: 1
 project:
-  name: deploydesk-hello-fullstack
+  name: abcdeploy-hello-fullstack
   description: ''
   commands:
     install: corepack pnpm install --frozen-lockfile
@@ -9,12 +9,12 @@ project:
     - corepack pnpm build
 source:
   provider: github
-  repository: owner/deploydesk-hello-fullstack
+  repository: owner/abcdeploy-hello-fullstack
   release_branch: main
 services:
 - id: api
   kind: api
-  image: deploydesk-hello-fullstack-api
+  image: abcdeploy-hello-fullstack-api
   context: .
   dockerfile: apps/api/Dockerfile
   container_port: 3000
@@ -31,7 +31,7 @@ services:
   build_args: {}
 - id: web
   kind: static
-  image: deploydesk-hello-fullstack-web
+  image: abcdeploy-hello-fullstack-web
   context: .
   dockerfile: apps/web/Dockerfile
   container_port: 80
@@ -51,7 +51,7 @@ environments:
     target:
       kind: local
       server: null
-      namespace: deploydesk-hello-fullstack-development
+      namespace: abcdeploy-hello-fullstack-development
     branch: null
     auto_deploy: false
     approval_required: false
@@ -63,7 +63,7 @@ environments:
     target:
       kind: server
       server: staging-server
-      namespace: deploydesk-hello-fullstack-staging
+      namespace: abcdeploy-hello-fullstack-staging
     branch: null
     auto_deploy: true
     approval_required: false
@@ -75,7 +75,7 @@ environments:
     target:
       kind: server
       server: production-server
-      namespace: deploydesk-hello-fullstack-production
+      namespace: abcdeploy-hello-fullstack-production
     branch: null
     auto_deploy: false
     approval_required: true
@@ -86,10 +86,10 @@ environments:
 providers:
   build:
     kind: cnb
-    repository: owner/deploydesk-hello-fullstack
+    repository: owner/abcdeploy-hello-fullstack
   registry:
     kind: cnb
-    repository: owner/deploydesk-hello-fullstack
+    repository: owner/abcdeploy-hello-fullstack
   reverse_proxy: caddy
 release:
   image_tag_template: sha-{commit}

@@ -7,8 +7,8 @@ COPY apps/api/package.json apps/api/package.json
 COPY apps/web/package.json apps/web/package.json
 RUN pnpm install --frozen-lockfile
 COPY . .
-RUN pnpm --filter @deploydesk-example/api build \
-    && pnpm --filter @deploydesk-example/api deploy --prod /opt/api
+RUN pnpm --filter @abcdeploy-example/api build \
+    && pnpm --filter @abcdeploy-example/api deploy --prod /opt/api
 
 FROM node:22-bookworm-slim AS runtime
 

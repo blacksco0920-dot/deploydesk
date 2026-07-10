@@ -1,5 +1,5 @@
-# 由 DeployDesk 生成。真实 .env 只保存在目标环境。
-name: deploydesk-hello-fullstack-development
+# 由 ABCDeploy 生成。真实 .env 只保存在目标环境。
+name: abcdeploy-hello-fullstack-development
 services:
   api:
     image: ${DEPLOYDESK_API_IMAGE:?请填写不可变镜像地址}
@@ -11,10 +11,10 @@ services:
     networks:
       apps:
         aliases:
-        - deploydesk-hello-fullstack-development-api
+        - abcdeploy-hello-fullstack-development-api
     labels:
       deploydesk.environment: development
-      deploydesk.project: deploydesk-hello-fullstack
+      deploydesk.project: abcdeploy-hello-fullstack
       deploydesk.service: api
     healthcheck:
       test:
@@ -34,10 +34,10 @@ services:
     networks:
       apps:
         aliases:
-        - deploydesk-hello-fullstack-development-web
+        - abcdeploy-hello-fullstack-development-web
     labels:
       deploydesk.environment: development
-      deploydesk.project: deploydesk-hello-fullstack
+      deploydesk.project: abcdeploy-hello-fullstack
       deploydesk.service: web
     healthcheck:
       test:
@@ -50,4 +50,4 @@ services:
 networks:
   apps:
     external: true
-    name: deploydesk-deploydesk-hello-fullstack-development
+    name: deploydesk-abcdeploy-hello-fullstack-development

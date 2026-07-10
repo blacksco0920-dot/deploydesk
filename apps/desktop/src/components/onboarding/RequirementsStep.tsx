@@ -157,7 +157,11 @@ export function RequirementsStep({
               size="sm"
               variant="secondary"
             >
-              {saving ? <LoaderCircle className="animate-spin-slow" /> : <Save />}
+              {saving ? (
+                <LoaderCircle className="animate-spin-slow" />
+              ) : (
+                <Save />
+              )}
               保存域名
             </Button>
           </div>
@@ -271,7 +275,9 @@ function ConfigurationInput({
   async function save(environment: DeployEnvironment) {
     const value = values[environment];
     if (!value.trim()) {
-      onError(`请填写 ${variable} 的${environment === "staging" ? "测试" : "生产"}值`);
+      onError(
+        `请填写 ${variable} 的${environment === "staging" ? "测试" : "生产"}值`,
+      );
       return;
     }
     setSaving(environment);
@@ -348,7 +354,9 @@ function ConfigurationInput({
                   ) : (
                     <Save />
                   )}
-                  <span className="sr-only">保存 {variable} {label}环境</span>
+                  <span className="sr-only">
+                    保存 {variable} {label}环境
+                  </span>
                 </Button>
               </span>
             </label>

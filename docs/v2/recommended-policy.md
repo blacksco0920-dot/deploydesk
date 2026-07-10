@@ -1,4 +1,4 @@
-# DeployDesk V2 推荐部署策略
+# ABCDeploy V2 推荐部署策略
 
 ## 1. 目标
 

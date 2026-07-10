@@ -233,7 +233,11 @@ export function ConnectionStep({
           ok={cnb.connected}
           title="CNB 云原生构建"
         >
-          <Button onClick={() => setCnbDialog(true)} size="sm" variant="secondary">
+          <Button
+            onClick={() => setCnbDialog(true)}
+            size="sm"
+            variant="secondary"
+          >
             {cnb.connected ? "重新授权" : "连接"}
           </Button>
         </ConnectionRow>
@@ -299,7 +303,11 @@ export function ConnectionStep({
                 </span>
               </span>
               {!selectedIdentity ? (
-                <Button onClick={handleGenerateIdentity} size="sm" variant="secondary">
+                <Button
+                  onClick={handleGenerateIdentity}
+                  size="sm"
+                  variant="secondary"
+                >
                   <KeyRound />
                   创建安全连接
                 </Button>
@@ -312,7 +320,11 @@ export function ConnectionStep({
               >
                 <Settings2 />
               </Button>
-              <Button disabled={checkingServer} onClick={handleServerCheck} size="sm">
+              <Button
+                disabled={checkingServer}
+                onClick={handleServerCheck}
+                size="sm"
+              >
                 {checkingServer ? (
                   <LoaderCircle className="animate-spin-slow" />
                 ) : (
@@ -328,7 +340,9 @@ export function ConnectionStep({
               <div className="flex items-start gap-3 rounded-md border border-[var(--accent-border)] bg-[var(--accent-soft)] p-3 sm:col-span-2">
                 <Fingerprint className="mt-0.5 size-4 shrink-0 text-[var(--accent)]" />
                 <span className="min-w-0 flex-1">
-                  <strong className="block text-xs font-medium">确认服务器身份</strong>
+                  <strong className="block text-xs font-medium">
+                    确认服务器身份
+                  </strong>
                   <code className="mt-1 block break-all text-[11px] text-[var(--muted-foreground)]">
                     {serverCheck.details[0]}
                   </code>
@@ -361,13 +375,16 @@ export function ConnectionStep({
           <DialogHeader>
             <DialogTitle>连接 CNB</DialogTitle>
             <DialogDescription>
-              CNB 暂未提供适合公开桌面客户端的免密授权流程，因此当前需要创建一次访问令牌。应用只会验证权限并保存到系统密钥库。
+              CNB
+              暂未提供适合公开桌面客户端的免密授权流程，因此当前需要创建一次访问令牌。应用只会验证权限并保存到系统密钥库。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
             <Button
               className="w-full justify-between"
-              onClick={() => openExternal("https://cnb.cool/profile/token", onError)}
+              onClick={() =>
+                openExternal("https://cnb.cool/profile/token", onError)
+              }
               variant="secondary"
             >
               打开 CNB 访问令牌页面
@@ -389,19 +406,27 @@ export function ConnectionStep({
             </div>
             <label className="flex items-center justify-between gap-4 rounded-md border border-[var(--border)] p-3">
               <span>
-                <strong className="block text-sm font-medium">记住这次连接</strong>
+                <strong className="block text-sm font-medium">
+                  记住这次连接
+                </strong>
                 <span className="mt-0.5 block text-xs text-[var(--muted-foreground)]">
                   安全保存在系统钥匙串或凭据管理器中
                 </span>
               </span>
-              <Switch checked={rememberToken} onCheckedChange={setRememberToken} />
+              <Switch
+                checked={rememberToken}
+                onCheckedChange={setRememberToken}
+              />
             </label>
           </div>
           <DialogFooter>
             <Button onClick={() => setCnbDialog(false)} variant="secondary">
               取消
             </Button>
-            <Button disabled={connectingCnb || !token.trim()} onClick={handleCnbConnect}>
+            <Button
+              disabled={connectingCnb || !token.trim()}
+              onClick={handleCnbConnect}
+            >
               {connectingCnb ? (
                 <LoaderCircle className="animate-spin-slow" />
               ) : (
@@ -427,7 +452,10 @@ export function ConnectionStep({
                 className="flex w-full items-center gap-3 border-b border-[var(--border)] px-3 py-3 text-left last:border-b-0 hover:bg-[var(--muted)]"
                 key={identity.path}
                 onClick={() => {
-                  setServer((current) => ({ ...current, keyPath: identity.path }));
+                  setServer((current) => ({
+                    ...current,
+                    keyPath: identity.path,
+                  }));
                   setServerCheck(null);
                   setIdentityDialog(false);
                 }}
@@ -435,7 +463,9 @@ export function ConnectionStep({
               >
                 <FileKey2 className="size-4 text-[var(--muted-foreground)]" />
                 <span className="min-w-0 flex-1">
-                  <strong className="block truncate text-sm font-medium">{identity.name}</strong>
+                  <strong className="block truncate text-sm font-medium">
+                    {identity.name}
+                  </strong>
                   <span className="block truncate text-xs text-[var(--muted-foreground)]">
                     {identity.source}
                   </span>

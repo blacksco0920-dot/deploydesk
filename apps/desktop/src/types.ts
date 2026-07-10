@@ -255,12 +255,7 @@ export interface ServerResource extends ServerForm {
 }
 
 export type DeploymentRunStatus =
-  | "queued"
-  | "running"
-  | "needs_action"
-  | "success"
-  | "failed"
-  | "cancelled";
+  "queued" | "running" | "needs_action" | "success" | "failed" | "cancelled";
 
 export interface DeploymentRun {
   id: string;

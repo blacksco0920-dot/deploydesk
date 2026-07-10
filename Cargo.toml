@@ -10,8 +10,8 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-authors = ["DeployDesk Contributors"]
-repository = "https://github.com/blacksco0920-dot/deploydesk"
+authors = ["ABCDeploy Contributors"]
+repository = "https://github.com/blacksco0920-dot/abcdeploy"
 rust-version = "1.97"
 
 [workspace.dependencies]

@@ -9,8 +9,8 @@ use chrono::Utc;
 use deploy_core::error::DeployError;
 use deploy_core::manifest::{ManifestValidation, validate_manifest};
 use deploy_core::model::{
-    DeploymentPlan, EnvironmentName, InspectionReport, ProviderCheck, RegistryConfig,
-    SystemPreflight,
+    DeploymentPlan, EnvironmentName, InspectionReport, ProviderCheck, PublicRouteCheck,
+    RegistryConfig, SystemPreflight,
 };
 use deploy_core::plan::serialize_manifest;
 use deploy_core::preflight::system_preflight;
@@ -409,6 +409,9 @@ async fn refresh_deployment(
                 run.commit_sha = Some(revision);
             }
             update_run_from_cnb(&mut run, &payload);
+            if run.status == "success" {
+                verify_public_routes(&mut run).await;
+            }
         }
         Err(error) => {
             let message = public_error(error);
@@ -426,6 +429,55 @@ async fn refresh_deployment(
         state.set_project_step(Path::new(&run.project_path), "workspace")?;
     }
     Ok(run)
+}
+
+async fn verify_public_routes(run: &mut DeploymentRun) {
+    let manifest = match load_manifest(Path::new(&run.project_path).join(MANIFEST_FILE).as_path()) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            run.status = "needs_action".to_string();
+            run.current_stage = "healthcheck".to_string();
+            run.action_kind = Some("route-check".to_string());
+            run.message = format!(
+                "应用已部署，但无法读取公网路由配置：{}",
+                public_error(error)
+            );
+            return;
+        }
+    };
+    let Ok(environment) = parse_deploy_environment(&run.environment) else {
+        return;
+    };
+    let routes = &manifest.environments.get(environment).domains;
+    if routes.is_empty() {
+        return;
+    }
+    let mut checks = Vec::with_capacity(routes.len());
+    for route in routes {
+        checks.push(deploy_core::health::check_public_route(&route.host, &route.path).await);
+    }
+    apply_public_route_checks(run, &checks);
+}
+
+fn apply_public_route_checks(run: &mut DeploymentRun, checks: &[PublicRouteCheck]) {
+    if let Some(failure) = checks.iter().find(|check| !check.reachable) {
+        run.status = "needs_action".to_string();
+        run.current_stage = "healthcheck".to_string();
+        run.action_kind = Some("route-check".to_string());
+        run.action_url = None;
+        run.completed_steps.retain(|step| step != "healthcheck");
+        run.message.clone_from(&failure.message);
+        return;
+    }
+    if !checks.is_empty() {
+        run.message = if run.environment == "production" {
+            "生产环境已按测试通过的同一镜像摘要发布，域名和 HTTPS 可访问".to_string()
+        } else {
+            "测试环境部署完成，域名和 HTTPS 可访问".to_string()
+        };
+    }
+    run.action_kind = None;
+    run.action_url = None;
 }
 
 #[tauri::command]
@@ -511,6 +563,8 @@ fn update_run_from_cnb(run: &mut DeploymentRun, payload: &serde_json::Value) {
         "success" => {
             run.status = "success".to_string();
             run.current_stage = "complete".to_string();
+            run.action_kind = None;
+            run.action_url = None;
             run.message = if run.environment == "production" {
                 "生产环境已按测试通过的同一镜像摘要发布".to_string()
             } else {
@@ -1520,10 +1574,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DeploymentRun, cloud_setup_required, is_deployment_owned_path, rollback_script,
-        runtime_secret_key, stage_key, update_run_from_cnb, validate_git_branch,
+        DeploymentRun, apply_public_route_checks, cloud_setup_required, is_deployment_owned_path,
+        rollback_script, runtime_secret_key, stage_key, update_run_from_cnb, validate_git_branch,
         validate_repository_slug,
     };
+    use deploy_core::model::PublicRouteCheck;
 
     fn run() -> DeploymentRun {
         DeploymentRun {
@@ -1685,5 +1740,32 @@ providers:
         assert!(script.contains("docker compose --env-file .release.env"));
         assert!(!script.contains("cp \"$previous_file\" .runtime.env"));
         assert!(!script.contains("Caddyfile"));
+    }
+
+    #[test]
+    fn public_route_failures_pause_without_rebuilding() {
+        let mut deployment = run();
+        deployment.status = "success".to_string();
+        deployment.completed_steps.push("healthcheck".to_string());
+        apply_public_route_checks(
+            &mut deployment,
+            &[PublicRouteCheck {
+                url: "https://app.example.com/".to_string(),
+                reachable: false,
+                phase: "dns".to_string(),
+                status: None,
+                message: "app.example.com 尚未解析".to_string(),
+            }],
+        );
+
+        assert_eq!(deployment.status, "needs_action");
+        assert_eq!(deployment.action_kind.as_deref(), Some("route-check"));
+        assert_eq!(deployment.current_stage, "healthcheck");
+        assert!(
+            !deployment
+                .completed_steps
+                .contains(&"healthcheck".to_string())
+        );
+        assert!(deployment.message.contains("尚未解析"));
     }
 }
