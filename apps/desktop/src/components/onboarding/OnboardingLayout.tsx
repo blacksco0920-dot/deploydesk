@@ -37,7 +37,10 @@ export function OnboardingLayout({
   onClose,
 }: OnboardingLayoutProps) {
   const index = Math.max(0, orderedSteps.indexOf(step));
-  const progress = Math.round(((index + 1) / orderedSteps.length) * 100);
+  const deploying = step === "deploying";
+  const progress = deploying
+    ? 100
+    : Math.round(((index + 1) / orderedSteps.length) * 100);
 
   return (
     <TooltipProvider delayDuration={350}>
@@ -69,7 +72,11 @@ export function OnboardingLayout({
         <main className="min-h-0 overflow-auto">
           <div className="mx-auto w-full max-w-[760px] px-6 py-10 sm:py-12">
             <div className="mb-7 flex items-center gap-3 text-xs text-[var(--muted-foreground)]">
-              <span>第 {index + 1} 步，共 {orderedSteps.length} 步</span>
+              <span>
+                {deploying
+                  ? "配置已确认"
+                  : `第 ${index + 1} 步，共 ${orderedSteps.length} 步`}
+              </span>
               <span className="h-px flex-1 bg-[var(--border)]" />
               <span>{stepName(step)}</span>
             </div>

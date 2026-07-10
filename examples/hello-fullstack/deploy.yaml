@@ -10,8 +10,7 @@ project:
 source:
   provider: github
   repository: owner/deploydesk-hello-fullstack
-  integration_branch: test
-  stable_branch: main
+  release_branch: main
 services:
 - id: api
   kind: api
@@ -65,7 +64,7 @@ environments:
       kind: server
       server: staging-server
       namespace: deploydesk-hello-fullstack-staging
-    branch: test
+    branch: null
     auto_deploy: true
     approval_required: false
     domains: []
@@ -77,7 +76,7 @@ environments:
       kind: server
       server: production-server
       namespace: deploydesk-hello-fullstack-production
-    branch: main
+    branch: null
     auto_deploy: false
     approval_required: true
     domains: []

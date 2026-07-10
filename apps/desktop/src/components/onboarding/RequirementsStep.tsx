@@ -221,17 +221,17 @@ function SecretInput({
 
 function readDomains(manifestYaml: string, services: string[]) {
   const document = parseDocument(manifestYaml);
+  const manifest = document.toJS() as {
+    environments?: {
+      staging?: { domains?: Array<{ service?: string; host?: string }> };
+      production?: { domains?: Array<{ service?: string; host?: string }> };
+    };
+  };
   const staging = routesToRecord(
-    (document.getIn(["environments", "staging", "domains"]) as Array<{
-      service?: string;
-      host?: string;
-    }>) ?? [],
+    manifest.environments?.staging?.domains ?? [],
   );
   const production = routesToRecord(
-    (document.getIn(["environments", "production", "domains"]) as Array<{
-      service?: string;
-      host?: string;
-    }>) ?? [],
+    manifest.environments?.production?.domains ?? [],
   );
   for (const service of services) {
     staging[service] ??= "";
@@ -241,6 +241,7 @@ function readDomains(manifestYaml: string, services: string[]) {
 }
 
 function routesToRecord(routes: Array<{ service?: string; host?: string }>) {
+  if (!Array.isArray(routes)) return {};
   return Object.fromEntries(
     routes
       .filter((route) => route.service && route.host)

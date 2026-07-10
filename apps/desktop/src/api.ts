@@ -5,10 +5,12 @@ import type {
   CnbRepositoryInput,
   CnbRepositoryResult,
   CnbAccount,
+  DeploymentRun,
   OnboardingStep,
   ProviderCheck,
   RecentProject,
   ServerForm,
+  ServerResource,
   SecretStatus,
   GeneratedSshIdentity,
   SshIdentity,
@@ -148,6 +150,14 @@ export async function checkDocker(): Promise<ProviderCheck> {
 
 export async function checkServer(form: ServerForm): Promise<ProviderCheck> {
   if (!isTauri()) {
+    if (form.host && form.user && form.keyPath && !form.hostFingerprint) {
+      return {
+        provider: "ssh-host-key",
+        ok: false,
+        summary: "请确认这台服务器的身份指纹",
+        details: ["SHA256:ABCDeployDemoServerFingerprint"],
+      };
+    }
     return {
       provider: "ssh",
       ok: Boolean(form.host && form.user && form.keyPath),
@@ -161,7 +171,78 @@ export async function checkServer(form: ServerForm): Promise<ProviderCheck> {
     user: form.user,
     keyPath: form.keyPath,
     port: form.port,
+    hostFingerprint: form.hostFingerprint,
   });
+}
+
+export async function listServers(): Promise<ServerResource[]> {
+  if (!isTauri()) return [];
+  return invoke<ServerResource[]>("list_servers");
+}
+
+export async function startStagingDeployment(
+  path: string,
+): Promise<DeploymentRun> {
+  if (!isTauri()) {
+    const run = demoRun(path, "staging");
+    writeDemoRun(run);
+    return run;
+  }
+  return invoke<DeploymentRun>("start_staging_deployment", { path });
+}
+
+export async function promoteProductionDeployment(
+  sourceRunId: string,
+): Promise<DeploymentRun> {
+  if (!isTauri()) {
+    const source = readDemoRuns().find((run) => run.id === sourceRunId);
+    if (!source || source.status !== "success") {
+      throw new Error("只有健康检查通过的测试版本才能发布生产");
+    }
+    const run = demoRun(source.projectPath, "production");
+    writeDemoRun(run);
+    return run;
+  }
+  return invoke<DeploymentRun>("promote_production_deployment", {
+    sourceRunId,
+  });
+}
+
+export async function refreshDeployment(runId: string): Promise<DeploymentRun> {
+  if (!isTauri()) {
+    const runs = readDemoRuns();
+    const run = runs.find((item) => item.id === runId);
+    if (!run) throw new Error("找不到这次部署记录");
+    if (run.status === "running" || run.status === "queued") {
+      const updated: DeploymentRun = {
+        ...run,
+        status: "success",
+        currentStage: "complete",
+        message:
+          run.environment === "production"
+            ? "生产环境已按测试通过的同一镜像摘要发布"
+            : "测试环境部署完成并通过健康检查",
+        completedSteps: [
+          "write-config",
+          "verify-build",
+          "publish-images",
+          "prepare-server",
+          "deploy",
+          "healthcheck",
+        ],
+        updatedAt: new Date().toISOString(),
+      };
+      writeDemoRun(updated);
+      return updated;
+    }
+    return run;
+  }
+  return invoke<DeploymentRun>("refresh_deployment", { runId });
+}
+
+export async function listDeploymentRuns(path: string): Promise<DeploymentRun[]> {
+  if (!isTauri()) return readDemoRuns().filter((run) => run.projectPath === path);
+  return invoke<DeploymentRun[]>("list_deployment_runs", { path });
 }
 
 export async function bootstrapServerCaddy(
@@ -171,8 +252,8 @@ export async function bootstrapServerCaddy(
     return {
       provider: "caddy",
       ok: true,
-      summary: `服务器 ${form.name} 的 DeployDesk Caddy 已就绪`,
-      details: ["已创建 ~/.deploydesk，未修改其他反向代理配置"],
+      summary: `服务器 ${form.name} 的 ABCDeploy Caddy 已就绪`,
+      details: ["已准备统一运行目录，未修改其他反向代理配置"],
     };
   }
   return invoke<ProviderCheck>("bootstrap_server_caddy", {
@@ -181,6 +262,7 @@ export async function bootstrapServerCaddy(
     user: form.user,
     keyPath: form.keyPath,
     port: form.port,
+    hostFingerprint: form.hostFingerprint,
     confirmed: true,
   });
 }
@@ -266,6 +348,7 @@ const demoPreflight: SystemPreflight = {
 };
 
 const DEMO_PROJECTS_KEY = "abcdeploy.demo.projects";
+const DEMO_RUNS_KEY = "abcdeploy.demo.runs";
 
 function readDemoProjects(): RecentProject[] {
   try {
@@ -295,6 +378,48 @@ function rememberDemoProject(path: string, workspace: WorkspacePreview) {
   );
 }
 
+function demoRun(
+  path: string,
+  environment: DeploymentRun["environment"],
+): DeploymentRun {
+  const now = new Date().toISOString();
+  return {
+    id: `demo-${environment}-${Date.now()}`,
+    projectPath: path,
+    projectName: "ecat-energy",
+    environment,
+    status: "running",
+    currentStage: environment === "production" ? "deploy" : "build",
+    buildSerial: `demo-${Date.now()}`,
+    repository: "owner/ecat-energy",
+    branch: "main",
+    message:
+      environment === "production"
+        ? "正在按已验证镜像摘要发布生产环境"
+        : "CNB 已开始构建，关闭应用后也可以继续查看",
+    completedSteps: ["write-config"],
+    startedAt: now,
+    updatedAt: now,
+  };
+}
+
+function readDemoRuns(): DeploymentRun[] {
+  try {
+    const raw = localStorage.getItem(DEMO_RUNS_KEY);
+    return raw ? (JSON.parse(raw) as DeploymentRun[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeDemoRun(run: DeploymentRun) {
+  const runs = readDemoRuns();
+  localStorage.setItem(
+    DEMO_RUNS_KEY,
+    JSON.stringify([run, ...runs.filter((item) => item.id !== run.id)]),
+  );
+}
+
 function demoWorkspace(path: string): WorkspacePreview {
   return {
     manifestExists: false,
@@ -302,19 +427,18 @@ function demoWorkspace(path: string): WorkspacePreview {
 project:
   name: ecat-energy
 source:
-  integration_branch: test
-  stable_branch: main
+  release_branch: main
 environments:
   staging:
     target:
       server: staging-server
-    branch: test
+    branch: null
     domains: []
     secrets_ref: https://cnb.cool/replace-me/secret/-/blob/main/env.staging.yml
   production:
     target:
       server: production-server
-    branch: main
+    branch: null
     domains: []
     secrets_ref: https://cnb.cool/replace-me/secret/-/blob/main/env.production.yml
 providers:

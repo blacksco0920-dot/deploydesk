@@ -7,14 +7,20 @@ import {
   forgetProject,
   getPreflight,
   listRecentProjects,
+  listDeploymentRuns,
+  listServers,
   openProject,
+  promoteProductionDeployment,
   previewManifest,
+  refreshDeployment,
   saveProjectStep,
   selectProjectDirectory,
+  startStagingDeployment,
 } from "./api";
 import { ProjectHome } from "./components/ProjectHome";
 import { WorkspaceShell } from "./components/WorkspaceShell";
 import { ConnectionStep } from "./components/onboarding/ConnectionStep";
+import { DeploymentProgress } from "./components/onboarding/DeploymentProgress";
 import { InspectionStep } from "./components/onboarding/InspectionStep";
 import { OnboardingLayout } from "./components/onboarding/OnboardingLayout";
 import { RecommendationStep } from "./components/onboarding/RecommendationStep";
@@ -23,6 +29,7 @@ import { ReviewStep } from "./components/onboarding/ReviewStep";
 import { Button } from "./components/ui/button";
 import type {
   OnboardingStep,
+  DeploymentRun,
   RecentProject,
   ServerForm,
   SystemPreflight,
@@ -51,6 +58,8 @@ function App() {
   const [applying, setApplying] = useState(false);
   const [connectionsReady, setConnectionsReady] = useState(false);
   const [lastServer, setLastServer] = useState<ServerForm | undefined>();
+  const [deploymentRuns, setDeploymentRuns] = useState<DeploymentRun[]>([]);
+  const [currentRun, setCurrentRun] = useState<DeploymentRun | null>(null);
 
   const reportError = useCallback((message: string) => {
     toast.error(message, { duration: 7000 });
@@ -77,8 +86,16 @@ function App() {
         const result = await openProject(path);
         setWorkspace(result);
         setProjectPath(path);
-        setStep(resumeStep);
-        setScreen(resumeStep === "workspace" ? "workspace" : "onboarding");
+        const runs = await listDeploymentRuns(path);
+        setDeploymentRuns(runs);
+        const resumable = runs.find((run) =>
+          ["queued", "running", "needs_action", "failed"].includes(run.status),
+        );
+        const effectiveStep =
+          resumeStep === "deploying" && !resumable ? "review" : resumeStep;
+        setCurrentRun(resumable ?? runs[0] ?? null);
+        setStep(effectiveStep);
+        setScreen(effectiveStep === "workspace" ? "workspace" : "onboarding");
         await refreshProjects();
       } catch (error) {
         reportError(toMessage(error));
@@ -91,11 +108,22 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    Promise.all([getPreflight(), listRecentProjects()])
-      .then(async ([system, recent]) => {
+    Promise.all([getPreflight(), listRecentProjects(), listServers()])
+      .then(async ([system, recent, servers]) => {
         if (!active) return;
         setPreflight(system);
         setProjects(recent);
+        const reusableServer = servers.find((server) => server.keyPathExists);
+        if (reusableServer) {
+          setLastServer({
+            name: reusableServer.name,
+            host: reusableServer.host,
+            user: reusableServer.user,
+            port: reusableServer.port,
+            keyPath: reusableServer.keyPath,
+            hostFingerprint: reusableServer.hostFingerprint,
+          });
+        }
         if (recent.length === 1 && recent[0].pathExists) {
           await loadProject(recent[0].path, recent[0].currentStep);
         }
@@ -162,11 +190,80 @@ function App() {
       const result = await applyManifest(projectPath, workspace.manifestYaml);
       const refreshed = await openProject(projectPath);
       setWorkspace(refreshed);
-      await saveProjectStep(projectPath, "workspace");
-      setStep("workspace");
-      setScreen("workspace");
+      const run = await startStagingDeployment(projectPath);
+      setCurrentRun(run);
+      setDeploymentRuns((current) => [
+        run,
+        ...current.filter((item) => item.id !== run.id),
+      ]);
+      await saveProjectStep(projectPath, "deploying");
+      setStep("deploying");
+      setScreen("onboarding");
       await refreshProjects();
       toast.success(`部署配置已生成，共更新 ${result.writtenFiles.length} 个文件`);
+    } catch (error) {
+      reportError(toMessage(error));
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  const refreshCurrentDeployment = useCallback(async () => {
+    if (!currentRun) return;
+    try {
+      const updated = await refreshDeployment(currentRun.id);
+      setCurrentRun(updated);
+      setDeploymentRuns((current) => [
+        updated,
+        ...current.filter((item) => item.id !== updated.id),
+      ]);
+    } catch (error) {
+      reportError(toMessage(error));
+    }
+  }, [currentRun, reportError]);
+
+  useEffect(() => {
+    if (
+      screen !== "onboarding" ||
+      step !== "deploying" ||
+      !currentRun ||
+      !["queued", "running"].includes(currentRun.status)
+    ) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      void refreshCurrentDeployment();
+    }, 8000);
+    return () => window.clearInterval(timer);
+  }, [currentRun, refreshCurrentDeployment, screen, step]);
+
+  async function retryDeployment() {
+    if (!projectPath) return;
+    setApplying(true);
+    try {
+      const run = await startStagingDeployment(projectPath);
+      setCurrentRun(run);
+      setDeploymentRuns((current) => [run, ...current]);
+    } catch (error) {
+      reportError(toMessage(error));
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  async function finishDeployment() {
+    await goToStep("workspace");
+  }
+
+  async function promoteToProduction(source: DeploymentRun) {
+    setApplying(true);
+    try {
+      const run = await promoteProductionDeployment(source.id);
+      setCurrentRun(run);
+      setDeploymentRuns((current) => [run, ...current]);
+      await saveProjectStep(projectPath, "deploying");
+      setStep("deploying");
+      setScreen("onboarding");
     } catch (error) {
       reportError(toMessage(error));
     } finally {
@@ -189,9 +286,9 @@ function App() {
   function renderOnboarding() {
     if (!workspace) return null;
     const footer =
-      step === "review" ? (
+      step === "review" || step === "deploying" ? (
         <span className="text-xs text-[var(--muted-foreground)]">
-          请在上方确认变更
+          {step === "deploying" ? "部署状态会自动保存" : "请在上方确认变更"}
         </span>
       ) : (
         <Button
@@ -212,7 +309,9 @@ function App() {
     return (
       <OnboardingLayout
         footer={footer}
-        onBack={step === "inspection" ? undefined : backStep}
+        onBack={
+          step === "inspection" || step === "deploying" ? undefined : backStep
+        }
         onClose={() => setScreen("home")}
         projectName={workspace.inspection.project_name}
         step={step}
@@ -241,6 +340,14 @@ function App() {
             applying={applying}
             onApply={applyCurrentPlan}
             workspace={workspace}
+          />
+        ) : null}
+        {step === "deploying" && currentRun ? (
+          <DeploymentProgress
+            onRefresh={refreshCurrentDeployment}
+            onRetry={retryDeployment}
+            onWorkspace={finishDeployment}
+            run={currentRun}
           />
         ) : null}
       </OnboardingLayout>
@@ -272,9 +379,11 @@ function App() {
             if (current) void forgetRecent(current);
           }}
           onHome={() => setScreen("home")}
+          onPromote={promoteToProduction}
           onRefresh={() => loadProject(projectPath, "workspace")}
           path={projectPath}
           preflight={preflight}
+          runs={deploymentRuns}
           workspace={workspace}
         />
       ) : null}

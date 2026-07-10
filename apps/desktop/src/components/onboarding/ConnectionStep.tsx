@@ -6,6 +6,7 @@ import {
   Copy,
   ExternalLink,
   FileKey2,
+  Fingerprint,
   KeyRound,
   LoaderCircle,
   Server,
@@ -104,6 +105,13 @@ export function ConnectionStep({
   }, [onError]);
 
   useEffect(() => {
+    if (!initialServer?.host) return;
+    setServer((current) =>
+      current.host ? current : { ...current, ...initialServer },
+    );
+  }, [initialServer]);
+
+  useEffect(() => {
     onStateChange({
       cnb: cnb.connected,
       server: serverCheck?.ok ?? false,
@@ -180,6 +188,13 @@ export function ConnectionStep({
     try {
       const result = await checkServer(server);
       setServerCheck(result);
+      if (result.provider === "ssh-host-key" && result.details[0]) {
+        setServer((current) => ({
+          ...current,
+          hostFingerprint: result.details[0],
+        }));
+        return;
+      }
       if (!result.ok) onError(result.summary);
     } catch (error) {
       onError(toMessage(error));
@@ -240,7 +255,11 @@ export function ConnectionStep({
               <Input
                 autoComplete="off"
                 onChange={(event) => {
-                  setServer((current) => ({ ...current, host: event.target.value }));
+                  setServer((current) => ({
+                    ...current,
+                    host: event.target.value,
+                    hostFingerprint: undefined,
+                  }));
                   setServerCheck(null);
                 }}
                 placeholder="例如 123.123.123.123"
@@ -252,7 +271,11 @@ export function ConnectionStep({
               <Input
                 autoComplete="username"
                 onChange={(event) => {
-                  setServer((current) => ({ ...current, user: event.target.value }));
+                  setServer((current) => ({
+                    ...current,
+                    user: event.target.value,
+                    hostFingerprint: undefined,
+                  }));
                   setServerCheck(null);
                 }}
                 value={server.user}
@@ -294,9 +317,23 @@ export function ConnectionStep({
                 ) : (
                   <ShieldCheck />
                 )}
-                验证连接
+                {serverCheck?.provider === "ssh-host-key"
+                  ? "确认并连接"
+                  : "验证连接"}
               </Button>
             </div>
+
+            {serverCheck?.provider === "ssh-host-key" ? (
+              <div className="flex items-start gap-3 rounded-md border border-[var(--accent-border)] bg-[var(--accent-soft)] p-3 sm:col-span-2">
+                <Fingerprint className="mt-0.5 size-4 shrink-0 text-[var(--accent)]" />
+                <span className="min-w-0 flex-1">
+                  <strong className="block text-xs font-medium">确认服务器身份</strong>
+                  <code className="mt-1 block break-all text-[11px] text-[var(--muted-foreground)]">
+                    {serverCheck.details[0]}
+                  </code>
+                </span>
+              </div>
+            ) : null}
 
             {generated ? (
               <div className="flex items-center gap-3 rounded-md border border-[var(--border)] bg-[var(--surface)] p-3 sm:col-span-2">

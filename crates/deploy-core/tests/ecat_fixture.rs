@@ -73,15 +73,16 @@ fn creates_three_isolated_environments_for_ecat() {
     );
     assert!(!admin.runtime_env.iter().any(|variable| variable.secret));
     assert!(!miniapp.runtime_env.iter().any(|variable| variable.secret));
-    assert_eq!(manifest.source.integration_branch, "test");
-    assert_eq!(manifest.source.stable_branch, "main");
+    assert_eq!(manifest.source.release_branch, "main");
+    assert!(manifest.source.integration_branch.is_empty());
+    assert!(manifest.source.stable_branch.is_empty());
     assert_eq!(
         manifest
             .environments
             .get(EnvironmentName::Staging)
             .branch
             .as_deref(),
-        Some("test")
+        None
     );
     assert_eq!(
         manifest
@@ -89,7 +90,7 @@ fn creates_three_isolated_environments_for_ecat() {
             .get(EnvironmentName::Production)
             .branch
             .as_deref(),
-        Some("main")
+        None
     );
     assert_ne!(
         manifest.environments.staging.target.namespace,

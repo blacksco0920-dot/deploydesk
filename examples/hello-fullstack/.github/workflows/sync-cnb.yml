@@ -1,4 +1,4 @@
-# 由 DeployDesk 生成。
+# 由 ABCDeploy 生成。
 concurrency:
   cancel-in-progress: true
   group: sync-cnb-${{ github.ref_name }}
@@ -23,7 +23,6 @@ name: Sync CNB
 on:
   push:
     branches:
-    - test
     - main
   workflow_dispatch: {}
 permissions:

@@ -198,6 +198,7 @@ export interface ServerForm {
   user: string;
   port: number;
   keyPath: string;
+  hostFingerprint?: string;
 }
 
 export interface SshIdentity {
@@ -212,4 +213,34 @@ export interface GeneratedSshIdentity {
   identity: SshIdentity;
   publicKey: string;
   created: boolean;
+}
+
+export interface ServerResource extends ServerForm {
+  id: string;
+  keyPathExists: boolean;
+  lastCheckedAt: string;
+}
+
+export type DeploymentRunStatus =
+  | "queued"
+  | "running"
+  | "needs_action"
+  | "success"
+  | "failed"
+  | "cancelled";
+
+export interface DeploymentRun {
+  id: string;
+  projectPath: string;
+  projectName: string;
+  environment: "staging" | "production";
+  status: DeploymentRunStatus;
+  currentStage: string;
+  buildSerial: string | null;
+  repository: string;
+  branch: string;
+  message: string;
+  completedSteps: string[];
+  startedAt: string;
+  updatedAt: string;
 }

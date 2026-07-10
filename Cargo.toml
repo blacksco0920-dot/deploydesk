@@ -23,6 +23,7 @@ keyring = "4.1"
 percent-encoding = "2.3"
 regex = "1.11"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+russh = { version = "0.61.2", default-features = false, features = ["ring", "rsa"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 schemars = { version = "1.2", features = ["chrono04"] }
 serde = { version = "1.0", features = ["derive"] }

@@ -30,6 +30,13 @@ describe("ConnectionsPanel", () => {
     fireEvent.click(staging.getByRole("button", { name: "验证 SSH" }));
 
     await waitFor(() =>
+      expect(staging.getByText("请确认这台服务器的身份指纹")).toBeInTheDocument(),
+    );
+    fireEvent.click(
+      staging.getByRole("button", { name: "确认指纹并验证" }),
+    );
+
+    await waitFor(() =>
       expect(staging.getByText("服务器连接正常")).toBeInTheDocument(),
     );
     const bootstrap = staging.getByRole("button", { name: "初始化 Caddy" });
@@ -44,7 +51,7 @@ describe("ConnectionsPanel", () => {
     fireEvent.click(bootstrap);
 
     await waitFor(() =>
-      expect(staging.getByText(/DeployDesk Caddy 已就绪/)).toBeInTheDocument(),
+      expect(staging.getByText(/ABCDeploy Caddy 已就绪/)).toBeInTheDocument(),
     );
     expect(onError).not.toHaveBeenCalled();
     expect(

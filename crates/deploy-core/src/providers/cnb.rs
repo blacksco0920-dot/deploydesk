@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Method;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -10,6 +12,14 @@ use crate::error::{DeployError, Result};
 use crate::redact::redact_text;
 
 const DEFAULT_API_BASE: &str = "https://api.cnb.cool";
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CnbBuildStatus {
+    pub status: String,
+    pub active_stages: Vec<String>,
+    pub error_stages: Vec<String>,
+    pub pipeline_ids: Vec<String>,
+}
 
 pub struct CnbClient {
     client: reqwest::Client,
@@ -169,6 +179,17 @@ impl CnbClient {
         .await
     }
 
+    pub async fn build_status(&self, repository: &str, serial: &str) -> Result<Value> {
+        let repository = encode_segment(repository);
+        let serial = encode_segment(serial);
+        self.request(
+            Method::GET,
+            &format!("/{repository}/-/build/status/{serial}"),
+            None,
+        )
+        .await
+    }
+
     async fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
         let mut request = self
             .client
@@ -195,6 +216,64 @@ impl CnbClient {
             source,
         })
     }
+}
+
+#[must_use]
+pub fn build_serial(value: &Value) -> Option<String> {
+    [
+        value.get("sn"),
+        value.get("buildSn"),
+        value.pointer("/data/sn"),
+        value.pointer("/data/buildSn"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(value_as_string)
+}
+
+#[must_use]
+pub fn summarize_build_status(value: &Value) -> CnbBuildStatus {
+    let mut active_stages = Vec::new();
+    let mut error_stages = Vec::new();
+    let mut pipeline_ids = Vec::new();
+    if let Some(pipelines) = value.get("pipelinesStatus").and_then(Value::as_object) {
+        for (pipeline_id, pipeline) in pipelines {
+            pipeline_ids.push(pipeline_id.clone());
+            if let Some(stages) = pipeline.get("stages").and_then(Value::as_array) {
+                for stage in stages {
+                    let status = stage.get("status").and_then(Value::as_str).unwrap_or("");
+                    let name = stage
+                        .get("name")
+                        .or_else(|| stage.get("id"))
+                        .and_then(value_as_string)
+                        .unwrap_or_else(|| "未知阶段".to_string());
+                    if matches!(status, "start" | "running") {
+                        active_stages.push(name);
+                    } else if matches!(status, "error" | "failed") {
+                        error_stages.push(name);
+                    }
+                }
+            }
+        }
+    }
+    pipeline_ids.sort();
+    pipeline_ids.dedup();
+    CnbBuildStatus {
+        status: value
+            .get("status")
+            .and_then(value_as_string)
+            .unwrap_or_else(|| "unknown".to_string()),
+        active_stages,
+        error_stages,
+        pipeline_ids,
+    }
+}
+
+fn value_as_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .or_else(|| value.as_u64().map(|number| number.to_string()))
 }
 
 fn encode_segment(value: &str) -> String {
@@ -228,6 +307,28 @@ mod tests {
     #[test]
     fn repository_slug_is_fully_encoded() {
         assert_eq!(encode_segment("owner/repo"), "owner%2Frepo");
+    }
+
+    #[test]
+    fn summarizes_build_responses_without_exposing_unrelated_fields() {
+        let payload = json!({
+            "sn": 42,
+            "status": "running",
+            "pipelinesStatus": {
+                "pipeline-1": {
+                    "stages": [
+                        {"name": "构建镜像", "status": "running"},
+                        {"name": "健康检查", "status": "waiting"}
+                    ]
+                }
+            },
+            "token": "must-not-be-copied"
+        });
+        assert_eq!(build_serial(&payload).as_deref(), Some("42"));
+        let summary = summarize_build_status(&payload);
+        assert_eq!(summary.status, "running");
+        assert_eq!(summary.active_stages, ["构建镜像"]);
+        assert_eq!(summary.pipeline_ids, ["pipeline-1"]);
     }
 
     #[tokio::test]

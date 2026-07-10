@@ -311,24 +311,22 @@ fn render_caddy(
 }
 
 fn render_cnb_pipeline(manifest: &ProjectManifest) -> Result<String> {
-    let staging = integration_pipeline(manifest)?;
     let release = release_pipeline(manifest)?;
 
     let mut root = Map::new();
     root.insert(
-        manifest.source.integration_branch.clone(),
-        json!({ "push": [staging] }),
+        manifest.source.release_branch.clone(),
+        json!({ "push": [release.clone()] }),
     );
-    root.insert(
-        manifest.source.stable_branch.clone(),
-        json!({ "push": [release] }),
-    );
+    let mut api_triggers = Map::new();
+    api_triggers.insert("api_trigger_staging".to_string(), json!([release]));
     if manifest.release.production_mode == ProductionMode::Approval {
-        root.insert(
-            "$".to_string(),
-            json!({ "api_trigger_production": [production_pipeline(manifest)?] }),
+        api_triggers.insert(
+            "api_trigger_production".to_string(),
+            json!([production_pipeline(manifest)?]),
         );
     }
+    root.insert("$".to_string(), Value::Object(api_triggers));
     let mut content =
         serde_yaml_ng::to_string(&Value::Object(root)).map_err(|source| DeployError::Yaml {
             path: ".cnb.yml".into(),
@@ -336,28 +334,9 @@ fn render_cnb_pipeline(manifest: &ProjectManifest) -> Result<String> {
         })?;
     content.insert_str(
         0,
-        "# 由 DeployDesk 生成。流水线只引用密钥，不在仓库保存密钥值。\n",
+        "# 由 ABCDeploy 生成。流水线只引用密钥，不在仓库保存密钥值。\n",
     );
     Ok(content)
-}
-
-fn integration_pipeline(manifest: &ProjectManifest) -> Result<Value> {
-    let mut stages = build_stages(manifest);
-    stages.push(json!({
-        "name": "部署测试环境",
-        "script": [deploy_script(
-            manifest,
-            EnvironmentName::Staging,
-            ReleaseChannel::Candidate,
-        )?]
-    }));
-    let imports = [secret_import(manifest, EnvironmentName::Staging)];
-    Ok(pipeline_definition(
-        "deploydesk-integration",
-        &imports,
-        EnvironmentName::Staging,
-        &stages,
-    ))
 }
 
 fn release_pipeline(manifest: &ProjectManifest) -> Result<Value> {
@@ -906,10 +885,7 @@ fn render_github_sync(manifest: &ProjectManifest) -> Result<String> {
         "name": "Sync CNB",
         "on": {
             "push": {
-                "branches": [
-                    manifest.source.integration_branch,
-                    manifest.source.stable_branch
-                ]
+            "branches": [manifest.source.release_branch]
             },
             "workflow_dispatch": Value::Object(Map::new())
         },
@@ -944,7 +920,7 @@ fn render_github_sync(manifest: &ProjectManifest) -> Result<String> {
         path: ".github/workflows/sync-cnb.yml".into(),
         source,
     })?;
-    content.insert_str(0, "# 由 DeployDesk 生成。\n");
+    content.insert_str(0, "# 由 ABCDeploy 生成。\n");
     Ok(content)
 }
 
@@ -964,7 +940,7 @@ mod tests {
     use crate::scanner::inspection_fixture;
 
     #[test]
-    fn renders_three_isolated_compose_files_and_two_branch_pipeline() {
+    fn renders_three_isolated_environments_and_one_release_branch() {
         let mut manifest = create_default_manifest(&inspection_fixture());
         manifest.environments.staging.domains.push(DomainRoute {
             service: "api".to_string(),
@@ -986,8 +962,14 @@ mod tests {
             .iter()
             .find(|file| file.path == ".cnb.yml")
             .expect("pipeline");
-        assert!(pipeline.content.contains("test:"));
         assert!(pipeline.content.contains("main:"));
+        assert!(!pipeline.content.contains("test:"));
+        let pipeline_yaml: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&pipeline.content).expect("parse generated pipeline");
+        let main_pipeline =
+            serde_yaml_ng::to_string(&pipeline_yaml["main"]).expect("serialize main pipeline");
+        assert_eq!(main_pipeline.matches("构建并上传").count(), 1);
+        assert!(pipeline.content.contains("api_trigger_staging"));
         assert!(pipeline.content.contains("api_trigger_production"));
         assert!(pipeline.content.contains("在测试环境验证生产候选"));
         assert!(pipeline.content.contains("标记已验证镜像摘要"));

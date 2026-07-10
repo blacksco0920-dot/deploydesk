@@ -16,7 +16,11 @@ import {
   Trash2,
 } from "lucide-react";
 import { useState } from "react";
-import type { SystemPreflight, WorkspacePreview } from "../types";
+import type {
+  DeploymentRun,
+  SystemPreflight,
+  WorkspacePreview,
+} from "../types";
 import { Brand } from "./Brand";
 import { Button } from "./ui/button";
 import {
@@ -51,7 +55,9 @@ interface WorkspaceShellProps {
   onDeploy: () => void;
   onForget: () => void;
   onHome: () => void;
+  onPromote: (run: DeploymentRun) => void;
   onRefresh: () => void;
+  runs: DeploymentRun[];
 }
 
 export function WorkspaceShell({
@@ -61,7 +67,9 @@ export function WorkspaceShell({
   onDeploy,
   onForget,
   onHome,
+  onPromote,
   onRefresh,
+  runs,
 }: WorkspaceShellProps) {
   const [active, setActive] = useState<WorkspaceSection>("project");
   const [confirmForget, setConfirmForget] = useState(false);
@@ -170,9 +178,15 @@ export function WorkspaceShell({
 
           <main className="min-h-0 overflow-auto">
             <div className="mx-auto w-full max-w-[980px] px-6 py-8">
-              {active === "project" ? <ProjectView workspace={workspace} /> : null}
-              {active === "deployments" ? <DeploymentsView workspace={workspace} /> : null}
-              {active === "environments" ? <EnvironmentsView workspace={workspace} /> : null}
+              {active === "project" ? (
+                <ProjectView onPromote={onPromote} runs={runs} workspace={workspace} />
+              ) : null}
+              {active === "deployments" ? (
+                <DeploymentsView runs={runs} workspace={workspace} />
+              ) : null}
+              {active === "environments" ? (
+                <EnvironmentsView runs={runs} workspace={workspace} />
+              ) : null}
               {active === "resources" ? <ResourcesView /> : null}
               {active === "settings" ? (
                 <SettingsView
@@ -209,7 +223,17 @@ export function WorkspaceShell({
   );
 }
 
-function ProjectView({ workspace }: { workspace: WorkspacePreview }) {
+function ProjectView({
+  onPromote,
+  runs,
+  workspace,
+}: {
+  onPromote: (run: DeploymentRun) => void;
+  runs: DeploymentRun[];
+  workspace: WorkspacePreview;
+}) {
+  const staging = runs.find((run) => run.environment === "staging");
+  const production = runs.find((run) => run.environment === "production");
   return (
     <div>
       <div className="mb-8 flex items-start justify-between gap-5">
@@ -222,22 +246,36 @@ function ProjectView({ workspace }: { workspace: WorkspacePreview }) {
             {workspace.inspection.services.length} 个服务 · {workspace.inspection.package_manager}
           </p>
         </div>
-        <span className="flex items-center gap-2 rounded-md bg-[var(--success-soft)] px-3 py-2 text-xs font-medium text-[var(--success)]">
+        <span
+          className={`flex items-center gap-2 rounded-md px-3 py-2 text-xs font-medium ${
+            staging?.status === "success"
+              ? "bg-[var(--success-soft)] text-[var(--success)]"
+              : "bg-[var(--muted)] text-[var(--muted-foreground)]"
+          }`}
+        >
           <CheckCircle2 className="size-4" />
-          部署配置已就绪
+          {staging?.status === "success" ? "测试环境运行正常" : "等待首次测试部署"}
         </span>
       </div>
 
       <section className="grid gap-px overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--border)] sm:grid-cols-2">
         <EnvironmentSummary
-          description="等待首次部署"
+          description={staging?.message ?? "等待首次部署"}
           name="测试环境"
-          status="准备就绪"
+          status={runStatus(staging)}
         />
         <EnvironmentSummary
-          description="测试通过后可以发布"
+          action={
+            staging?.status === "success" && production?.status !== "success" ? (
+              <Button onClick={() => onPromote(staging)} size="sm" variant="secondary">
+                <Rocket />
+                发布生产
+              </Button>
+            ) : null
+          }
+          description={production?.message ?? "测试通过后可以发布"}
           name="生产环境"
-          status="尚未发布"
+          status={runStatus(production)}
         />
       </section>
 
@@ -272,7 +310,13 @@ function ProjectView({ workspace }: { workspace: WorkspacePreview }) {
   );
 }
 
-function DeploymentsView({ workspace }: { workspace: WorkspacePreview }) {
+function DeploymentsView({
+  runs,
+  workspace,
+}: {
+  runs: DeploymentRun[];
+  workspace: WorkspacePreview;
+}) {
   return (
     <div>
       <PageHeading
@@ -280,19 +324,41 @@ function DeploymentsView({ workspace }: { workspace: WorkspacePreview }) {
         title="部署记录"
       />
       <div className="border-y border-[var(--border)]">
-        {workspace.plan.steps.map((step, index) => (
+        {runs.length ? runs.map((run) => (
+          <div
+            className="flex min-h-[62px] items-center gap-3 border-b border-[var(--border)] px-2 last:border-b-0"
+            key={run.id}
+          >
+            <span className={`grid size-7 shrink-0 place-items-center rounded-full ${
+              run.status === "success"
+                ? "bg-[var(--success-soft)] text-[var(--success)]"
+                : run.status === "failed" || run.status === "needs_action"
+                  ? "bg-[var(--warning-soft)] text-[var(--warning)]"
+                  : "bg-[var(--accent-soft)] text-[var(--accent)]"
+            }`}>
+              {run.status === "success" ? <CheckCircle2 className="size-4" /> : <Activity className="size-4" />}
+            </span>
+            <span className="min-w-0 flex-1">
+              <strong className="block text-sm font-medium">
+                {run.environment === "production" ? "生产发布" : "测试部署"}
+              </strong>
+              <span className="block truncate text-xs text-[var(--muted-foreground)]">
+                {run.message}
+              </span>
+            </span>
+            <span className="text-xs text-[var(--subtle-foreground)]">
+              {new Date(run.startedAt).toLocaleString("zh-CN")}
+            </span>
+          </div>
+        )) : workspace.plan.steps.map((step, index) => (
           <div
             className="flex min-h-[62px] items-center gap-3 border-b border-[var(--border)] px-2 last:border-b-0"
             key={step.id}
           >
-            <span className="grid size-7 shrink-0 place-items-center rounded-full bg-[var(--muted)] text-xs font-medium text-[var(--muted-foreground)]">
-              {index + 1}
-            </span>
+            <span className="grid size-7 shrink-0 place-items-center rounded-full bg-[var(--muted)] text-xs font-medium text-[var(--muted-foreground)]">{index + 1}</span>
             <span className="min-w-0 flex-1">
               <strong className="block text-sm font-medium">{step.title}</strong>
-              <span className="block truncate text-xs text-[var(--muted-foreground)]">
-                {step.detail}
-              </span>
+              <span className="block truncate text-xs text-[var(--muted-foreground)]">{step.detail}</span>
             </span>
             <span className="text-xs text-[var(--subtle-foreground)]">等待首次运行</span>
           </div>
@@ -302,7 +368,13 @@ function DeploymentsView({ workspace }: { workspace: WorkspacePreview }) {
   );
 }
 
-function EnvironmentsView({ workspace }: { workspace: WorkspacePreview }) {
+function EnvironmentsView({
+  runs,
+  workspace,
+}: {
+  runs: DeploymentRun[];
+  workspace: WorkspacePreview;
+}) {
   return (
     <div>
       <PageHeading
@@ -320,7 +392,9 @@ function EnvironmentsView({ workspace }: { workspace: WorkspacePreview }) {
               {environment.target}
             </span>
             <span className="text-right text-xs text-[var(--muted-foreground)]">
-              {environment.approval_required
+              {environment.name !== "development" && runs.find((run) => run.environment === environment.name)
+                ? runStatus(runs.find((run) => run.environment === environment.name))
+                : environment.approval_required
                 ? "发布前确认"
                 : environment.automatic
                   ? "自动更新"
@@ -389,10 +463,12 @@ function SettingsView({
 }
 
 function EnvironmentSummary({
+  action,
   description,
   name,
   status,
 }: {
+  action?: React.ReactNode;
   description: string;
   name: string;
   status: string;
@@ -401,11 +477,23 @@ function EnvironmentSummary({
     <div className="bg-[var(--surface)] p-5">
       <div className="flex items-center justify-between gap-3">
         <strong className="text-sm font-medium">{name}</strong>
-        <span className="text-xs text-[var(--success)]">{status}</span>
+        {action ?? <span className="text-xs text-[var(--success)]">{status}</span>}
       </div>
       <p className="mb-0 mt-2 text-xs text-[var(--muted-foreground)]">{description}</p>
     </div>
   );
+}
+
+function runStatus(run: DeploymentRun | undefined) {
+  if (!run) return "尚未部署";
+  return {
+    queued: "等待资源",
+    running: "部署中",
+    needs_action: "需要处理",
+    success: "运行正常",
+    failed: "部署失败",
+    cancelled: "已取消",
+  }[run.status];
 }
 
 function ResourceRow({

@@ -1,10 +1,15 @@
 use std::path::{Path, PathBuf};
 
+use chrono::Utc;
 use deploy_core::manifest::{ManifestValidation, validate_manifest};
 use deploy_core::model::{DeploymentPlan, InspectionReport, ProviderCheck, SystemPreflight};
 use deploy_core::plan::serialize_manifest;
 use deploy_core::preflight::system_preflight;
-use deploy_core::providers::{caddy, cnb::CnbClient, docker, ssh};
+use deploy_core::providers::{
+    caddy,
+    cnb::{CnbClient, build_serial, summarize_build_status},
+    docker, ssh,
+};
 use deploy_core::redact::redact_text;
 use deploy_core::{
     MANIFEST_FILE, apply_plan, build_plan, create_default_manifest, inspect_project, load_manifest,
@@ -17,7 +22,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod workspace;
 
-use workspace::{RecentProject, WorkspaceState};
+use workspace::{DeploymentRun, RecentProject, ServerResource, WorkspaceState};
 
 const KEYRING_SERVICE: &str = "cloud.finagent.abcdeploy";
 const LEGACY_KEYRING_SERVICE: &str = "com.deploydesk.desktop";
@@ -171,6 +176,238 @@ fn forget_project(path: String, state: State<'_, WorkspaceState>) -> Result<bool
 }
 
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri injects managed state by value.
+fn list_servers(state: State<'_, WorkspaceState>) -> Result<Vec<ServerResource>, String> {
+    state.list_servers()
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
+async fn start_staging_deployment(
+    path: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<DeploymentRun, String> {
+    let root = PathBuf::from(&path);
+    let manifest = load_manifest(&root.join(MANIFEST_FILE)).map_err(public_error)?;
+    let validation = validate_manifest(&manifest);
+    if !validation.valid {
+        return Err("部署配置仍有必填项或隔离问题，请先处理校验结果".to_string());
+    }
+    let run = state.create_deployment_run(
+        &root,
+        &manifest.project.name,
+        "staging",
+        &manifest.providers.build.repository,
+        &manifest.source.release_branch,
+    )?;
+    state.set_project_step(&root, "deploying")?;
+    Ok(trigger_cnb_run(run, "api_trigger_staging", &state).await)
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
+async fn promote_production_deployment(
+    source_run_id: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<DeploymentRun, String> {
+    let source = state.deployment_run(&source_run_id)?;
+    if source.environment != "staging" || source.status != "success" {
+        return Err("只有健康检查通过的测试版本才能发布生产".to_string());
+    }
+    let run = state.create_deployment_run(
+        Path::new(&source.project_path),
+        &source.project_name,
+        "production",
+        &source.repository,
+        &source.branch,
+    )?;
+    Ok(trigger_cnb_run(run, "api_trigger_production", &state).await)
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
+async fn refresh_deployment(
+    run_id: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<DeploymentRun, String> {
+    let mut run = state.deployment_run(&run_id)?;
+    if matches!(run.status.as_str(), "success" | "failed" | "cancelled") {
+        return Ok(run);
+    }
+    let Some(serial) = run.build_serial.clone() else {
+        run.status = "needs_action".to_string();
+        run.message = "CNB 已接受请求，但没有返回构建编号；请检查最近构建记录".to_string();
+        run.updated_at = Utc::now().to_rfc3339();
+        state.save_deployment_run(&run)?;
+        return Ok(run);
+    };
+    let token = match read_keyring_secret("cnb-token") {
+        Ok(value) => Zeroizing::new(value),
+        Err(error) => {
+            run.status = "needs_action".to_string();
+            run.message = if error == "missing" {
+                "CNB 登录已失效，请重新连接后继续".to_string()
+            } else {
+                public_error(error)
+            };
+            run.updated_at = Utc::now().to_rfc3339();
+            state.save_deployment_run(&run)?;
+            return Ok(run);
+        }
+    };
+    let client = CnbClient::new(token.as_str()).map_err(public_error)?;
+    match client.build_status(&run.repository, &serial).await {
+        Ok(payload) => update_run_from_cnb(&mut run, &payload),
+        Err(error) => {
+            let message = public_error(error);
+            run.status = if message.contains("权限不足") {
+                "needs_action".to_string()
+            } else {
+                "failed".to_string()
+            };
+            run.message = message;
+        }
+    }
+    run.updated_at = Utc::now().to_rfc3339();
+    state.save_deployment_run(&run)?;
+    if run.status == "success" && run.environment == "staging" {
+        state.set_project_step(Path::new(&run.project_path), "workspace")?;
+    }
+    Ok(run)
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
+fn list_deployment_runs(
+    path: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<Vec<DeploymentRun>, String> {
+    state.list_deployment_runs(Path::new(&path))
+}
+
+async fn trigger_cnb_run(
+    mut run: DeploymentRun,
+    event: &str,
+    state: &WorkspaceState,
+) -> DeploymentRun {
+    let result = async {
+        let token = Zeroizing::new(resolve_cnb_token(String::new())?);
+        let client = CnbClient::new(token.as_str()).map_err(public_error)?;
+        let response = client
+            .trigger_build(
+                &run.repository,
+                &run.branch,
+                event,
+                &format!("ABCDeploy · {} · {}", run.project_name, run.environment),
+            )
+            .await
+            .map_err(public_error)?;
+        let serial = if let Some(serial) = build_serial(&response) {
+            Some(serial)
+        } else {
+            let recent = client
+                .recent_builds(&run.repository, 1)
+                .await
+                .map_err(public_error)?;
+            recent.pointer("/data/0/sn").and_then(|value| {
+                value
+                    .as_str()
+                    .map(ToString::to_string)
+                    .or_else(|| value.as_u64().map(|number| number.to_string()))
+            })
+        };
+        Ok::<Option<String>, String>(serial)
+    }
+    .await;
+
+    match result {
+        Ok(serial) => {
+            run.build_serial = serial;
+            run.status = "running".to_string();
+            run.current_stage = "build".to_string();
+            run.message = "CNB 已开始构建，关闭应用后也可以继续查看".to_string();
+        }
+        Err(message) => {
+            run.status = if message.contains("权限不足") || message.contains("重新连接") {
+                "needs_action".to_string()
+            } else {
+                "failed".to_string()
+            };
+            run.message = message;
+        }
+    }
+    run.updated_at = Utc::now().to_rfc3339();
+    let _ = state.save_deployment_run(&run);
+    run
+}
+
+fn update_run_from_cnb(run: &mut DeploymentRun, payload: &serde_json::Value) {
+    let summary = summarize_build_status(payload);
+    let current = summary
+        .active_stages
+        .first()
+        .cloned()
+        .or_else(|| summary.error_stages.first().cloned());
+    match summary.status.as_str() {
+        "success" => {
+            run.status = "success".to_string();
+            run.current_stage = "complete".to_string();
+            run.message = if run.environment == "production" {
+                "生产环境已按测试通过的同一镜像摘要发布".to_string()
+            } else {
+                "测试环境部署完成并通过健康检查".to_string()
+            };
+            run.completed_steps = vec![
+                "write-config".to_string(),
+                "verify-build".to_string(),
+                "publish-images".to_string(),
+                "prepare-server".to_string(),
+                "deploy".to_string(),
+                "healthcheck".to_string(),
+            ];
+        }
+        "error" | "failed" => {
+            run.status = "failed".to_string();
+            run.current_stage = stage_key(current.as_deref());
+            run.message = current.map_or_else(
+                || "CNB 构建失败，请查看经过脱敏的技术日志".to_string(),
+                |stage| format!("{stage}未完成，可以从这个阶段重试"),
+            );
+        }
+        "waiting" | "pending" | "queued" => {
+            run.status = "queued".to_string();
+            run.message = "CNB 正在分配构建资源".to_string();
+        }
+        _ => {
+            run.status = "running".to_string();
+            run.current_stage = stage_key(current.as_deref());
+            run.message = current.map_or_else(
+                || "CNB 正在执行部署流程".to_string(),
+                |stage| format!("正在执行：{stage}"),
+            );
+        }
+    }
+}
+
+fn stage_key(stage: Option<&str>) -> String {
+    let stage = stage.unwrap_or("");
+    if stage.contains("安装") || stage.contains("验证") || stage.contains("构建") {
+        "build"
+    } else if stage.contains("上传") || stage.contains("镜像") {
+        "publish"
+    } else if stage.contains("服务器") {
+        "prepare-server"
+    } else if stage.contains("健康") {
+        "healthcheck"
+    } else if stage.contains("部署") || stage.contains("环境") {
+        "deploy"
+    } else {
+        "build"
+    }
+    .to_string()
+}
+
+#[tauri::command]
 fn check_docker() -> Result<ProviderCheck, String> {
     docker::check_engine().map_err(public_error)
 }
@@ -186,43 +423,60 @@ fn generate_ssh_identity() -> Result<ssh::GeneratedSshIdentity, String> {
 }
 
 #[tauri::command]
-fn check_server(
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
+async fn check_server(
     name: String,
     host: String,
     user: String,
     key_path: String,
     port: u16,
+    host_fingerprint: Option<String>,
+    state: State<'_, WorkspaceState>,
 ) -> Result<ProviderCheck, String> {
-    ssh::check_connection(&ssh::SshProfile {
+    let profile = ssh::SshProfile {
         name,
         host,
         user,
         port,
         key_path: PathBuf::from(key_path),
-    })
-    .map_err(public_error)
+        host_fingerprint,
+    };
+    let result = ssh::check_connection(&profile)
+        .await
+        .map_err(public_error)?;
+    if result.ok {
+        state.remember_server(&profile)?;
+    }
+    Ok(result)
 }
 
 #[tauri::command]
-fn bootstrap_server_caddy(
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)] // Tauri IPC deserializes flat, owned arguments.
+async fn bootstrap_server_caddy(
     name: String,
     host: String,
     user: String,
     key_path: String,
     port: u16,
+    host_fingerprint: Option<String>,
     confirmed: bool,
+    state: State<'_, WorkspaceState>,
 ) -> Result<ProviderCheck, String> {
-    caddy::bootstrap_server(
-        &ssh::SshProfile {
-            name,
-            host,
-            user,
-            port,
-            key_path: PathBuf::from(key_path),
-        },
-        confirmed,
-    )
-    .map_err(public_error)
+    let profile = ssh::SshProfile {
+        name,
+        host,
+        user,
+        port,
+        key_path: PathBuf::from(key_path),
+        host_fingerprint,
+    };
+    let result = caddy::bootstrap_server(&profile, confirmed)
+        .await
+        .map_err(public_error)?;
+    if result.ok {
+        state.remember_server(&profile)?;
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -401,6 +655,11 @@ pub fn run() {
             list_recent_projects,
             save_project_step,
             forget_project,
+            list_servers,
+            start_staging_deployment,
+            promote_production_deployment,
+            refresh_deployment,
+            list_deployment_runs,
             preview_manifest,
             apply_manifest,
             check_docker,
@@ -417,4 +676,56 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("DeployDesk failed to start");
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{DeploymentRun, stage_key, update_run_from_cnb};
+
+    fn run() -> DeploymentRun {
+        DeploymentRun {
+            id: "run-1".to_string(),
+            project_path: "/tmp/sample".to_string(),
+            project_name: "sample".to_string(),
+            environment: "staging".to_string(),
+            status: "running".to_string(),
+            current_stage: "build".to_string(),
+            build_serial: Some("42".to_string()),
+            repository: "owner/sample".to_string(),
+            branch: "main".to_string(),
+            message: String::new(),
+            completed_steps: vec!["write-config".to_string()],
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn maps_cnb_stages_to_resumable_product_state() {
+        let mut deployment = run();
+        update_run_from_cnb(
+            &mut deployment,
+            &json!({
+                "status": "running",
+                "pipelinesStatus": {
+                    "pipeline": {"stages": [{"name": "部署测试环境", "status": "running"}]}
+                }
+            }),
+        );
+        assert_eq!(deployment.status, "running");
+        assert_eq!(deployment.current_stage, "deploy");
+        assert!(deployment.message.contains("部署测试环境"));
+
+        update_run_from_cnb(&mut deployment, &json!({"status": "success"}));
+        assert_eq!(deployment.status, "success");
+        assert_eq!(deployment.current_stage, "complete");
+        assert!(
+            deployment
+                .completed_steps
+                .contains(&"healthcheck".to_string())
+        );
+        assert_eq!(stage_key(Some("上传镜像")), "publish");
+    }
 }

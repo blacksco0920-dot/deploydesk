@@ -149,6 +149,14 @@ export function ConnectionsPanel({
     setCheckingServer(form.name);
     try {
       const result = await checkServer(form);
+      if (result.provider === "ssh-host-key" && result.details[0]) {
+        const verifiedForm = {
+          ...form,
+          hostFingerprint: result.details[0],
+        };
+        if (form.name === staging.name) setStaging(verifiedForm);
+        if (form.name === production.name) setProduction(verifiedForm);
+      }
       setServerChecks((current) => ({ ...current, [form.name]: result }));
     } catch (error) {
       onError(toMessage(error));
@@ -463,7 +471,11 @@ function ServerConnectionForm({
           地址
           <input
             onChange={(event) =>
-              onChange({ ...form, host: event.target.value })
+              onChange({
+                ...form,
+                host: event.target.value,
+                hostFingerprint: undefined,
+              })
             }
             placeholder="服务器 IP 或域名"
             value={form.host}
@@ -473,7 +485,11 @@ function ServerConnectionForm({
           用户名
           <input
             onChange={(event) =>
-              onChange({ ...form, user: event.target.value })
+              onChange({
+                ...form,
+                user: event.target.value,
+                hostFingerprint: undefined,
+              })
             }
             value={form.user}
           />
@@ -506,7 +522,7 @@ function ServerConnectionForm({
         ) : (
           <ShieldCheck size={16} />
         )}
-        验证 SSH
+        {check?.provider === "ssh-host-key" ? "确认指纹并验证" : "验证 SSH"}
       </button>
       {check ? (
         <span
