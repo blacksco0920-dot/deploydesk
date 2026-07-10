@@ -74,7 +74,7 @@ $:
         test -n "$SERVER_USER"
         test -n "$SERVER_SSH_KEY"
         if [ -z "$SERVER_KNOWN_HOSTS" ]; then
-          SCANNED_HOST_KEYS="$(ssh-keyscan -T 5 -p "$SERVER_PORT" -t ed25519 "$SERVER_HOST" 2>/dev/null)"
+          SCANNED_HOST_KEYS="$(ssh-keyscan -T 5 -p "$SERVER_PORT" -t ed25519 "$SERVER_HOST" 2>/dev/null | awk '$1 !~ /^#/ && NF >= 3')"
           test -n "$SCANNED_HOST_KEYS"
           ACTUAL_FINGERPRINT="$(printf '%s\n' "$SCANNED_HOST_KEYS" | ssh-keygen -lf - | awk 'NR == 1 { print $2 }')"
           test "$ACTUAL_FINGERPRINT" = "$ABCDEPLOY_SERVER_FINGERPRINT"
@@ -225,7 +225,7 @@ $:
         test -n "$SERVER_USER"
         test -n "$SERVER_SSH_KEY"
         if [ -z "$SERVER_KNOWN_HOSTS" ]; then
-          SCANNED_HOST_KEYS="$(ssh-keyscan -T 5 -p "$SERVER_PORT" -t ed25519 "$SERVER_HOST" 2>/dev/null)"
+          SCANNED_HOST_KEYS="$(ssh-keyscan -T 5 -p "$SERVER_PORT" -t ed25519 "$SERVER_HOST" 2>/dev/null | awk '$1 !~ /^#/ && NF >= 3')"
           test -n "$SCANNED_HOST_KEYS"
           ACTUAL_FINGERPRINT="$(printf '%s\n' "$SCANNED_HOST_KEYS" | ssh-keygen -lf - | awk 'NR == 1 { print $2 }')"
           test "$ACTUAL_FINGERPRINT" = "$ABCDEPLOY_SERVER_FINGERPRINT"
@@ -389,7 +389,7 @@ main:
         test -n "$SERVER_USER"
         test -n "$SERVER_SSH_KEY"
         if [ -z "$SERVER_KNOWN_HOSTS" ]; then
-          SCANNED_HOST_KEYS="$(ssh-keyscan -T 5 -p "$SERVER_PORT" -t ed25519 "$SERVER_HOST" 2>/dev/null)"
+          SCANNED_HOST_KEYS="$(ssh-keyscan -T 5 -p "$SERVER_PORT" -t ed25519 "$SERVER_HOST" 2>/dev/null | awk '$1 !~ /^#/ && NF >= 3')"
           test -n "$SCANNED_HOST_KEYS"
           ACTUAL_FINGERPRINT="$(printf '%s\n' "$SCANNED_HOST_KEYS" | ssh-keygen -lf - | awk 'NR == 1 { print $2 }')"
           test "$ACTUAL_FINGERPRINT" = "$ABCDEPLOY_SERVER_FINGERPRINT"
