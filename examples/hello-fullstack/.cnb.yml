@@ -1,0 +1,465 @@
+# 由 DeployDesk 生成。流水线只引用密钥，不在仓库保存密钥值。
+$:
+  api_trigger_production:
+  - docker:
+      image: node:22-slim
+    env:
+      DEPLOYDESK_ENV: production
+    imports:
+    - https://cnb.cool/replace-me/secret/-/blob/main/env.production.yml
+    name: deploydesk-production-approved
+    runner:
+      cpus: 4
+      tags: cnb:arch:amd64
+    services:
+    - docker
+    stages:
+    - name: 准备安全部署工具
+      script:
+      - apt-get update && apt-get install -y --no-install-recommends ca-certificates openssh-client && rm -rf /var/lib/apt/lists/*
+    - name: 登录镜像仓库
+      script:
+      - |-
+        test -n "$CNB_TOKEN"
+        printf '%s' "$CNB_TOKEN" | docker login docker.cnb.cool --username "${CNB_USERNAME:-cnb}" --password-stdin
+    - name: 按已验证摘要部署生产环境
+      script:
+      - |-
+        set -eu
+        IMAGE_TAG="sha-${CNB_COMMIT_SHORT}"
+        RELEASE_TAG="verified-${IMAGE_TAG}"
+        RUNTIME_DIRECTORY='.deploydesk/runtime/production'
+        rm -rf "$RUNTIME_DIRECTORY"
+        install -d -m 700 "$RUNTIME_DIRECTORY"
+        node <<'DEPLOYDESK_NODE'
+        const fs = require("node:fs");
+        const variables = [{"name":"API_GREETING","source":"PRODUCTION_API_GREETING","required":true,"default":null},{"name":"VITE_API_BASE_URL","source":"PRODUCTION_VITE_API_BASE_URL","required":true,"default":null}];
+        const outputPath = ".deploydesk/runtime/production/.runtime.env";
+        const lines = ["DEPLOYDESK_ENV=production"];
+        const missing = [];
+        for (const variable of variables) {
+          const configured = Object.prototype.hasOwnProperty.call(process.env, variable.source);
+          const value = configured ? process.env[variable.source] : (variable.default ?? "");
+          if (variable.required && !value) missing.push(variable.source);
+          if (/\r|\n/.test(value)) {
+            console.error(`密钥仓库字段 ${variable.source} 不支持换行值`);
+            process.exit(1);
+          }
+          lines.push(`${variable.name}=${JSON.stringify(value)}`);
+        }
+        if (missing.length) {
+          console.error(`缺少密钥仓库字段：${missing.join(", ")}`);
+          process.exit(1);
+        }
+        fs.writeFileSync(outputPath, `${lines.join("\n")}\n`, { mode: 0o600 });
+        DEPLOYDESK_NODE
+        DEPLOYDESK_API_IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-api'
+        DEPLOYDESK_API_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_API_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
+        case "${DEPLOYDESK_API_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 api 的镜像摘要无效' >&2; exit 1 ;; esac
+        DEPLOYDESK_API_IMAGE="${DEPLOYDESK_API_IMAGE_REPOSITORY}@${DEPLOYDESK_API_IMAGE_DIGEST}"
+        DEPLOYDESK_WEB_IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-web'
+        DEPLOYDESK_WEB_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_WEB_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
+        case "${DEPLOYDESK_WEB_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 web 的镜像摘要无效' >&2; exit 1 ;; esac
+        DEPLOYDESK_WEB_IMAGE="${DEPLOYDESK_WEB_IMAGE_REPOSITORY}@${DEPLOYDESK_WEB_IMAGE_DIGEST}"
+        {
+          printf 'DEPLOYDESK_RELEASE_ID=%s\n' "$RELEASE_TAG"
+          printf 'DEPLOYDESK_API_IMAGE=%s\n' "${DEPLOYDESK_API_IMAGE}"
+          printf 'DEPLOYDESK_WEB_IMAGE=%s\n' "${DEPLOYDESK_WEB_IMAGE}"
+        } > "$RUNTIME_DIRECTORY/.release.env"
+        chmod 600 "$RUNTIME_DIRECTORY/.release.env"
+        SERVER_HOST="${PRODUCTION_SERVER_HOST:-}"
+        SERVER_PORT="${PRODUCTION_SERVER_PORT:-22}"
+        SERVER_USER="${PRODUCTION_SERVER_USER:-}"
+        SERVER_SSH_KEY="${PRODUCTION_SERVER_SSH_KEY:-}"
+        SERVER_KNOWN_HOSTS="${PRODUCTION_SERVER_KNOWN_HOSTS:-}"
+        test -n "$SERVER_HOST"
+        test -n "$SERVER_USER"
+        test -n "$SERVER_SSH_KEY"
+        test -n "$SERVER_KNOWN_HOSTS"
+        case "$SERVER_PORT" in ''|*[!0-9]*) echo 'SSH 端口格式不正确' >&2; exit 1 ;; esac
+        SSH_KEY_FILE="$RUNTIME_DIRECTORY/deploydesk_key"
+        KNOWN_HOSTS_FILE="$RUNTIME_DIRECTORY/known_hosts"
+        printf '%s\n' "$SERVER_SSH_KEY" > "$SSH_KEY_FILE"
+        printf '%s\n' "$SERVER_KNOWN_HOSTS" > "$KNOWN_HOSTS_FILE"
+        chmod 600 "$SSH_KEY_FILE" "$KNOWN_HOSTS_FILE"
+        DESTINATION="$SERVER_USER@$SERVER_HOST"
+        ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
+        mkdir -p '"'"'.deploydesk/apps/deploydesk-hello-fullstack/production'"'"' "$HOME/.deploydesk/caddy/sites"
+        docker network inspect '"'"'deploydesk-deploydesk-hello-fullstack-production'"'"' >/dev/null 2>&1 || docker network create '"'"'deploydesk-deploydesk-hello-fullstack-production'"'"' >/dev/null'
+        printf '%s' "$CNB_TOKEN" | ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'docker login docker.cnb.cool --username cnb --password-stdin'
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/production/docker-compose.yml' "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/production/docker-compose.yml.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/production/Caddyfile' "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/production/Caddyfile.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.runtime.env" "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/production/.runtime.env.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.release.env" "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/production/.release.env.next"
+        ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
+        cd '"'"'.deploydesk/apps/deploydesk-hello-fullstack/production'"'"'
+        backup_file() {
+          if [ -f "$1" ]; then cp "$1" "$1.previous"; else rm -f "$1.previous"; fi
+        }
+        restore_previous() {
+          for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
+            if [ -f "$file.previous" ]; then cp "$file.previous" "$file"; fi
+          done
+        }
+        for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
+          test -f "$file.next"
+          backup_file "$file"
+          mv "$file.next" "$file"
+        done
+        chmod 600 .runtime.env .release.env
+        if docker compose --env-file .release.env -f docker-compose.yml config --quiet && \
+           docker compose --env-file .release.env -f docker-compose.yml pull && \
+           docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180; then
+          release_id="$(sed -n '"'"'s/^DEPLOYDESK_RELEASE_ID=//p'"'"' .release.env | head -n 1)"
+        else
+          deploy_status=$?
+          if [ "true" = "true" ] && [ -f .release.env.previous ]; then
+            restore_previous
+            docker compose --env-file .release.env -f docker-compose.yml pull || true
+            docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180 || true
+          fi
+          exit "$deploy_status"
+        fi
+        case "$release_id" in '"'"''"'"'|*[!A-Za-z0-9._-]*) echo '"'"'发布记录标识无效'"'"' >&2; exit 1 ;; esac
+        mkdir -p .history "$HOME/.deploydesk/caddy/sites"
+        cp .release.env ".history/$release_id.env"
+        old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
+        if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
+        cp Caddyfile "$HOME/.deploydesk/caddy/sites/deploydesk-hello-fullstack-production.caddy"
+        if docker inspect deploydesk-caddy >/dev/null 2>&1; then
+          docker network connect '"'"'deploydesk-deploydesk-hello-fullstack-production'"'"' deploydesk-caddy 2>/dev/null || true
+          docker exec deploydesk-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker exec deploydesk-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+        else
+          echo '"'"'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 DeployDesk Caddy。'"'"'
+        fi'
+main:
+  push:
+  - docker:
+      image: node:22-slim
+    env:
+      DEPLOYDESK_ENV: staging
+    imports:
+    - https://cnb.cool/replace-me/secret/-/blob/main/env.staging.yml
+    name: deploydesk-release-candidate
+    runner:
+      cpus: 4
+      tags: cnb:arch:amd64
+    services:
+    - docker
+    stages:
+    - name: 准备安全部署工具
+      script:
+      - apt-get update && apt-get install -y --no-install-recommends ca-certificates openssh-client && rm -rf /var/lib/apt/lists/*
+    - name: 安装依赖
+      script:
+      - corepack pnpm install --frozen-lockfile
+    - name: 验证 1
+      script:
+      - corepack pnpm build
+    - name: 登录镜像仓库
+      script:
+      - |-
+        test -n "$CNB_TOKEN"
+        printf '%s' "$CNB_TOKEN" | docker login docker.cnb.cool --username "${CNB_USERNAME:-cnb}" --password-stdin
+    - name: 构建并上传 api
+      script:
+      - |-
+        IMAGE_TAG="sha-${CNB_COMMIT_SHORT}"
+        IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-api'
+        IMAGE_REFERENCE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+        docker build --file 'apps/api/Dockerfile' --tag "$IMAGE_REFERENCE" '.'
+        docker push "$IMAGE_REFERENCE"
+    - name: 构建并上传 web
+      script:
+      - |-
+        IMAGE_TAG="sha-${CNB_COMMIT_SHORT}"
+        IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-web'
+        IMAGE_REFERENCE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+        docker build --file 'apps/web/Dockerfile' --tag "$IMAGE_REFERENCE" '.'
+        docker push "$IMAGE_REFERENCE"
+    - name: 在测试环境验证生产候选
+      script:
+      - |-
+        set -eu
+        IMAGE_TAG="sha-${CNB_COMMIT_SHORT}"
+        RELEASE_TAG="$IMAGE_TAG"
+        RUNTIME_DIRECTORY='.deploydesk/runtime/staging'
+        rm -rf "$RUNTIME_DIRECTORY"
+        install -d -m 700 "$RUNTIME_DIRECTORY"
+        node <<'DEPLOYDESK_NODE'
+        const fs = require("node:fs");
+        const variables = [{"name":"API_GREETING","source":"STAGING_API_GREETING","required":true,"default":null},{"name":"VITE_API_BASE_URL","source":"STAGING_VITE_API_BASE_URL","required":true,"default":null}];
+        const outputPath = ".deploydesk/runtime/staging/.runtime.env";
+        const lines = ["DEPLOYDESK_ENV=staging"];
+        const missing = [];
+        for (const variable of variables) {
+          const configured = Object.prototype.hasOwnProperty.call(process.env, variable.source);
+          const value = configured ? process.env[variable.source] : (variable.default ?? "");
+          if (variable.required && !value) missing.push(variable.source);
+          if (/\r|\n/.test(value)) {
+            console.error(`密钥仓库字段 ${variable.source} 不支持换行值`);
+            process.exit(1);
+          }
+          lines.push(`${variable.name}=${JSON.stringify(value)}`);
+        }
+        if (missing.length) {
+          console.error(`缺少密钥仓库字段：${missing.join(", ")}`);
+          process.exit(1);
+        }
+        fs.writeFileSync(outputPath, `${lines.join("\n")}\n`, { mode: 0o600 });
+        DEPLOYDESK_NODE
+        DEPLOYDESK_API_IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-api'
+        DEPLOYDESK_API_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_API_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
+        case "${DEPLOYDESK_API_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 api 的镜像摘要无效' >&2; exit 1 ;; esac
+        DEPLOYDESK_API_IMAGE="${DEPLOYDESK_API_IMAGE_REPOSITORY}@${DEPLOYDESK_API_IMAGE_DIGEST}"
+        DEPLOYDESK_WEB_IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-web'
+        DEPLOYDESK_WEB_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_WEB_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
+        case "${DEPLOYDESK_WEB_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 web 的镜像摘要无效' >&2; exit 1 ;; esac
+        DEPLOYDESK_WEB_IMAGE="${DEPLOYDESK_WEB_IMAGE_REPOSITORY}@${DEPLOYDESK_WEB_IMAGE_DIGEST}"
+        {
+          printf 'DEPLOYDESK_RELEASE_ID=%s\n' "$RELEASE_TAG"
+          printf 'DEPLOYDESK_API_IMAGE=%s\n' "${DEPLOYDESK_API_IMAGE}"
+          printf 'DEPLOYDESK_WEB_IMAGE=%s\n' "${DEPLOYDESK_WEB_IMAGE}"
+        } > "$RUNTIME_DIRECTORY/.release.env"
+        chmod 600 "$RUNTIME_DIRECTORY/.release.env"
+        SERVER_HOST="${STAGING_SERVER_HOST:-}"
+        SERVER_PORT="${STAGING_SERVER_PORT:-22}"
+        SERVER_USER="${STAGING_SERVER_USER:-}"
+        SERVER_SSH_KEY="${STAGING_SERVER_SSH_KEY:-}"
+        SERVER_KNOWN_HOSTS="${STAGING_SERVER_KNOWN_HOSTS:-}"
+        test -n "$SERVER_HOST"
+        test -n "$SERVER_USER"
+        test -n "$SERVER_SSH_KEY"
+        test -n "$SERVER_KNOWN_HOSTS"
+        case "$SERVER_PORT" in ''|*[!0-9]*) echo 'SSH 端口格式不正确' >&2; exit 1 ;; esac
+        SSH_KEY_FILE="$RUNTIME_DIRECTORY/deploydesk_key"
+        KNOWN_HOSTS_FILE="$RUNTIME_DIRECTORY/known_hosts"
+        printf '%s\n' "$SERVER_SSH_KEY" > "$SSH_KEY_FILE"
+        printf '%s\n' "$SERVER_KNOWN_HOSTS" > "$KNOWN_HOSTS_FILE"
+        chmod 600 "$SSH_KEY_FILE" "$KNOWN_HOSTS_FILE"
+        DESTINATION="$SERVER_USER@$SERVER_HOST"
+        ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
+        mkdir -p '"'"'.deploydesk/apps/deploydesk-hello-fullstack/staging'"'"' "$HOME/.deploydesk/caddy/sites"
+        docker network inspect '"'"'deploydesk-deploydesk-hello-fullstack-staging'"'"' >/dev/null 2>&1 || docker network create '"'"'deploydesk-deploydesk-hello-fullstack-staging'"'"' >/dev/null'
+        printf '%s' "$CNB_TOKEN" | ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'docker login docker.cnb.cool --username cnb --password-stdin'
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/staging/docker-compose.yml' "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/staging/docker-compose.yml.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/staging/Caddyfile' "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/staging/Caddyfile.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.runtime.env" "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/staging/.runtime.env.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.release.env" "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/staging/.release.env.next"
+        ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
+        cd '"'"'.deploydesk/apps/deploydesk-hello-fullstack/staging'"'"'
+        backup_file() {
+          if [ -f "$1" ]; then cp "$1" "$1.previous"; else rm -f "$1.previous"; fi
+        }
+        restore_previous() {
+          for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
+            if [ -f "$file.previous" ]; then cp "$file.previous" "$file"; fi
+          done
+        }
+        for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
+          test -f "$file.next"
+          backup_file "$file"
+          mv "$file.next" "$file"
+        done
+        chmod 600 .runtime.env .release.env
+        if docker compose --env-file .release.env -f docker-compose.yml config --quiet && \
+           docker compose --env-file .release.env -f docker-compose.yml pull && \
+           docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180; then
+          release_id="$(sed -n '"'"'s/^DEPLOYDESK_RELEASE_ID=//p'"'"' .release.env | head -n 1)"
+        else
+          deploy_status=$?
+          if [ "true" = "true" ] && [ -f .release.env.previous ]; then
+            restore_previous
+            docker compose --env-file .release.env -f docker-compose.yml pull || true
+            docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180 || true
+          fi
+          exit "$deploy_status"
+        fi
+        case "$release_id" in '"'"''"'"'|*[!A-Za-z0-9._-]*) echo '"'"'发布记录标识无效'"'"' >&2; exit 1 ;; esac
+        mkdir -p .history "$HOME/.deploydesk/caddy/sites"
+        cp .release.env ".history/$release_id.env"
+        old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
+        if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
+        cp Caddyfile "$HOME/.deploydesk/caddy/sites/deploydesk-hello-fullstack-staging.caddy"
+        if docker inspect deploydesk-caddy >/dev/null 2>&1; then
+          docker network connect '"'"'deploydesk-deploydesk-hello-fullstack-staging'"'"' deploydesk-caddy 2>/dev/null || true
+          docker exec deploydesk-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker exec deploydesk-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+        else
+          echo '"'"'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 DeployDesk Caddy。'"'"'
+        fi'
+    - name: 标记已验证镜像摘要
+      script:
+      - |-
+        set -eu
+        IMAGE_TAG="sha-${CNB_COMMIT_SHORT}"
+        VERIFIED_TAG="verified-${IMAGE_TAG}"
+        IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-api'
+        IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
+        case "$IMAGE_DIGEST" in sha256:*) ;; *) echo '镜像摘要解析失败' >&2; exit 1 ;; esac
+        docker buildx imagetools create --prefer-index=false --tag "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+        VERIFIED_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" --format '{{.Manifest.Digest}}')"
+        test "$VERIFIED_DIGEST" = "$IMAGE_DIGEST"
+        IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-web'
+        IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
+        case "$IMAGE_DIGEST" in sha256:*) ;; *) echo '镜像摘要解析失败' >&2; exit 1 ;; esac
+        docker buildx imagetools create --prefer-index=false --tag "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+        VERIFIED_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" --format '{{.Manifest.Digest}}')"
+        test "$VERIFIED_DIGEST" = "$IMAGE_DIGEST"
+test:
+  push:
+  - docker:
+      image: node:22-slim
+    env:
+      DEPLOYDESK_ENV: staging
+    imports:
+    - https://cnb.cool/replace-me/secret/-/blob/main/env.staging.yml
+    name: deploydesk-integration
+    runner:
+      cpus: 4
+      tags: cnb:arch:amd64
+    services:
+    - docker
+    stages:
+    - name: 准备安全部署工具
+      script:
+      - apt-get update && apt-get install -y --no-install-recommends ca-certificates openssh-client && rm -rf /var/lib/apt/lists/*
+    - name: 安装依赖
+      script:
+      - corepack pnpm install --frozen-lockfile
+    - name: 验证 1
+      script:
+      - corepack pnpm build
+    - name: 登录镜像仓库
+      script:
+      - |-
+        test -n "$CNB_TOKEN"
+        printf '%s' "$CNB_TOKEN" | docker login docker.cnb.cool --username "${CNB_USERNAME:-cnb}" --password-stdin
+    - name: 构建并上传 api
+      script:
+      - |-
+        IMAGE_TAG="sha-${CNB_COMMIT_SHORT}"
+        IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-api'
+        IMAGE_REFERENCE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+        docker build --file 'apps/api/Dockerfile' --tag "$IMAGE_REFERENCE" '.'
+        docker push "$IMAGE_REFERENCE"
+    - name: 构建并上传 web
+      script:
+      - |-
+        IMAGE_TAG="sha-${CNB_COMMIT_SHORT}"
+        IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-web'
+        IMAGE_REFERENCE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+        docker build --file 'apps/web/Dockerfile' --tag "$IMAGE_REFERENCE" '.'
+        docker push "$IMAGE_REFERENCE"
+    - name: 部署测试环境
+      script:
+      - |-
+        set -eu
+        IMAGE_TAG="sha-${CNB_COMMIT_SHORT}"
+        RELEASE_TAG="$IMAGE_TAG"
+        RUNTIME_DIRECTORY='.deploydesk/runtime/staging'
+        rm -rf "$RUNTIME_DIRECTORY"
+        install -d -m 700 "$RUNTIME_DIRECTORY"
+        node <<'DEPLOYDESK_NODE'
+        const fs = require("node:fs");
+        const variables = [{"name":"API_GREETING","source":"STAGING_API_GREETING","required":true,"default":null},{"name":"VITE_API_BASE_URL","source":"STAGING_VITE_API_BASE_URL","required":true,"default":null}];
+        const outputPath = ".deploydesk/runtime/staging/.runtime.env";
+        const lines = ["DEPLOYDESK_ENV=staging"];
+        const missing = [];
+        for (const variable of variables) {
+          const configured = Object.prototype.hasOwnProperty.call(process.env, variable.source);
+          const value = configured ? process.env[variable.source] : (variable.default ?? "");
+          if (variable.required && !value) missing.push(variable.source);
+          if (/\r|\n/.test(value)) {
+            console.error(`密钥仓库字段 ${variable.source} 不支持换行值`);
+            process.exit(1);
+          }
+          lines.push(`${variable.name}=${JSON.stringify(value)}`);
+        }
+        if (missing.length) {
+          console.error(`缺少密钥仓库字段：${missing.join(", ")}`);
+          process.exit(1);
+        }
+        fs.writeFileSync(outputPath, `${lines.join("\n")}\n`, { mode: 0o600 });
+        DEPLOYDESK_NODE
+        DEPLOYDESK_API_IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-api'
+        DEPLOYDESK_API_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_API_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
+        case "${DEPLOYDESK_API_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 api 的镜像摘要无效' >&2; exit 1 ;; esac
+        DEPLOYDESK_API_IMAGE="${DEPLOYDESK_API_IMAGE_REPOSITORY}@${DEPLOYDESK_API_IMAGE_DIGEST}"
+        DEPLOYDESK_WEB_IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-web'
+        DEPLOYDESK_WEB_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_WEB_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
+        case "${DEPLOYDESK_WEB_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 web 的镜像摘要无效' >&2; exit 1 ;; esac
+        DEPLOYDESK_WEB_IMAGE="${DEPLOYDESK_WEB_IMAGE_REPOSITORY}@${DEPLOYDESK_WEB_IMAGE_DIGEST}"
+        {
+          printf 'DEPLOYDESK_RELEASE_ID=%s\n' "$RELEASE_TAG"
+          printf 'DEPLOYDESK_API_IMAGE=%s\n' "${DEPLOYDESK_API_IMAGE}"
+          printf 'DEPLOYDESK_WEB_IMAGE=%s\n' "${DEPLOYDESK_WEB_IMAGE}"
+        } > "$RUNTIME_DIRECTORY/.release.env"
+        chmod 600 "$RUNTIME_DIRECTORY/.release.env"
+        SERVER_HOST="${STAGING_SERVER_HOST:-}"
+        SERVER_PORT="${STAGING_SERVER_PORT:-22}"
+        SERVER_USER="${STAGING_SERVER_USER:-}"
+        SERVER_SSH_KEY="${STAGING_SERVER_SSH_KEY:-}"
+        SERVER_KNOWN_HOSTS="${STAGING_SERVER_KNOWN_HOSTS:-}"
+        test -n "$SERVER_HOST"
+        test -n "$SERVER_USER"
+        test -n "$SERVER_SSH_KEY"
+        test -n "$SERVER_KNOWN_HOSTS"
+        case "$SERVER_PORT" in ''|*[!0-9]*) echo 'SSH 端口格式不正确' >&2; exit 1 ;; esac
+        SSH_KEY_FILE="$RUNTIME_DIRECTORY/deploydesk_key"
+        KNOWN_HOSTS_FILE="$RUNTIME_DIRECTORY/known_hosts"
+        printf '%s\n' "$SERVER_SSH_KEY" > "$SSH_KEY_FILE"
+        printf '%s\n' "$SERVER_KNOWN_HOSTS" > "$KNOWN_HOSTS_FILE"
+        chmod 600 "$SSH_KEY_FILE" "$KNOWN_HOSTS_FILE"
+        DESTINATION="$SERVER_USER@$SERVER_HOST"
+        ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
+        mkdir -p '"'"'.deploydesk/apps/deploydesk-hello-fullstack/staging'"'"' "$HOME/.deploydesk/caddy/sites"
+        docker network inspect '"'"'deploydesk-deploydesk-hello-fullstack-staging'"'"' >/dev/null 2>&1 || docker network create '"'"'deploydesk-deploydesk-hello-fullstack-staging'"'"' >/dev/null'
+        printf '%s' "$CNB_TOKEN" | ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'docker login docker.cnb.cool --username cnb --password-stdin'
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/staging/docker-compose.yml' "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/staging/docker-compose.yml.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/staging/Caddyfile' "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/staging/Caddyfile.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.runtime.env" "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/staging/.runtime.env.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.release.env" "$DESTINATION:.deploydesk/apps/deploydesk-hello-fullstack/staging/.release.env.next"
+        ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
+        cd '"'"'.deploydesk/apps/deploydesk-hello-fullstack/staging'"'"'
+        backup_file() {
+          if [ -f "$1" ]; then cp "$1" "$1.previous"; else rm -f "$1.previous"; fi
+        }
+        restore_previous() {
+          for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
+            if [ -f "$file.previous" ]; then cp "$file.previous" "$file"; fi
+          done
+        }
+        for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
+          test -f "$file.next"
+          backup_file "$file"
+          mv "$file.next" "$file"
+        done
+        chmod 600 .runtime.env .release.env
+        if docker compose --env-file .release.env -f docker-compose.yml config --quiet && \
+           docker compose --env-file .release.env -f docker-compose.yml pull && \
+           docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180; then
+          release_id="$(sed -n '"'"'s/^DEPLOYDESK_RELEASE_ID=//p'"'"' .release.env | head -n 1)"
+        else
+          deploy_status=$?
+          if [ "true" = "true" ] && [ -f .release.env.previous ]; then
+            restore_previous
+            docker compose --env-file .release.env -f docker-compose.yml pull || true
+            docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180 || true
+          fi
+          exit "$deploy_status"
+        fi
+        case "$release_id" in '"'"''"'"'|*[!A-Za-z0-9._-]*) echo '"'"'发布记录标识无效'"'"' >&2; exit 1 ;; esac
+        mkdir -p .history "$HOME/.deploydesk/caddy/sites"
+        cp .release.env ".history/$release_id.env"
+        old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
+        if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
+        cp Caddyfile "$HOME/.deploydesk/caddy/sites/deploydesk-hello-fullstack-staging.caddy"
+        if docker inspect deploydesk-caddy >/dev/null 2>&1; then
+          docker network connect '"'"'deploydesk-deploydesk-hello-fullstack-staging'"'"' deploydesk-caddy 2>/dev/null || true
+          docker exec deploydesk-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker exec deploydesk-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+        else
+          echo '"'"'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 DeployDesk Caddy。'"'"'
+        fi'

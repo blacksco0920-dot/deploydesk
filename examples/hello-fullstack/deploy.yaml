@@ -1,0 +1,100 @@
+# DeployDesk 项目部署协议。这里只声明变量名，不保存真实密钥。
+version: 1
+project:
+  name: deploydesk-hello-fullstack
+  description: ''
+  commands:
+    install: corepack pnpm install --frozen-lockfile
+    verify:
+    - corepack pnpm build
+source:
+  provider: github
+  repository: owner/deploydesk-hello-fullstack
+  integration_branch: test
+  stable_branch: main
+services:
+- id: api
+  kind: api
+  image: deploydesk-hello-fullstack-api
+  context: .
+  dockerfile: apps/api/Dockerfile
+  container_port: 3000
+  healthcheck:
+    path: /api/health
+    interval_seconds: 10
+    retries: 12
+  migration: null
+  runtime_env:
+  - name: API_GREETING
+    required: true
+    secret: false
+    description: ''
+  build_args: {}
+- id: web
+  kind: static
+  image: deploydesk-hello-fullstack-web
+  context: .
+  dockerfile: apps/web/Dockerfile
+  container_port: 80
+  healthcheck:
+    path: /
+    interval_seconds: 10
+    retries: 12
+  migration: null
+  runtime_env:
+  - name: VITE_API_BASE_URL
+    required: true
+    secret: false
+    description: ''
+  build_args: {}
+environments:
+  development:
+    target:
+      kind: local
+      server: null
+      namespace: deploydesk-hello-fullstack-development
+    branch: null
+    auto_deploy: false
+    approval_required: false
+    domains: []
+    database: null
+    redis_namespace: null
+    secrets_ref: local-keychain://development
+  staging:
+    target:
+      kind: server
+      server: staging-server
+      namespace: deploydesk-hello-fullstack-staging
+    branch: test
+    auto_deploy: true
+    approval_required: false
+    domains: []
+    database: null
+    redis_namespace: null
+    secrets_ref: https://cnb.cool/replace-me/secret/-/blob/main/env.staging.yml
+  production:
+    target:
+      kind: server
+      server: production-server
+      namespace: deploydesk-hello-fullstack-production
+    branch: main
+    auto_deploy: false
+    approval_required: true
+    domains: []
+    database: null
+    redis_namespace: null
+    secrets_ref: https://cnb.cool/replace-me/secret/-/blob/main/env.production.yml
+providers:
+  build:
+    kind: cnb
+    repository: owner/deploydesk-hello-fullstack
+  registry:
+    kind: cnb
+    repository: owner/deploydesk-hello-fullstack
+  reverse_proxy: caddy
+release:
+  image_tag_template: sha-{commit}
+  production_mode: approval
+  keep_releases: 5
+  auto_rollback: true
+  backup_before_migration: true

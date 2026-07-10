@@ -1,0 +1,32 @@
+:root {
+  font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: #182126;
+  background: #f3f5f6;
+}
+
+body {
+  display: grid;
+  min-height: 100vh;
+  margin: 0;
+  place-items: center;
+}
+
+main {
+  width: min(640px, calc(100% - 40px));
+}
+
+span {
+  color: #0f766e;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+h1 {
+  margin: 12px 0;
+  font-size: 40px;
+}
+
+p {
+  color: #66747c;
+  line-height: 1.7;
+}

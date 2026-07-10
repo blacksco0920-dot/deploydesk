@@ -1,0 +1,30 @@
+# 由 DeployDesk 生成。
+concurrency:
+  cancel-in-progress: true
+  group: sync-cnb-${{ github.ref_name }}
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - env:
+        CNB_PUSH_TOKEN: ${{ secrets.CNB_PUSH_TOKEN }}
+        CNB_REPOSITORY: owner/deploydesk-hello-fullstack
+      name: Sync branch to CNB
+      run: |-
+        test -n "$CNB_PUSH_TOKEN"
+        git remote add cnb "https://oauth2:${CNB_PUSH_TOKEN}@cnb.cool/${CNB_REPOSITORY}.git"
+        git push cnb "HEAD:${GITHUB_REF_NAME}" --force
+    timeout-minutes: 5
+name: Sync CNB
+on:
+  push:
+    branches:
+    - test
+    - main
+  workflow_dispatch: {}
+permissions:
+  contents: read

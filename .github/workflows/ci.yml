@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main, test]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-22.04
+          - name: Windows
+            os: windows-2025
+          - name: macOS
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            examples/hello-fullstack/pnpm-lock.yaml
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+          components: rustfmt, clippy
+
+      - name: 缓存 Rust 构建
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.os }}
+
+      - name: 安装 Linux 桌面依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 检查 Rust 格式
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: Rust 严格检查
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Rust 测试
+        run: cargo test --workspace
+
+      - name: 桌面前端测试
+        run: pnpm --filter @deploydesk/desktop test
+
+      - name: 桌面前端构建
+        run: pnpm --filter @deploydesk/desktop build
+
+      - name: 构建示例项目
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          pnpm --dir examples/hello-fullstack install --frozen-lockfile
+          pnpm --dir examples/hello-fullstack build
+          bash -n scripts/server-bootstrap.sh
+
+      - name: 编译 Tauri 桌面程序
+        run: pnpm --filter @deploydesk/desktop tauri build --no-bundle --ci
