@@ -10,7 +10,7 @@ export class AppController {
   @Get("hello")
   hello() {
     return {
-      message: process.env.API_GREETING ?? "Hello from DeployDesk",
+      message: process.env.API_GREETING ?? "Hello from ABCDeploy",
     };
   }
 }

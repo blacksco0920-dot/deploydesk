@@ -62,9 +62,11 @@ pub struct SourceConfig {
     pub provider: SourceProvider,
     #[serde(default)]
     pub repository: String,
-    #[serde(default = "default_integration_branch")]
+    #[serde(default = "default_release_branch")]
+    pub release_branch: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub integration_branch: String,
-    #[serde(default = "default_stable_branch")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub stable_branch: String,
 }
 
@@ -77,11 +79,7 @@ pub enum SourceProvider {
     Local,
 }
 
-fn default_integration_branch() -> String {
-    "test".to_string()
-}
-
-fn default_stable_branch() -> String {
+fn default_release_branch() -> String {
     "main".to_string()
 }
 
@@ -542,6 +540,15 @@ pub struct HealthcheckResult {
     pub url: String,
     pub healthy: bool,
     pub attempts: u16,
+    pub status: Option<u16>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct PublicRouteCheck {
+    pub url: String,
+    pub reachable: bool,
+    pub phase: String,
     pub status: Option<u16>,
     pub message: String,
 }

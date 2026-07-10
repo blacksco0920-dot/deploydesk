@@ -1,16 +1,18 @@
 {
-  "name": "deploydesk",
+  "name": "abcdeploy",
   "version": "0.1.0",
   "private": true,
   "packageManager": "pnpm@11.5.0",
   "scripts": {
-    "build": "pnpm --filter @deploydesk/desktop build",
-    "dev": "pnpm --filter @deploydesk/desktop tauri dev",
-    "desktop": "pnpm --filter @deploydesk/desktop",
-    "format": "cargo fmt --all && pnpm --filter @deploydesk/desktop format",
-    "lint": "cargo clippy --workspace --all-targets -- -D warnings && pnpm --filter @deploydesk/desktop lint",
-    "test": "cargo test --workspace && pnpm --filter @deploydesk/desktop test",
-    "tauri:build": "pnpm --filter @deploydesk/desktop tauri build",
-    "tauri:build:mac": "CI=true APPLE_SIGNING_IDENTITY=- pnpm --filter @deploydesk/desktop tauri build --bundles app,dmg --ci"
+    "build": "pnpm --filter @abcdeploy/desktop build",
+    "dev": "pnpm --filter @abcdeploy/desktop tauri dev",
+    "desktop": "pnpm --filter @abcdeploy/desktop",
+    "format": "cargo fmt --all && pnpm --filter @abcdeploy/desktop format",
+    "lint": "cargo clippy --workspace --all-targets -- -D warnings && pnpm --filter @abcdeploy/desktop lint",
+    "test": "cargo test --workspace && pnpm --filter @abcdeploy/desktop test",
+    "site:build": "pnpm --filter @abcdeploy/site build",
+    "site:dev": "pnpm --filter @abcdeploy/site dev",
+    "tauri:build": "pnpm --filter @abcdeploy/desktop tauri build",
+    "tauri:build:mac": "CI=true APPLE_SIGNING_IDENTITY=- pnpm --filter @abcdeploy/desktop tauri build --bundles app,dmg --ci"
   }
 }

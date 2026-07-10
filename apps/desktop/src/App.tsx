@@ -1,100 +1,190 @@
-import {
-  CheckCircle2,
-  FolderOpen,
-  LoaderCircle,
-  RefreshCw,
-  X,
-} from "lucide-react";
 import { isTauri } from "@tauri-apps/api/core";
-import { useEffect, useRef, useState } from "react";
+import { ArrowRight, LoaderCircle } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Toaster, toast } from "sonner";
 import { parseDocument } from "yaml";
 import {
   applyManifest,
+  bootstrapServerCaddy,
+  enableCnbAutoTrigger,
+  forgetProject,
   getPreflight,
+  listRecentProjects,
+  listDeploymentRuns,
+  listServers,
   openProject,
+  promoteProductionDeployment,
   previewManifest,
+  preparePipelineIdentity,
+  refreshDeployment,
+  resumeStagingDeployment,
+  rollbackEnvironment,
+  saveProjectStep,
   selectProjectDirectory,
+  startStagingDeployment,
+  syncProjectToCnb,
 } from "./api";
-import { ConnectionsPanel } from "./components/ConnectionsPanel";
-import { EnvironmentEditor } from "./components/EnvironmentEditor";
-import { PlanPanel } from "./components/PlanPanel";
-import { ProjectOverview } from "./components/ProjectOverview";
-import { Sidebar } from "./components/Sidebar";
-import { WelcomePanel } from "./components/WelcomePanel";
+import { ProjectHome } from "./components/ProjectHome";
+import { WorkspaceShell } from "./components/WorkspaceShell";
+import { ConnectionStep } from "./components/onboarding/ConnectionStep";
+import { CloudSetupAction } from "./components/onboarding/CloudSetupAction";
+import { DeploymentProgress } from "./components/onboarding/DeploymentProgress";
+import { InspectionStep } from "./components/onboarding/InspectionStep";
+import { OnboardingLayout } from "./components/onboarding/OnboardingLayout";
+import { RecommendationStep } from "./components/onboarding/RecommendationStep";
+import { RequirementsStep } from "./components/onboarding/RequirementsStep";
+import { ReviewStep } from "./components/onboarding/ReviewStep";
+import { Button } from "./components/ui/button";
 import type {
-  ApplyResult,
-  NavigationSection,
+  OnboardingStep,
+  DeploymentRun,
+  RecentProject,
+  ServerForm,
   SystemPreflight,
   WorkspacePreview,
 } from "./types";
-import "./App.css";
 
-const sectionNames: Record<NavigationSection, string> = {
-  overview: "项目识别",
-  environments: "环境配置",
-  connections: "服务连接",
-  plan: "部署计划",
-};
+type AppScreen = "home" | "onboarding" | "workspace";
+
+const onboardingSteps: OnboardingStep[] = [
+  "inspection",
+  "connections",
+  "recommendation",
+  "requirements",
+  "review",
+];
 
 function App() {
-  const mainContentRef = useRef<HTMLElement>(null);
-  const [active, setActive] = useState<NavigationSection>("overview");
+  const [screen, setScreen] = useState<AppScreen>("home");
+  const [step, setStep] = useState<OnboardingStep>("inspection");
   const [preflight, setPreflight] = useState<SystemPreflight | null>(null);
+  const [projects, setProjects] = useState<RecentProject[]>([]);
   const [workspace, setWorkspace] = useState<WorkspacePreview | null>(null);
   const [projectPath, setProjectPath] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [applying, setApplying] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [applyResult, setApplyResult] = useState<ApplyResult | null>(null);
+  const [connectionsReady, setConnectionsReady] = useState(false);
+  const [lastServer, setLastServer] = useState<ServerForm | undefined>();
+  const [deploymentRuns, setDeploymentRuns] = useState<DeploymentRun[]>([]);
+  const [currentRun, setCurrentRun] = useState<DeploymentRun | null>(null);
 
-  useEffect(() => {
-    getPreflight()
-      .then(setPreflight)
-      .catch((reason) => setError(toMessage(reason)));
+  const reportError = useCallback((message: string) => {
+    toast.error(message, { duration: 7000 });
   }, []);
 
+  const handleConnectionState = useCallback(
+    (state: { cnb: boolean; server: boolean; serverForm: ServerForm }) => {
+      setConnectionsReady(state.cnb && state.server);
+      setLastServer(state.serverForm);
+    },
+    [],
+  );
+
+  const refreshProjects = useCallback(async () => {
+    const recent = await listRecentProjects();
+    setProjects(recent);
+    return recent;
+  }, []);
+
+  const loadProject = useCallback(
+    async (path: string, resumeStep: OnboardingStep = "inspection") => {
+      setLoading(true);
+      try {
+        const result = await openProject(path);
+        setWorkspace(result);
+        setProjectPath(path);
+        const runs = await listDeploymentRuns(path);
+        setDeploymentRuns(runs);
+        const resumable = runs.find((run) =>
+          ["queued", "running", "needs_action", "failed"].includes(run.status),
+        );
+        const effectiveStep =
+          resumeStep === "deploying" && !resumable ? "review" : resumeStep;
+        setCurrentRun(resumable ?? runs[0] ?? null);
+        setStep(effectiveStep);
+        setScreen(effectiveStep === "workspace" ? "workspace" : "onboarding");
+        await refreshProjects();
+      } catch (error) {
+        reportError(toMessage(error));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [refreshProjects, reportError],
+  );
+
   useEffect(() => {
-    if (mainContentRef.current) mainContentRef.current.scrollTop = 0;
-  }, [active]);
+    let active = true;
+    Promise.all([getPreflight(), listRecentProjects(), listServers()])
+      .then(async ([system, recent, servers]) => {
+        if (!active) return;
+        setPreflight(system);
+        setProjects(recent);
+        const reusableServer = servers.find((server) => server.keyPathExists);
+        if (reusableServer) {
+          setLastServer({
+            name: reusableServer.name,
+            host: reusableServer.host,
+            user: reusableServer.user,
+            port: reusableServer.port,
+            keyPath: reusableServer.keyPath,
+            hostFingerprint: reusableServer.hostFingerprint,
+          });
+        }
+        if (recent.length === 1 && recent[0].pathExists) {
+          await loadProject(recent[0].path, recent[0].currentStep);
+        }
+      })
+      .catch((error) => reportError(toMessage(error)))
+      .finally(() => active && setLoading(false));
+    return () => {
+      active = false;
+    };
+  }, [loadProject, reportError]);
 
   async function selectProject() {
-    setError(null);
     const selected = await selectProjectDirectory();
-    if (!selected) return;
-    await loadProject(selected);
+    if (selected) await loadProject(selected);
   }
 
-  async function loadProject(path: string) {
-    setLoading(true);
-    setError(null);
-    setNotice(null);
-    setApplyResult(null);
+  async function forgetRecent(project: RecentProject) {
     try {
-      const result = await openProject(path);
-      setWorkspace(result);
-      setProjectPath(path);
-      setActive("overview");
-      if (mainContentRef.current) mainContentRef.current.scrollTop = 0;
-    } catch (reason) {
-      setError(toMessage(reason));
-    } finally {
-      setLoading(false);
+      await forgetProject(project.path);
+      await refreshProjects();
+      if (project.path === projectPath) {
+        setWorkspace(null);
+        setProjectPath("");
+        setScreen("home");
+      }
+      toast.success("已移除本机项目记录");
+    } catch (error) {
+      reportError(toMessage(error));
     }
   }
 
-  async function updateManifest(manifestYaml: string): Promise<boolean> {
+  async function goToStep(next: OnboardingStep) {
+    if (!projectPath) return;
+    try {
+      await saveProjectStep(projectPath, next);
+      setStep(next);
+      setScreen(next === "workspace" ? "workspace" : "onboarding");
+      await refreshProjects();
+    } catch (error) {
+      reportError(toMessage(error));
+    }
+  }
+
+  async function updateManifest(manifestYaml: string) {
     if (!projectPath) return false;
     setSaving(true);
-    setError(null);
     try {
       const result = await previewManifest(projectPath, manifestYaml);
       setWorkspace(result);
-      setNotice("环境配置已更新，部署计划已重新计算。");
+      toast.success("推荐方案已更新");
       return true;
-    } catch (reason) {
-      setError(toMessage(reason));
+    } catch (error) {
+      reportError(toMessage(error));
       return false;
     } finally {
       setSaving(false);
@@ -103,142 +193,345 @@ function App() {
 
   async function applyCurrentPlan() {
     if (!workspace || !projectPath) return;
+    if (!lastServer?.host || !lastServer.hostFingerprint) {
+      reportError("目标服务器尚未完成身份验证，请返回连接步骤重新验证");
+      return;
+    }
     setApplying(true);
-    setError(null);
     try {
+      const serverSetup = await bootstrapServerCaddy(lastServer);
+      if (!serverSetup.ok) throw new Error(serverSetup.summary);
+      await preparePipelineIdentity(projectPath, lastServer);
       const result = await applyManifest(projectPath, workspace.manifestYaml);
-      setApplyResult(result);
       const refreshed = await openProject(projectPath);
       setWorkspace(refreshed);
-      setNotice("部署配置已写入，原文件已自动备份。");
-    } catch (reason) {
-      setError(toMessage(reason));
+      if (currentRun?.actionKind === "cloud-setup") {
+        await saveProjectStep(projectPath, "deploying");
+        setStep("deploying");
+        setScreen("onboarding");
+        toast.success("项目配置已更新，可以继续完成 CNB 保护配置");
+        return;
+      }
+      const run = await startStagingDeployment(projectPath);
+      setCurrentRun(run);
+      setDeploymentRuns((current) => [
+        run,
+        ...current.filter((item) => item.id !== run.id),
+      ]);
+      await saveProjectStep(projectPath, "deploying");
+      setStep("deploying");
+      setScreen("onboarding");
+      await refreshProjects();
+      toast.success(
+        `服务器与部署配置已准备完成，共更新 ${result.writtenFiles.length} 个文件`,
+      );
+    } catch (error) {
+      reportError(toMessage(error));
     } finally {
       setApplying(false);
     }
   }
 
-  async function selectCnbRepository(repository: string) {
-    if (!workspace) throw new Error("请先选择本地项目");
-    const document = parseDocument(workspace.manifestYaml);
-    document.setIn(["providers", "build", "repository"], repository);
-    if (document.getIn(["providers", "registry", "kind"]) === "cnb") {
-      document.setIn(["providers", "registry", "repository"], repository);
+  const refreshCurrentDeployment = useCallback(async () => {
+    if (!currentRun) return;
+    try {
+      const updated = await refreshDeployment(currentRun.id);
+      setCurrentRun(updated);
+      setDeploymentRuns((current) => [
+        updated,
+        ...current.filter((item) => item.id !== updated.id),
+      ]);
+    } catch (error) {
+      reportError(toMessage(error));
     }
-    const updated = await updateManifest(document.toString({ lineWidth: 0 }));
-    if (!updated) {
-      throw new Error(
-        `仓库 ${repository} 已创建，但部署计划未能更新，请在环境配置中手动选择`,
-      );
+  }, [currentRun, reportError]);
+
+  useEffect(() => {
+    if (
+      screen !== "onboarding" ||
+      step !== "deploying" ||
+      !currentRun ||
+      !["queued", "running"].includes(currentRun.status)
+    ) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      void refreshCurrentDeployment();
+    }, 8000);
+    return () => window.clearInterval(timer);
+  }, [currentRun, refreshCurrentDeployment, screen, step]);
+
+  async function retryDeployment() {
+    if (!projectPath) return;
+    setApplying(true);
+    try {
+      if (currentRun?.actionKind === "route-check") {
+        await refreshCurrentDeployment();
+        return;
+      }
+      const run = await startStagingDeployment(projectPath);
+      setCurrentRun(run);
+      setDeploymentRuns((current) => [run, ...current]);
+    } catch (error) {
+      reportError(toMessage(error));
+    } finally {
+      setApplying(false);
     }
   }
 
-  function renderContent() {
-    if (!workspace) {
-      return (
-        <WelcomePanel
-          loading={loading}
-          onDemo={() => loadProject("/demo/ecat-energy")}
-          onSelect={selectProject}
-          showDemo={!isTauri()}
-        />
+  async function completeCloudSetup(
+    codeRepository: string,
+    secretRepository: string,
+  ) {
+    if (!workspace || !projectPath || !currentRun) return;
+    setApplying(true);
+    try {
+      const document = parseDocument(workspace.manifestYaml);
+      document.setIn(["providers", "build", "repository"], codeRepository);
+      const data = document.toJS() as {
+        providers?: { registry?: { kind?: string } };
+        source?: { release_branch?: string };
+      };
+      if (data.providers?.registry?.kind === "cnb") {
+        document.setIn(["providers", "registry", "repository"], codeRepository);
+      }
+      document.setIn(
+        ["environments", "staging", "secrets_ref"],
+        `https://cnb.cool/${secretRepository}/-/blob/main/env.staging.yml`,
       );
+      document.setIn(
+        ["environments", "production", "secrets_ref"],
+        `https://cnb.cool/${secretRepository}/-/blob/main/env.production.yml`,
+      );
+      const manifestYaml = document.toString({ lineWidth: 0 });
+      const preview = await previewManifest(projectPath, manifestYaml);
+      if (!preview.validation.valid) {
+        throw new Error("持续部署配置校验未通过，请检查密钥仓库路径");
+      }
+      await applyManifest(projectPath, manifestYaml);
+      const branch = data.source?.release_branch ?? "main";
+      await syncProjectToCnb(projectPath, codeRepository, branch);
+      const autoTrigger = await enableCnbAutoTrigger(codeRepository);
+      if (!autoTrigger.ok) throw new Error(autoTrigger.summary);
+      const refreshed = await openProject(projectPath);
+      setWorkspace(refreshed);
+      const run = await resumeStagingDeployment(currentRun.id);
+      setCurrentRun(run);
+      setDeploymentRuns((current) => [
+        run,
+        ...current.filter((item) => item.id !== run.id),
+      ]);
+      toast.success("持续部署连接已完成，测试环境开始构建");
+    } catch (error) {
+      reportError(toMessage(error));
+    } finally {
+      setApplying(false);
     }
-    switch (active) {
-      case "overview":
-        return <ProjectOverview workspace={workspace} />;
-      case "environments":
-        return (
-          <EnvironmentEditor
-            onSave={updateManifest}
+  }
+
+  async function finishDeployment() {
+    await goToStep("workspace");
+  }
+
+  async function promoteToProduction(source: DeploymentRun) {
+    setApplying(true);
+    try {
+      const run = await promoteProductionDeployment(source.id);
+      setCurrentRun(run);
+      setDeploymentRuns((current) => [run, ...current]);
+      await saveProjectStep(projectPath, "deploying");
+      setStep("deploying");
+      setScreen("onboarding");
+    } catch (error) {
+      reportError(toMessage(error));
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  async function rollbackProjectEnvironment(
+    environment: DeploymentRun["environment"],
+  ) {
+    if (!lastServer?.hostFingerprint) {
+      reportError("目标服务器身份需要重新验证后才能回滚");
+      return;
+    }
+    setApplying(true);
+    try {
+      const run = await rollbackEnvironment(
+        projectPath,
+        environment,
+        lastServer,
+      );
+      setDeploymentRuns((current) => [
+        run,
+        ...current.filter((item) => item.id !== run.id),
+      ]);
+      if (run.status === "success") {
+        toast.success(run.message);
+      } else {
+        reportError(run.message);
+      }
+    } catch (error) {
+      reportError(toMessage(error));
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  function backStep() {
+    const index = onboardingSteps.indexOf(step);
+    if (index > 0) void goToStep(onboardingSteps[index - 1]);
+  }
+
+  function nextStep() {
+    const index = onboardingSteps.indexOf(step);
+    if (index >= 0 && index < onboardingSteps.length - 1) {
+      void goToStep(onboardingSteps[index + 1]);
+    }
+  }
+
+  function renderOnboarding() {
+    if (!workspace) return null;
+    const footer =
+      step === "review" || step === "deploying" ? (
+        <span className="text-xs text-[var(--muted-foreground)]">
+          {step === "deploying" ? "部署状态会自动保存" : "请在上方确认变更"}
+        </span>
+      ) : (
+        <Button
+          disabled={step === "connections" && !connectionsReady}
+          onClick={nextStep}
+        >
+          {step === "inspection"
+            ? "结果正确，继续"
+            : step === "connections"
+              ? "使用这些连接"
+              : step === "recommendation"
+                ? "使用推荐方案"
+                : "查看部署计划"}
+          <ArrowRight />
+        </Button>
+      );
+
+    return (
+      <OnboardingLayout
+        footer={footer}
+        onBack={
+          step === "inspection" || step === "deploying" ? undefined : backStep
+        }
+        onClose={() => setScreen("home")}
+        projectName={workspace.inspection.project_name}
+        step={step}
+      >
+        {step === "inspection" ? (
+          <InspectionStep workspace={workspace} />
+        ) : null}
+        {step === "connections" ? (
+          <ConnectionStep
+            initialServer={lastServer}
+            onError={reportError}
+            onStateChange={handleConnectionState}
+          />
+        ) : null}
+        {step === "recommendation" ? (
+          <RecommendationStep workspace={workspace} />
+        ) : null}
+        {step === "requirements" ? (
+          <RequirementsStep
+            onError={reportError}
+            onUpdate={updateManifest}
             saving={saving}
             workspace={workspace}
           />
-        );
-      case "connections":
-        return (
-          <ConnectionsPanel
-            onError={setError}
-            onRepositorySelected={selectCnbRepository}
-          />
-        );
-      case "plan":
-        return (
-          <PlanPanel
+        ) : null}
+        {step === "review" ? (
+          <ReviewStep
             applying={applying}
-            applyResult={applyResult}
             onApply={applyCurrentPlan}
             workspace={workspace}
           />
-        );
-    }
+        ) : null}
+        {step === "deploying" &&
+        currentRun?.actionKind === "cloud-setup" &&
+        lastServer ? (
+          <CloudSetupAction
+            completing={applying}
+            onBackToRequirements={() => goToStep("requirements")}
+            onComplete={completeCloudSetup}
+            onError={reportError}
+            path={projectPath}
+            server={lastServer}
+            workspace={workspace}
+          />
+        ) : null}
+        {step === "deploying" &&
+        currentRun &&
+        currentRun.actionKind !== "cloud-setup" ? (
+          <DeploymentProgress
+            onRefresh={refreshCurrentDeployment}
+            onRetry={retryDeployment}
+            onWorkspace={finishDeployment}
+            run={currentRun}
+          />
+        ) : null}
+      </OnboardingLayout>
+    );
   }
 
   return (
-    <div className="app-shell">
-      <Sidebar
-        active={active}
-        hasWorkspace={Boolean(workspace)}
-        onChange={setActive}
-        preflight={preflight}
-      />
-      <div className="workspace-shell">
-        <header className="topbar">
-          <div className="breadcrumb">
-            <span>{workspace?.inspection.project_name ?? "工作区"}</span>
-            <span>/</span>
-            <strong>{sectionNames[active]}</strong>
-          </div>
-          <div className="topbar-actions">
-            {workspace ? (
-              <button
-                className="icon-action"
-                onClick={() => loadProject(projectPath)}
-                title="重新识别项目"
-                type="button"
-              >
-                <RefreshCw size={17} />
-              </button>
-            ) : null}
-            <button
-              className="secondary-action compact"
-              onClick={selectProject}
-              type="button"
-            >
-              <FolderOpen size={16} />
-              {workspace ? "切换项目" : "选择项目"}
-            </button>
-          </div>
-        </header>
-        <main className="main-content" ref={mainContentRef}>
-          {renderContent()}
-        </main>
-      </div>
+    <>
+      {screen === "home" ? (
+        <ProjectHome
+          loading={loading}
+          onDemo={() => loadProject("/demo/ecat-energy")}
+          onForget={forgetRecent}
+          onOpen={(project) => loadProject(project.path, project.currentStep)}
+          onSelect={selectProject}
+          preflight={preflight}
+          projects={projects}
+          showDemo={!isTauri()}
+        />
+      ) : null}
 
-      {loading ? (
-        <div className="loading-layer" role="status">
-          <LoaderCircle className="spin" size={25} />
-          <span>正在只读识别项目</span>
+      {screen === "onboarding" ? renderOnboarding() : null}
+
+      {screen === "workspace" && workspace ? (
+        <WorkspaceShell
+          onDeploy={() => goToStep("review")}
+          onForget={() => {
+            const current = projects.find(
+              (project) => project.path === projectPath,
+            );
+            if (current) void forgetRecent(current);
+          }}
+          onHome={() => setScreen("home")}
+          onPromote={promoteToProduction}
+          onRollback={rollbackProjectEnvironment}
+          onRefresh={() => loadProject(projectPath, "workspace")}
+          path={projectPath}
+          preflight={preflight}
+          runs={deploymentRuns}
+          workspace={workspace}
+        />
+      ) : null}
+
+      {loading && screen !== "home" ? (
+        <div className="fixed inset-0 z-[100] grid place-items-center bg-[var(--background)]/80 backdrop-blur-sm">
+          <div className="flex items-center gap-2 text-sm text-[var(--muted-foreground)]">
+            <LoaderCircle className="size-5 animate-spin-slow" />
+            正在只读识别项目
+          </div>
         </div>
       ) : null}
-      {error ? (
-        <div className="toast error-toast" role="alert">
-          <span>{error}</span>
-          <button onClick={() => setError(null)} title="关闭" type="button">
-            <X size={16} />
-          </button>
-        </div>
-      ) : null}
-      {notice ? (
-        <div className="toast success-toast" role="status">
-          <CheckCircle2 size={17} />
-          <span>{notice}</span>
-          <button onClick={() => setNotice(null)} title="关闭" type="button">
-            <X size={16} />
-          </button>
-        </div>
-      ) : null}
-    </div>
+
+      <Toaster
+        closeButton
+        position="top-right"
+        richColors
+        toastOptions={{ duration: 4500 }}
+      />
+    </>
   );
 }
 

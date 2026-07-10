@@ -11,13 +11,13 @@ pub fn system_preflight() -> SystemPreflight {
         "读取和同步项目代码",
         "安装 Git 后重新检查",
     );
-    let ssh = tool_status(
-        "OpenSSH",
-        "ssh",
-        &["-V"],
-        "安全连接目标服务器",
-        "安装系统 OpenSSH 客户端",
-    );
+    let ssh = ToolStatus {
+        name: "内置安全连接".to_string(),
+        available: true,
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        required_for: "安全连接目标服务器".to_string(),
+        resolution: None,
+    };
     let docker = docker_status();
     let node = tool_status(
         "Node.js",
@@ -26,7 +26,7 @@ pub fn system_preflight() -> SystemPreflight {
         "本地开发预览",
         "仅云端部署时可以暂不安装",
     );
-    let ready_for_cloud_deploy = git.available && ssh.available;
+    let ready_for_cloud_deploy = git.available;
     let ready_for_local_preview = ready_for_cloud_deploy && docker.available && node.available;
     SystemPreflight {
         operating_system: std::env::consts::OS.to_string(),

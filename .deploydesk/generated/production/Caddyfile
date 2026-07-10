@@ -1,0 +1,5 @@
+# abcdeploy / 生产环境，由 ABCDeploy 生成
+
+abcdeploy.finagent.cloud {
+	reverse_proxy abcdeploy-production-site:80
+}

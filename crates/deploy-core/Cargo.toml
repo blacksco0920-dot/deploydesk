@@ -1,6 +1,6 @@
 [package]
 name = "deploy-core"
-description = "Deterministic deployment planning and provider integrations for DeployDesk"
+description = "Deterministic deployment planning and provider integrations for ABCDeploy"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,11 +14,13 @@ dirs.workspace = true
 percent-encoding.workspace = true
 regex.workspace = true
 reqwest.workspace = true
+russh.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true
+ssh-key.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

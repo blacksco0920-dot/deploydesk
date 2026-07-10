@@ -16,7 +16,7 @@ use deploy_core::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "deployctl", version, about = "DeployDesk 的跨平台部署内核")]
+#[command(name = "deployctl", version, about = "ABCDeploy 的跨平台部署内核")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -117,6 +117,8 @@ enum ProviderCommand {
         key: PathBuf,
         #[arg(long, default_value_t = 22)]
         port: u16,
+        #[arg(long)]
+        host_fingerprint: Option<String>,
     },
     CaddyBootstrap {
         #[arg(long)]
@@ -129,6 +131,8 @@ enum ProviderCommand {
         key: PathBuf,
         #[arg(long, default_value_t = 22)]
         port: u16,
+        #[arg(long)]
+        host_fingerprint: Option<String>,
         #[arg(long)]
         yes: bool,
     },
@@ -170,9 +174,9 @@ enum CnbCommand {
         repository: String,
         #[arg(long, default_value = "main")]
         branch: String,
-        #[arg(long, default_value = "api_trigger_deploydesk")]
+        #[arg(long, default_value = "api_trigger_abcdeploy")]
         event: String,
-        #[arg(long, default_value = "DeployDesk 手动触发")]
+        #[arg(long, default_value = "ABCDeploy 手动触发")]
         title: String,
     },
 }
@@ -305,7 +309,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Release(command) => handle_release(command)?,
-        Command::Provider(command) => handle_provider(command)?,
+        Command::Provider(command) => handle_provider(command).await?,
         Command::Cnb(command) => handle_cnb(command).await?,
     }
     Ok(())
@@ -357,7 +361,7 @@ fn handle_release(command: ReleaseCommand) -> Result<()> {
     Ok(())
 }
 
-fn handle_provider(command: ProviderCommand) -> Result<()> {
+async fn handle_provider(command: ProviderCommand) -> Result<()> {
     match command {
         ProviderCommand::Docker => print_json(&docker::check_engine()?)?,
         ProviderCommand::Ssh {
@@ -366,34 +370,46 @@ fn handle_provider(command: ProviderCommand) -> Result<()> {
             user,
             key,
             port,
-        } => print_json(&ssh::check_connection(&ssh::SshProfile {
-            name,
-            host,
-            user,
-            port,
-            key_path: key,
-        })?)?,
+            host_fingerprint,
+        } => {
+            print_json(
+                &ssh::check_connection(&ssh::SshProfile {
+                    name,
+                    host,
+                    user,
+                    port,
+                    key_path: key,
+                    host_fingerprint,
+                })
+                .await?,
+            )?;
+        }
         ProviderCommand::CaddyBootstrap {
             name,
             host,
             user,
             key,
             port,
+            host_fingerprint,
             yes,
         } => {
             if !yes {
                 bail!("Caddy 初始化会在服务器创建 ~/.deploydesk 和容器，请加 --yes 明确确认");
             }
-            print_json(&caddy::bootstrap_server(
-                &ssh::SshProfile {
-                    name,
-                    host,
-                    user,
-                    port,
-                    key_path: key,
-                },
-                true,
-            )?)?;
+            print_json(
+                &caddy::bootstrap_server(
+                    &ssh::SshProfile {
+                        name,
+                        host,
+                        user,
+                        port,
+                        key_path: key,
+                        host_fingerprint,
+                    },
+                    true,
+                )
+                .await?,
+            )?;
         }
     }
     Ok(())

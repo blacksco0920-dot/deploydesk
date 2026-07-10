@@ -1,0 +1,493 @@
+# 由 ABCDeploy 生成。流水线只引用密钥，不在仓库保存密钥值。
+# 试点兼容历史密钥字段；新项目由桌面端生成独立流水线身份与完整 known_hosts。
+$:
+  api_trigger_production:
+  - docker:
+      image: node:22-slim
+    env:
+      ABCDEPLOY_SERVER_FINGERPRINT: SHA256:HEb1XRqWqz7adPpLS99kCz9tReGnsnV+62BNKxXaAiI
+      ABCDEPLOY_PILOT_SERVER_HOST: abcdeploy.finagent.cloud
+      ABCDEPLOY_PILOT_SERVER_USER: ubuntu
+      DEPLOYDESK_ENV: production
+    imports:
+    - https://cnb.cool/blacksco0920/finagent-secrets/-/blob/main/envs.yml
+    name: deploydesk-production-approved
+    runner:
+      cpus: 4
+      tags: cnb:arch:amd64
+    services:
+    - docker
+    stages:
+    - name: 准备安全部署工具
+      script:
+      - apt-get update && apt-get install -y --no-install-recommends ca-certificates openssh-client && rm -rf /var/lib/apt/lists/*
+    - name: 登录镜像仓库
+      script:
+      - |-
+        test -n "$TCR_USERNAME"
+        test -n "$TCR_PASSWORD"
+        printf '%s' "$TCR_PASSWORD" | docker login 'ccr.ccs.tencentyun.com' --username "$TCR_USERNAME" --password-stdin
+    - name: 按已验证摘要部署生产环境
+      script:
+      - |-
+        set -eu
+        IMAGE_TAG="sha-${CNB_COMMIT}"
+        RELEASE_TAG="verified-${IMAGE_TAG}"
+        RUNTIME_DIRECTORY='.deploydesk/runtime/production'
+        rm -rf "$RUNTIME_DIRECTORY"
+        install -d -m 700 "$RUNTIME_DIRECTORY"
+        node <<'DEPLOYDESK_NODE'
+        const fs = require("node:fs");
+        const variables = [];
+        const outputPath = ".deploydesk/runtime/production/.runtime.env";
+        const lines = ["DEPLOYDESK_ENV=production"];
+        const missing = [];
+        for (const variable of variables) {
+          const configured = Object.prototype.hasOwnProperty.call(process.env, variable.source);
+          const value = configured ? process.env[variable.source] : (variable.default ?? "");
+          if (variable.required && !value) missing.push(variable.source);
+          if (/\r|\n/.test(value)) {
+            console.error(`密钥仓库字段 ${variable.source} 不支持换行值`);
+            process.exit(1);
+          }
+          lines.push(`${variable.name}=${JSON.stringify(value)}`);
+        }
+        if (missing.length) {
+          console.error(`缺少密钥仓库字段：${missing.join(", ")}`);
+          process.exit(1);
+        }
+        fs.writeFileSync(outputPath, `${lines.join("\n")}\n`, { mode: 0o600 });
+        DEPLOYDESK_NODE
+        DEPLOYDESK_SITE_IMAGE_REPOSITORY='ccr.ccs.tencentyun.com/finagent/abcdeploy-site'
+        DEPLOYDESK_SITE_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_SITE_IMAGE_REPOSITORY}:${RELEASE_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
+        case "${DEPLOYDESK_SITE_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 site 的镜像摘要无效' >&2; exit 1 ;; esac
+        DEPLOYDESK_SITE_IMAGE="${DEPLOYDESK_SITE_IMAGE_REPOSITORY}@${DEPLOYDESK_SITE_IMAGE_DIGEST}"
+        {
+          printf 'DEPLOYDESK_RELEASE_ID=%s\n' "$RELEASE_TAG"
+          printf 'DEPLOYDESK_SITE_IMAGE=%s\n' "${DEPLOYDESK_SITE_IMAGE}"
+        } > "$RUNTIME_DIRECTORY/.release.env"
+        chmod 600 "$RUNTIME_DIRECTORY/.release.env"
+        SERVER_HOST="${ABCDEPLOY_PILOT_SERVER_HOST:-${PRODUCTION_SERVER_HOST:-${SERVER_HOST:-}}}"
+        SERVER_PORT="${PRODUCTION_SERVER_PORT:-${SERVER_PORT:-22}}"
+        SERVER_USER="${ABCDEPLOY_PILOT_SERVER_USER:-${PRODUCTION_SERVER_USER:-${SERVER_USER:-}}}"
+        SERVER_SSH_KEY="${PRODUCTION_SERVER_SSH_KEY:-${SERVER_SSH_KEY:-}}"
+        SERVER_KNOWN_HOSTS="${PRODUCTION_SERVER_KNOWN_HOSTS:-${SERVER_KNOWN_HOSTS:-}}"
+        test -n "$SERVER_HOST" || { echo '缺少生产服务器地址（PRODUCTION_SERVER_HOST 或 SERVER_HOST）' >&2; exit 1; }
+        test -n "$SERVER_USER" || { echo '缺少生产服务器用户（PRODUCTION_SERVER_USER 或 SERVER_USER）' >&2; exit 1; }
+        test -n "$SERVER_SSH_KEY" || { echo '缺少生产 SSH 私钥（PRODUCTION_SERVER_SSH_KEY 或 SERVER_SSH_KEY）' >&2; exit 1; }
+        if [ -z "$SERVER_KNOWN_HOSTS" ]; then
+          SCANNED_HOST_KEYS="$(ssh-keyscan -T 5 -p "$SERVER_PORT" -t ed25519 "$SERVER_HOST" 2>/dev/null | awk '$1 !~ /^#/ && NF >= 3')"
+          test -n "$SCANNED_HOST_KEYS" || { echo '无法读取生产服务器 Ed25519 主机公钥' >&2; exit 1; }
+          ACTUAL_FINGERPRINT="$(printf '%s\n' "$SCANNED_HOST_KEYS" | ssh-keygen -lf - | awk 'NR == 1 { print $2 }')"
+          test "$ACTUAL_FINGERPRINT" = "$ABCDEPLOY_SERVER_FINGERPRINT" || { echo '生产服务器 SSH 主机指纹与已确认值不一致' >&2; exit 1; }
+          SERVER_KNOWN_HOSTS="$SCANNED_HOST_KEYS"
+        fi
+        test -n "$SERVER_KNOWN_HOSTS" || { echo '缺少生产服务器 known_hosts' >&2; exit 1; }
+        case "$SERVER_PORT" in ''|*[!0-9]*) echo 'SSH 端口格式不正确' >&2; exit 1 ;; esac
+        SSH_KEY_FILE="$RUNTIME_DIRECTORY/deploydesk_key"
+        KNOWN_HOSTS_FILE="$RUNTIME_DIRECTORY/known_hosts"
+        printf '%s\n' "$SERVER_SSH_KEY" > "$SSH_KEY_FILE"
+        printf '%s\n' "$SERVER_KNOWN_HOSTS" > "$KNOWN_HOSTS_FILE"
+        chmod 600 "$SSH_KEY_FILE" "$KNOWN_HOSTS_FILE"
+        DESTINATION="$SERVER_USER@$SERVER_HOST"
+        ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
+        mkdir -p '"'"'.deploydesk/apps/abcdeploy/production'"'"' "$HOME/.deploydesk/caddy/sites"
+        docker network inspect '"'"'deploydesk-abcdeploy-production'"'"' >/dev/null 2>&1 || docker network create '"'"'deploydesk-abcdeploy-production'"'"' >/dev/null'
+        { printf '%s\n' "$TCR_USERNAME"; printf '%s' "$TCR_PASSWORD"; } | ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'IFS= read -r registry_user; test -n "$registry_user"; docker login '"'"'ccr.ccs.tencentyun.com'"'"' --username "$registry_user" --password-stdin'
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/production/docker-compose.yml' "$DESTINATION:.deploydesk/apps/abcdeploy/production/docker-compose.yml.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/production/Caddyfile' "$DESTINATION:.deploydesk/apps/abcdeploy/production/Caddyfile.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.runtime.env" "$DESTINATION:.deploydesk/apps/abcdeploy/production/.runtime.env.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.release.env" "$DESTINATION:.deploydesk/apps/abcdeploy/production/.release.env.next"
+        ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
+        cd '"'"'.deploydesk/apps/abcdeploy/production'"'"'
+        backup_file() {
+          if [ -f "$1" ]; then cp "$1" "$1.previous"; else rm -f "$1.previous"; fi
+        }
+        restore_previous() {
+          for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
+            if [ -f "$file.previous" ]; then cp "$file.previous" "$file"; fi
+          done
+        }
+        for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
+          test -f "$file.next"
+          backup_file "$file"
+          mv "$file.next" "$file"
+        done
+        chmod 600 .runtime.env .release.env
+        if docker compose --env-file .release.env -f docker-compose.yml config --quiet && \
+           docker compose --env-file .release.env -f docker-compose.yml pull && \
+           docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180; then
+          release_id="$(sed -n '"'"'s/^DEPLOYDESK_RELEASE_ID=//p'"'"' .release.env | head -n 1)"
+        else
+          deploy_status=$?
+          if [ "true" = "true" ] && [ -f .release.env.previous ]; then
+            restore_previous
+            docker compose --env-file .release.env -f docker-compose.yml pull || true
+            docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180 || true
+          fi
+          exit "$deploy_status"
+        fi
+        case "$release_id" in '"'"''"'"'|*[!A-Za-z0-9._-]*) echo '"'"'发布记录标识无效'"'"' >&2; exit 1 ;; esac
+        mkdir -p .history "$HOME/.deploydesk/caddy/sites"
+        cp .release.env ".history/$release_id.env"
+        old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
+        if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
+        cp Caddyfile "$HOME/.deploydesk/caddy/sites/abcdeploy-production.caddy"
+        if docker inspect deploydesk-caddy >/dev/null 2>&1; then
+          docker network connect '"'"'deploydesk-abcdeploy-production'"'"' deploydesk-caddy 2>/dev/null || true
+          docker exec deploydesk-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker exec deploydesk-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+        elif docker inspect infra-caddy >/dev/null 2>&1; then
+          docker network connect '"'"'deploydesk-abcdeploy-production'"'"' infra-caddy 2>/dev/null || true
+          docker exec infra-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker exec infra-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+        else
+          echo '"'"'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 ABCDeploy Caddy。'"'"'
+        fi'
+  api_trigger_staging:
+  - docker:
+      image: node:22-slim
+    env:
+      ABCDEPLOY_SERVER_FINGERPRINT: SHA256:HEb1XRqWqz7adPpLS99kCz9tReGnsnV+62BNKxXaAiI
+      ABCDEPLOY_PILOT_SERVER_HOST: abcdeploy.finagent.cloud
+      ABCDEPLOY_PILOT_SERVER_USER: ubuntu
+      DEPLOYDESK_ENV: staging
+    imports:
+    - https://cnb.cool/blacksco0920/ecatSecret/-/blob/main/envs.yml
+    name: deploydesk-release-candidate
+    runner:
+      cpus: 4
+      tags: cnb:arch:amd64
+    services:
+    - docker
+    stages:
+    - name: 准备安全部署工具
+      script:
+      - apt-get update && apt-get install -y --no-install-recommends ca-certificates openssh-client && rm -rf /var/lib/apt/lists/*
+    - name: 安装依赖
+      script:
+      - corepack enable && pnpm install --frozen-lockfile --filter @abcdeploy/site...
+    - name: 验证 1
+      script:
+      - pnpm --filter @abcdeploy/site build
+    - name: 登录镜像仓库
+      script:
+      - |-
+        test -n "$TCR_USERNAME"
+        test -n "$TCR_PASSWORD"
+        printf '%s' "$TCR_PASSWORD" | docker login 'ccr.ccs.tencentyun.com' --username "$TCR_USERNAME" --password-stdin
+    - name: 构建并上传 site
+      script:
+      - |-
+        IMAGE_TAG="sha-${CNB_COMMIT}"
+        IMAGE_REPOSITORY='ccr.ccs.tencentyun.com/finagent/abcdeploy-site'
+        IMAGE_REFERENCE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+        docker build --file 'apps/site/Dockerfile' --tag "$IMAGE_REFERENCE" '.'
+        docker push "$IMAGE_REFERENCE"
+    - name: 在测试环境验证生产候选
+      script:
+      - |-
+        set -eu
+        IMAGE_TAG="sha-${CNB_COMMIT}"
+        RELEASE_TAG="$IMAGE_TAG"
+        RUNTIME_DIRECTORY='.deploydesk/runtime/staging'
+        rm -rf "$RUNTIME_DIRECTORY"
+        install -d -m 700 "$RUNTIME_DIRECTORY"
+        node <<'DEPLOYDESK_NODE'
+        const fs = require("node:fs");
+        const variables = [];
+        const outputPath = ".deploydesk/runtime/staging/.runtime.env";
+        const lines = ["DEPLOYDESK_ENV=staging"];
+        const missing = [];
+        for (const variable of variables) {
+          const configured = Object.prototype.hasOwnProperty.call(process.env, variable.source);
+          const value = configured ? process.env[variable.source] : (variable.default ?? "");
+          if (variable.required && !value) missing.push(variable.source);
+          if (/\r|\n/.test(value)) {
+            console.error(`密钥仓库字段 ${variable.source} 不支持换行值`);
+            process.exit(1);
+          }
+          lines.push(`${variable.name}=${JSON.stringify(value)}`);
+        }
+        if (missing.length) {
+          console.error(`缺少密钥仓库字段：${missing.join(", ")}`);
+          process.exit(1);
+        }
+        fs.writeFileSync(outputPath, `${lines.join("\n")}\n`, { mode: 0o600 });
+        DEPLOYDESK_NODE
+        DEPLOYDESK_SITE_IMAGE_REPOSITORY='ccr.ccs.tencentyun.com/finagent/abcdeploy-site'
+        DEPLOYDESK_SITE_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_SITE_IMAGE_REPOSITORY}:${RELEASE_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
+        case "${DEPLOYDESK_SITE_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 site 的镜像摘要无效' >&2; exit 1 ;; esac
+        DEPLOYDESK_SITE_IMAGE="${DEPLOYDESK_SITE_IMAGE_REPOSITORY}@${DEPLOYDESK_SITE_IMAGE_DIGEST}"
+        {
+          printf 'DEPLOYDESK_RELEASE_ID=%s\n' "$RELEASE_TAG"
+          printf 'DEPLOYDESK_SITE_IMAGE=%s\n' "${DEPLOYDESK_SITE_IMAGE}"
+        } > "$RUNTIME_DIRECTORY/.release.env"
+        chmod 600 "$RUNTIME_DIRECTORY/.release.env"
+        SERVER_HOST="${ABCDEPLOY_PILOT_SERVER_HOST:-${STAGING_SERVER_HOST:-${SERVER_HOST:-}}}"
+        SERVER_PORT="${STAGING_SERVER_PORT:-${SERVER_PORT:-22}}"
+        SERVER_USER="${ABCDEPLOY_PILOT_SERVER_USER:-${STAGING_SERVER_USER:-${SERVER_USER:-}}}"
+        SERVER_SSH_KEY="${STAGING_SERVER_SSH_KEY:-${SERVER_SSH_KEY:-}}"
+        SERVER_KNOWN_HOSTS="${STAGING_SERVER_KNOWN_HOSTS:-${SERVER_KNOWN_HOSTS:-}}"
+        test -n "$SERVER_HOST" || { echo '缺少测试服务器地址（STAGING_SERVER_HOST 或 SERVER_HOST）' >&2; exit 1; }
+        test -n "$SERVER_USER" || { echo '缺少测试服务器用户（STAGING_SERVER_USER 或 SERVER_USER）' >&2; exit 1; }
+        test -n "$SERVER_SSH_KEY" || { echo '缺少测试 SSH 私钥（STAGING_SERVER_SSH_KEY 或 SERVER_SSH_KEY）' >&2; exit 1; }
+        if [ -z "$SERVER_KNOWN_HOSTS" ]; then
+          SCANNED_HOST_KEYS="$(ssh-keyscan -T 5 -p "$SERVER_PORT" -t ed25519 "$SERVER_HOST" 2>/dev/null | awk '$1 !~ /^#/ && NF >= 3')"
+          test -n "$SCANNED_HOST_KEYS" || { echo '无法读取测试服务器 Ed25519 主机公钥' >&2; exit 1; }
+          ACTUAL_FINGERPRINT="$(printf '%s\n' "$SCANNED_HOST_KEYS" | ssh-keygen -lf - | awk 'NR == 1 { print $2 }')"
+          test "$ACTUAL_FINGERPRINT" = "$ABCDEPLOY_SERVER_FINGERPRINT" || { echo '测试服务器 SSH 主机指纹与已确认值不一致' >&2; exit 1; }
+          SERVER_KNOWN_HOSTS="$SCANNED_HOST_KEYS"
+        fi
+        test -n "$SERVER_KNOWN_HOSTS" || { echo '缺少测试服务器 known_hosts' >&2; exit 1; }
+        case "$SERVER_PORT" in ''|*[!0-9]*) echo 'SSH 端口格式不正确' >&2; exit 1 ;; esac
+        SSH_KEY_FILE="$RUNTIME_DIRECTORY/deploydesk_key"
+        KNOWN_HOSTS_FILE="$RUNTIME_DIRECTORY/known_hosts"
+        printf '%s\n' "$SERVER_SSH_KEY" > "$SSH_KEY_FILE"
+        printf '%s\n' "$SERVER_KNOWN_HOSTS" > "$KNOWN_HOSTS_FILE"
+        chmod 600 "$SSH_KEY_FILE" "$KNOWN_HOSTS_FILE"
+        DESTINATION="$SERVER_USER@$SERVER_HOST"
+        ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
+        mkdir -p '"'"'.deploydesk/apps/abcdeploy/staging'"'"' "$HOME/.deploydesk/caddy/sites"
+        docker network inspect '"'"'deploydesk-abcdeploy-staging'"'"' >/dev/null 2>&1 || docker network create '"'"'deploydesk-abcdeploy-staging'"'"' >/dev/null'
+        { printf '%s\n' "$TCR_USERNAME"; printf '%s' "$TCR_PASSWORD"; } | ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'IFS= read -r registry_user; test -n "$registry_user"; docker login '"'"'ccr.ccs.tencentyun.com'"'"' --username "$registry_user" --password-stdin'
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/staging/docker-compose.yml' "$DESTINATION:.deploydesk/apps/abcdeploy/staging/docker-compose.yml.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/staging/Caddyfile' "$DESTINATION:.deploydesk/apps/abcdeploy/staging/Caddyfile.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.runtime.env" "$DESTINATION:.deploydesk/apps/abcdeploy/staging/.runtime.env.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.release.env" "$DESTINATION:.deploydesk/apps/abcdeploy/staging/.release.env.next"
+        ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
+        cd '"'"'.deploydesk/apps/abcdeploy/staging'"'"'
+        backup_file() {
+          if [ -f "$1" ]; then cp "$1" "$1.previous"; else rm -f "$1.previous"; fi
+        }
+        restore_previous() {
+          for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
+            if [ -f "$file.previous" ]; then cp "$file.previous" "$file"; fi
+          done
+        }
+        for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
+          test -f "$file.next"
+          backup_file "$file"
+          mv "$file.next" "$file"
+        done
+        chmod 600 .runtime.env .release.env
+        if docker compose --env-file .release.env -f docker-compose.yml config --quiet && \
+           docker compose --env-file .release.env -f docker-compose.yml pull && \
+           docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180; then
+          release_id="$(sed -n '"'"'s/^DEPLOYDESK_RELEASE_ID=//p'"'"' .release.env | head -n 1)"
+        else
+          deploy_status=$?
+          if [ "true" = "true" ] && [ -f .release.env.previous ]; then
+            restore_previous
+            docker compose --env-file .release.env -f docker-compose.yml pull || true
+            docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180 || true
+          fi
+          exit "$deploy_status"
+        fi
+        case "$release_id" in '"'"''"'"'|*[!A-Za-z0-9._-]*) echo '"'"'发布记录标识无效'"'"' >&2; exit 1 ;; esac
+        mkdir -p .history "$HOME/.deploydesk/caddy/sites"
+        cp .release.env ".history/$release_id.env"
+        old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
+        if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
+        cp Caddyfile "$HOME/.deploydesk/caddy/sites/abcdeploy-staging.caddy"
+        if docker inspect deploydesk-caddy >/dev/null 2>&1; then
+          docker network connect '"'"'deploydesk-abcdeploy-staging'"'"' deploydesk-caddy 2>/dev/null || true
+          docker exec deploydesk-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker exec deploydesk-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+        elif docker inspect infra-caddy >/dev/null 2>&1; then
+          docker network connect '"'"'deploydesk-abcdeploy-staging'"'"' infra-caddy 2>/dev/null || true
+          docker exec infra-caddy wget -q --spider http://abcdeploy-staging-site:80/
+        else
+          echo '"'"'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 ABCDeploy Caddy。'"'"'
+        fi'
+    - name: 标记已验证镜像摘要
+      script:
+      - |-
+        set -eu
+        IMAGE_TAG="sha-${CNB_COMMIT}"
+        VERIFIED_TAG="verified-${IMAGE_TAG}"
+        IMAGE_REPOSITORY='ccr.ccs.tencentyun.com/finagent/abcdeploy-site'
+        IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
+        case "$IMAGE_DIGEST" in sha256:*) ;; *) echo '镜像摘要解析失败' >&2; exit 1 ;; esac
+        docker buildx imagetools create --prefer-index=false --tag "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+        VERIFIED_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
+        test "$VERIFIED_DIGEST" = "$IMAGE_DIGEST"
+production:
+  push:
+  - name: abcdeploy-production-approval
+    stages:
+    - name: 晋级当前已验证提交到生产
+      type: cnb:apply
+      options:
+        event: api_trigger_production
+        sync: true
+        title: ABCDeploy production promotion
+main:
+  push:
+  - docker:
+      image: node:22-slim
+    env:
+      ABCDEPLOY_SERVER_FINGERPRINT: SHA256:HEb1XRqWqz7adPpLS99kCz9tReGnsnV+62BNKxXaAiI
+      ABCDEPLOY_PILOT_SERVER_HOST: abcdeploy.finagent.cloud
+      ABCDEPLOY_PILOT_SERVER_USER: ubuntu
+      DEPLOYDESK_ENV: staging
+    imports:
+    - https://cnb.cool/blacksco0920/ecatSecret/-/blob/main/envs.yml
+    name: deploydesk-release-candidate
+    runner:
+      cpus: 4
+      tags: cnb:arch:amd64
+    services:
+    - docker
+    stages:
+    - name: 准备安全部署工具
+      script:
+      - apt-get update && apt-get install -y --no-install-recommends ca-certificates openssh-client && rm -rf /var/lib/apt/lists/*
+    - name: 安装依赖
+      script:
+      - corepack enable && pnpm install --frozen-lockfile --filter @abcdeploy/site...
+    - name: 验证 1
+      script:
+      - pnpm --filter @abcdeploy/site build
+    - name: 登录镜像仓库
+      script:
+      - |-
+        test -n "$TCR_USERNAME"
+        test -n "$TCR_PASSWORD"
+        printf '%s' "$TCR_PASSWORD" | docker login 'ccr.ccs.tencentyun.com' --username "$TCR_USERNAME" --password-stdin
+    - name: 构建并上传 site
+      script:
+      - |-
+        IMAGE_TAG="sha-${CNB_COMMIT}"
+        IMAGE_REPOSITORY='ccr.ccs.tencentyun.com/finagent/abcdeploy-site'
+        IMAGE_REFERENCE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+        docker build --file 'apps/site/Dockerfile' --tag "$IMAGE_REFERENCE" '.'
+        docker push "$IMAGE_REFERENCE"
+    - name: 在测试环境验证生产候选
+      script:
+      - |-
+        set -eu
+        IMAGE_TAG="sha-${CNB_COMMIT}"
+        RELEASE_TAG="$IMAGE_TAG"
+        RUNTIME_DIRECTORY='.deploydesk/runtime/staging'
+        rm -rf "$RUNTIME_DIRECTORY"
+        install -d -m 700 "$RUNTIME_DIRECTORY"
+        node <<'DEPLOYDESK_NODE'
+        const fs = require("node:fs");
+        const variables = [];
+        const outputPath = ".deploydesk/runtime/staging/.runtime.env";
+        const lines = ["DEPLOYDESK_ENV=staging"];
+        const missing = [];
+        for (const variable of variables) {
+          const configured = Object.prototype.hasOwnProperty.call(process.env, variable.source);
+          const value = configured ? process.env[variable.source] : (variable.default ?? "");
+          if (variable.required && !value) missing.push(variable.source);
+          if (/\r|\n/.test(value)) {
+            console.error(`密钥仓库字段 ${variable.source} 不支持换行值`);
+            process.exit(1);
+          }
+          lines.push(`${variable.name}=${JSON.stringify(value)}`);
+        }
+        if (missing.length) {
+          console.error(`缺少密钥仓库字段：${missing.join(", ")}`);
+          process.exit(1);
+        }
+        fs.writeFileSync(outputPath, `${lines.join("\n")}\n`, { mode: 0o600 });
+        DEPLOYDESK_NODE
+        DEPLOYDESK_SITE_IMAGE_REPOSITORY='ccr.ccs.tencentyun.com/finagent/abcdeploy-site'
+        DEPLOYDESK_SITE_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_SITE_IMAGE_REPOSITORY}:${RELEASE_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
+        case "${DEPLOYDESK_SITE_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 site 的镜像摘要无效' >&2; exit 1 ;; esac
+        DEPLOYDESK_SITE_IMAGE="${DEPLOYDESK_SITE_IMAGE_REPOSITORY}@${DEPLOYDESK_SITE_IMAGE_DIGEST}"
+        {
+          printf 'DEPLOYDESK_RELEASE_ID=%s\n' "$RELEASE_TAG"
+          printf 'DEPLOYDESK_SITE_IMAGE=%s\n' "${DEPLOYDESK_SITE_IMAGE}"
+        } > "$RUNTIME_DIRECTORY/.release.env"
+        chmod 600 "$RUNTIME_DIRECTORY/.release.env"
+        SERVER_HOST="${ABCDEPLOY_PILOT_SERVER_HOST:-${STAGING_SERVER_HOST:-${SERVER_HOST:-}}}"
+        SERVER_PORT="${STAGING_SERVER_PORT:-${SERVER_PORT:-22}}"
+        SERVER_USER="${ABCDEPLOY_PILOT_SERVER_USER:-${STAGING_SERVER_USER:-${SERVER_USER:-}}}"
+        SERVER_SSH_KEY="${STAGING_SERVER_SSH_KEY:-${SERVER_SSH_KEY:-}}"
+        SERVER_KNOWN_HOSTS="${STAGING_SERVER_KNOWN_HOSTS:-${SERVER_KNOWN_HOSTS:-}}"
+        test -n "$SERVER_HOST" || { echo '缺少测试服务器地址（STAGING_SERVER_HOST 或 SERVER_HOST）' >&2; exit 1; }
+        test -n "$SERVER_USER" || { echo '缺少测试服务器用户（STAGING_SERVER_USER 或 SERVER_USER）' >&2; exit 1; }
+        test -n "$SERVER_SSH_KEY" || { echo '缺少测试 SSH 私钥（STAGING_SERVER_SSH_KEY 或 SERVER_SSH_KEY）' >&2; exit 1; }
+        if [ -z "$SERVER_KNOWN_HOSTS" ]; then
+          SCANNED_HOST_KEYS="$(ssh-keyscan -T 5 -p "$SERVER_PORT" -t ed25519 "$SERVER_HOST" 2>/dev/null | awk '$1 !~ /^#/ && NF >= 3')"
+          test -n "$SCANNED_HOST_KEYS" || { echo '无法读取测试服务器 Ed25519 主机公钥' >&2; exit 1; }
+          ACTUAL_FINGERPRINT="$(printf '%s\n' "$SCANNED_HOST_KEYS" | ssh-keygen -lf - | awk 'NR == 1 { print $2 }')"
+          test "$ACTUAL_FINGERPRINT" = "$ABCDEPLOY_SERVER_FINGERPRINT" || { echo '测试服务器 SSH 主机指纹与已确认值不一致' >&2; exit 1; }
+          SERVER_KNOWN_HOSTS="$SCANNED_HOST_KEYS"
+        fi
+        test -n "$SERVER_KNOWN_HOSTS" || { echo '缺少测试服务器 known_hosts' >&2; exit 1; }
+        case "$SERVER_PORT" in ''|*[!0-9]*) echo 'SSH 端口格式不正确' >&2; exit 1 ;; esac
+        SSH_KEY_FILE="$RUNTIME_DIRECTORY/deploydesk_key"
+        KNOWN_HOSTS_FILE="$RUNTIME_DIRECTORY/known_hosts"
+        printf '%s\n' "$SERVER_SSH_KEY" > "$SSH_KEY_FILE"
+        printf '%s\n' "$SERVER_KNOWN_HOSTS" > "$KNOWN_HOSTS_FILE"
+        chmod 600 "$SSH_KEY_FILE" "$KNOWN_HOSTS_FILE"
+        DESTINATION="$SERVER_USER@$SERVER_HOST"
+        ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
+        mkdir -p '"'"'.deploydesk/apps/abcdeploy/staging'"'"' "$HOME/.deploydesk/caddy/sites"
+        docker network inspect '"'"'deploydesk-abcdeploy-staging'"'"' >/dev/null 2>&1 || docker network create '"'"'deploydesk-abcdeploy-staging'"'"' >/dev/null'
+        { printf '%s\n' "$TCR_USERNAME"; printf '%s' "$TCR_PASSWORD"; } | ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'IFS= read -r registry_user; test -n "$registry_user"; docker login '"'"'ccr.ccs.tencentyun.com'"'"' --username "$registry_user" --password-stdin'
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/staging/docker-compose.yml' "$DESTINATION:.deploydesk/apps/abcdeploy/staging/docker-compose.yml.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" '.deploydesk/generated/staging/Caddyfile' "$DESTINATION:.deploydesk/apps/abcdeploy/staging/Caddyfile.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.runtime.env" "$DESTINATION:.deploydesk/apps/abcdeploy/staging/.runtime.env.next"
+        scp -i "$SSH_KEY_FILE" -P "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$RUNTIME_DIRECTORY/.release.env" "$DESTINATION:.deploydesk/apps/abcdeploy/staging/.release.env.next"
+        ssh -i "$SSH_KEY_FILE" -p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" "$DESTINATION" 'set -eu
+        cd '"'"'.deploydesk/apps/abcdeploy/staging'"'"'
+        backup_file() {
+          if [ -f "$1" ]; then cp "$1" "$1.previous"; else rm -f "$1.previous"; fi
+        }
+        restore_previous() {
+          for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
+            if [ -f "$file.previous" ]; then cp "$file.previous" "$file"; fi
+          done
+        }
+        for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
+          test -f "$file.next"
+          backup_file "$file"
+          mv "$file.next" "$file"
+        done
+        chmod 600 .runtime.env .release.env
+        if docker compose --env-file .release.env -f docker-compose.yml config --quiet && \
+           docker compose --env-file .release.env -f docker-compose.yml pull && \
+           docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180; then
+          release_id="$(sed -n '"'"'s/^DEPLOYDESK_RELEASE_ID=//p'"'"' .release.env | head -n 1)"
+        else
+          deploy_status=$?
+          if [ "true" = "true" ] && [ -f .release.env.previous ]; then
+            restore_previous
+            docker compose --env-file .release.env -f docker-compose.yml pull || true
+            docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180 || true
+          fi
+          exit "$deploy_status"
+        fi
+        case "$release_id" in '"'"''"'"'|*[!A-Za-z0-9._-]*) echo '"'"'发布记录标识无效'"'"' >&2; exit 1 ;; esac
+        mkdir -p .history "$HOME/.deploydesk/caddy/sites"
+        cp .release.env ".history/$release_id.env"
+        old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
+        if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
+        cp Caddyfile "$HOME/.deploydesk/caddy/sites/abcdeploy-staging.caddy"
+        if docker inspect deploydesk-caddy >/dev/null 2>&1; then
+          docker network connect '"'"'deploydesk-abcdeploy-staging'"'"' deploydesk-caddy 2>/dev/null || true
+          docker exec deploydesk-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker exec deploydesk-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+        elif docker inspect infra-caddy >/dev/null 2>&1; then
+          docker network connect '"'"'deploydesk-abcdeploy-staging'"'"' infra-caddy 2>/dev/null || true
+          docker exec infra-caddy wget -q --spider http://abcdeploy-staging-site:80/
+        else
+          echo '"'"'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 ABCDeploy Caddy。'"'"'
+        fi'
+    - name: 标记已验证镜像摘要
+      script:
+      - |-
+        set -eu
+        IMAGE_TAG="sha-${CNB_COMMIT}"
+        VERIFIED_TAG="verified-${IMAGE_TAG}"
+        IMAGE_REPOSITORY='ccr.ccs.tencentyun.com/finagent/abcdeploy-site'
+        IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
+        case "$IMAGE_DIGEST" in sha256:*) ;; *) echo '镜像摘要解析失败' >&2; exit 1 ;; esac
+        docker buildx imagetools create --prefer-index=false --tag "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+        VERIFIED_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
+        test "$VERIFIED_DIGEST" = "$IMAGE_DIGEST"

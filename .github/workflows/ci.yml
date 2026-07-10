@@ -79,10 +79,17 @@ jobs:
         run: cargo test --workspace
 
       - name: 桌面前端测试
-        run: pnpm --filter @deploydesk/desktop test
+        run: pnpm --filter @abcdeploy/desktop test
 
       - name: 桌面前端构建
-        run: pnpm --filter @deploydesk/desktop build
+        run: pnpm --filter @abcdeploy/desktop build
+
+      - name: 官网构建
+        run: pnpm --filter @abcdeploy/site build
+
+      - name: 官网容器构建
+        if: runner.os == 'Linux'
+        run: docker build -f apps/site/Dockerfile -t abcdeploy-site:ci .
 
       - name: 构建示例项目
         if: runner.os == 'Linux'
@@ -93,4 +100,4 @@ jobs:
           bash -n scripts/server-bootstrap.sh
 
       - name: 编译 Tauri 桌面程序
-        run: pnpm --filter @deploydesk/desktop tauri build --no-bundle --ci
+        run: pnpm --filter @abcdeploy/desktop tauri build --no-bundle --ci

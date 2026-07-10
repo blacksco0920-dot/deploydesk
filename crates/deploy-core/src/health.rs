@@ -1,7 +1,8 @@
+use std::net::ToSocketAddrs;
 use std::time::Duration;
 
 use crate::error::Result;
-use crate::model::HealthcheckResult;
+use crate::model::{HealthcheckResult, PublicRouteCheck};
 
 pub async fn check_http_health(
     url: &str,
@@ -51,4 +52,79 @@ pub async fn check_http_health(
         status: last_status,
         message: last_message,
     })
+}
+
+pub async fn check_public_route(host: &str, path: &str) -> PublicRouteCheck {
+    let route_path = if path.starts_with('/') { path } else { "/" };
+    let url = format!("https://{host}{route_path}");
+    let lookup_host = host.to_string();
+    let lookup = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            (lookup_host.as_str(), 443)
+                .to_socket_addrs()
+                .map(|mut addresses| addresses.next().is_some())
+        }),
+    )
+    .await;
+    if !matches!(lookup, Ok(Ok(Ok(true)))) {
+        return PublicRouteCheck {
+            url,
+            reachable: false,
+            phase: "dns".to_string(),
+            status: None,
+            message: format!("{host} 尚未解析，请添加指向目标服务器的 A 或 AAAA 记录"),
+        };
+    }
+
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .build()
+    else {
+        return PublicRouteCheck {
+            url,
+            reachable: false,
+            phase: "https".to_string(),
+            status: None,
+            message: "无法创建 HTTPS 检查，请稍后重试".to_string(),
+        };
+    };
+    match client.get(&url).send().await {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            if status < 500 {
+                PublicRouteCheck {
+                    url,
+                    reachable: true,
+                    phase: "ready".to_string(),
+                    status: Some(status),
+                    message: format!("{host} 的 DNS、HTTPS 和 Caddy 路由均可访问"),
+                }
+            } else {
+                PublicRouteCheck {
+                    url,
+                    reachable: false,
+                    phase: "application".to_string(),
+                    status: Some(status),
+                    message: format!(
+                        "{host} 已连通，但返回 HTTP {status}；请检查 Caddy 路由和应用日志"
+                    ),
+                }
+            }
+        }
+        Err(error) => PublicRouteCheck {
+            url,
+            reachable: false,
+            phase: "https".to_string(),
+            status: None,
+            message: if error.is_timeout() {
+                format!("{host} 已解析，但 HTTPS 连接超时；请确认服务器开放 443 端口")
+            } else {
+                format!(
+                    "{host} 已解析，但 HTTPS 尚未就绪；请稍候让 Caddy 申请证书并确认 443 端口开放"
+                )
+            },
+        },
+    }
 }

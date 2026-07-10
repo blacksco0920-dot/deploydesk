@@ -90,8 +90,9 @@ pub fn create_default_manifest(report: &InspectionReport) -> ProjectManifest {
         source: SourceConfig {
             provider: SourceProvider::Github,
             repository: format!("owner/{}", report.project_name),
-            integration_branch: "test".to_string(),
-            stable_branch: "main".to_string(),
+            release_branch: "main".to_string(),
+            integration_branch: String::new(),
+            stable_branch: String::new(),
         },
         services,
         environments: EnvironmentSet {
@@ -119,7 +120,7 @@ pub fn create_default_manifest(report: &InspectionReport) -> ProjectManifest {
                     server: Some("staging-server".to_string()),
                     namespace: format!("{}-staging", report.project_name),
                 },
-                branch: Some("test".to_string()),
+                branch: None,
                 auto_deploy: true,
                 approval_required: false,
                 domains: Vec::<DomainRoute>::new(),
@@ -138,7 +139,7 @@ pub fn create_default_manifest(report: &InspectionReport) -> ProjectManifest {
                     server: Some("production-server".to_string()),
                     namespace: format!("{}-production", report.project_name),
                 },
-                branch: Some("main".to_string()),
+                branch: None,
                 auto_deploy: false,
                 approval_required: true,
                 domains: Vec::<DomainRoute>::new(),
@@ -220,7 +221,7 @@ pub fn serialize_manifest(manifest: &ProjectManifest) -> Result<String> {
     })?;
     content.insert_str(
         0,
-        "# DeployDesk 项目部署协议。这里只声明变量名，不保存真实密钥。\n",
+        "# ABCDeploy 项目部署协议。这里只声明变量名，不保存真实密钥。\n",
     );
     Ok(content)
 }
@@ -297,7 +298,7 @@ pub fn build_plan(
         user_actions.push(UserAction {
             id: "connect-cnb".to_string(),
             title: "连接 CNB".to_string(),
-            detail: "授权后由 DeployDesk 创建或选择云原生构建仓库".to_string(),
+            detail: "授权后由 ABCDeploy 创建或选择云原生构建仓库".to_string(),
             category: UserActionCategory::Authorization,
             required: true,
         });
@@ -318,7 +319,7 @@ pub fn build_plan(
             user_actions.push(UserAction {
                 id: format!("domain-{}", name.as_str()),
                 title: format!("填写{}域名", name.display_name()),
-                detail: "DeployDesk 会生成 DNS 记录并持续检查解析状态".to_string(),
+                detail: "ABCDeploy 会生成 DNS 记录并持续检查解析状态".to_string(),
                 category: UserActionCategory::Dns,
                 required: name == EnvironmentName::Production,
             });

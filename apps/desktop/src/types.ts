@@ -153,10 +153,73 @@ export interface CnbRepositoryResult {
   visibility: "private" | "public";
 }
 
+export interface CnbProjectSetup {
+  repository: string;
+  created: boolean;
+}
+
+export interface SourceSyncResult {
+  repository: string;
+  branch: string;
+  commitSha: string;
+  committed: boolean;
+}
+
+export interface CnbAccount {
+  connected: boolean;
+  displayName: string;
+  username: string;
+}
+
+export interface SecretStatus {
+  key: string;
+  stored: boolean;
+}
+
+export interface PipelineIdentityResult {
+  created: boolean;
+  fingerprint: string;
+}
+
+export interface RuntimeSecretStatus {
+  environment: "staging" | "production";
+  variable: string;
+  stored: boolean;
+}
+
+export interface CnbSecretBundle {
+  environment: "staging" | "production";
+  filename: string;
+  fileUrl: string;
+  content: string;
+  missingVariables: string[];
+  deployKeyFingerprint: string;
+}
+
 export interface ApplyResult {
   planId: string;
   writtenFiles: string[];
   backupDirectory: string;
+}
+
+export type OnboardingStep =
+  | "inspection"
+  | "connections"
+  | "recommendation"
+  | "requirements"
+  | "review"
+  | "deploying"
+  | "workspace";
+
+export interface RecentProject {
+  id: string;
+  path: string;
+  name: string;
+  currentStep: OnboardingStep;
+  manifestExists: boolean;
+  serviceCount: number;
+  lastOpenedAt: string;
+  pathExists: boolean;
 }
 
 export type NavigationSection =
@@ -168,4 +231,48 @@ export interface ServerForm {
   user: string;
   port: number;
   keyPath: string;
+  hostFingerprint?: string;
+}
+
+export interface SshIdentity {
+  name: string;
+  path: string;
+  source: string;
+  fingerprint: string | null;
+  managed: boolean;
+}
+
+export interface GeneratedSshIdentity {
+  identity: SshIdentity;
+  publicKey: string;
+  created: boolean;
+}
+
+export interface ServerResource extends ServerForm {
+  id: string;
+  keyPathExists: boolean;
+  lastCheckedAt: string;
+}
+
+export type DeploymentRunStatus =
+  "queued" | "running" | "needs_action" | "success" | "failed" | "cancelled";
+
+export interface DeploymentRun {
+  id: string;
+  projectPath: string;
+  projectName: string;
+  environment: "staging" | "production";
+  status: DeploymentRunStatus;
+  currentStage: string;
+  buildSerial: string | null;
+  commitSha: string | null;
+  sourceRunId: string | null;
+  actionKind: string | null;
+  actionUrl: string | null;
+  repository: string;
+  branch: string;
+  message: string;
+  completedSteps: string[];
+  startedAt: string;
+  updatedAt: string;
 }

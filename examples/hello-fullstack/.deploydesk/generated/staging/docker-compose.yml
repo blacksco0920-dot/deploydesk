@@ -1,5 +1,5 @@
-# 由 DeployDesk 生成。真实 .env 只保存在目标环境。
-name: deploydesk-hello-fullstack-staging
+# 由 ABCDeploy 生成。真实 .env 只保存在目标环境。
+name: abcdeploy-hello-fullstack-staging
 services:
   api:
     image: ${DEPLOYDESK_API_IMAGE:?请填写不可变镜像地址}
@@ -11,10 +11,10 @@ services:
     networks:
       apps:
         aliases:
-        - deploydesk-hello-fullstack-staging-api
+        - abcdeploy-hello-fullstack-staging-api
     labels:
       deploydesk.environment: staging
-      deploydesk.project: deploydesk-hello-fullstack
+      deploydesk.project: abcdeploy-hello-fullstack
       deploydesk.service: api
     healthcheck:
       test:
@@ -34,10 +34,10 @@ services:
     networks:
       apps:
         aliases:
-        - deploydesk-hello-fullstack-staging-web
+        - abcdeploy-hello-fullstack-staging-web
     labels:
       deploydesk.environment: staging
-      deploydesk.project: deploydesk-hello-fullstack
+      deploydesk.project: abcdeploy-hello-fullstack
       deploydesk.service: web
     healthcheck:
       test:
@@ -50,4 +50,4 @@ services:
 networks:
   apps:
     external: true
-    name: deploydesk-deploydesk-hello-fullstack-staging
+    name: deploydesk-abcdeploy-hello-fullstack-staging

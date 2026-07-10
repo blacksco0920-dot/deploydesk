@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Method;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -10,6 +12,14 @@ use crate::error::{DeployError, Result};
 use crate::redact::redact_text;
 
 const DEFAULT_API_BASE: &str = "https://api.cnb.cool";
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CnbBuildStatus {
+    pub status: String,
+    pub active_stages: Vec<String>,
+    pub error_stages: Vec<String>,
+    pub pipeline_ids: Vec<String>,
+}
 
 pub struct CnbClient {
     client: reqwest::Client,
@@ -47,7 +57,7 @@ impl CnbClient {
         }
         Ok(Self {
             client: reqwest::Client::builder()
-                .user_agent("DeployDesk/0.1")
+                .user_agent("ABCDeploy/0.1")
                 .timeout(Duration::from_secs(30))
                 .build()?,
             api_base: api_base.into().trim_end_matches('/').to_string(),
@@ -140,21 +150,42 @@ impl CnbClient {
         event: &str,
         title: &str,
     ) -> Result<Value> {
+        self.trigger_build_at_revision(repository, branch, event, title, None)
+            .await
+    }
+
+    pub async fn trigger_build_at_revision(
+        &self,
+        repository: &str,
+        branch: &str,
+        event: &str,
+        title: &str,
+        revision: Option<&str>,
+    ) -> Result<Value> {
         if !event.starts_with("api_trigger") {
             return Err(DeployError::InvalidManifest(
                 "CNB API 事件必须以 api_trigger 开头".to_string(),
             ));
         }
+        if revision.is_some_and(|value| !valid_revision(value)) {
+            return Err(DeployError::InvalidManifest(
+                "CNB 构建提交标识格式不正确".to_string(),
+            ));
+        }
         let repository = encode_segment(repository);
+        let mut body = json!({
+            "branch": branch,
+            "event": event,
+            "title": title,
+            "sync": "false"
+        });
+        if let Some(revision) = revision {
+            body["sha"] = Value::String(revision.to_string());
+        }
         self.request(
             Method::POST,
             &format!("/{repository}/-/build/start"),
-            Some(json!({
-                "branch": branch,
-                "event": event,
-                "title": title,
-                "sync": "false"
-            })),
+            Some(body),
         )
         .await
     }
@@ -164,6 +195,17 @@ impl CnbClient {
         self.request(
             Method::GET,
             &format!("/{repository}/-/build/logs?size={}", size.clamp(1, 50)),
+            None,
+        )
+        .await
+    }
+
+    pub async fn build_status(&self, repository: &str, serial: &str) -> Result<Value> {
+        let repository = encode_segment(repository);
+        let serial = encode_segment(serial);
+        self.request(
+            Method::GET,
+            &format!("/{repository}/-/build/status/{serial}"),
             None,
         )
         .await
@@ -197,8 +239,88 @@ impl CnbClient {
     }
 }
 
+#[must_use]
+pub fn build_serial(value: &Value) -> Option<String> {
+    [
+        value.get("sn"),
+        value.get("buildSn"),
+        value.pointer("/data/sn"),
+        value.pointer("/data/buildSn"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(value_as_string)
+}
+
+#[must_use]
+pub fn build_revision(value: &Value) -> Option<String> {
+    [
+        "/sha",
+        "/commit",
+        "/commitSha",
+        "/data/sha",
+        "/data/commit",
+        "/build/sha",
+        "/git/sha",
+    ]
+    .into_iter()
+    .filter_map(|path| value.pointer(path).and_then(Value::as_str))
+    .map(str::trim)
+    .find(|value| valid_revision(value))
+    .map(ToString::to_string)
+}
+
+#[must_use]
+pub fn summarize_build_status(value: &Value) -> CnbBuildStatus {
+    let mut active_stages = Vec::new();
+    let mut error_stages = Vec::new();
+    let mut pipeline_ids = Vec::new();
+    if let Some(pipelines) = value.get("pipelinesStatus").and_then(Value::as_object) {
+        for (pipeline_id, pipeline) in pipelines {
+            pipeline_ids.push(pipeline_id.clone());
+            if let Some(stages) = pipeline.get("stages").and_then(Value::as_array) {
+                for stage in stages {
+                    let status = stage.get("status").and_then(Value::as_str).unwrap_or("");
+                    let name = stage
+                        .get("name")
+                        .or_else(|| stage.get("id"))
+                        .and_then(value_as_string)
+                        .unwrap_or_else(|| "未知阶段".to_string());
+                    if matches!(status, "start" | "running") {
+                        active_stages.push(name);
+                    } else if matches!(status, "error" | "failed") {
+                        error_stages.push(name);
+                    }
+                }
+            }
+        }
+    }
+    pipeline_ids.sort();
+    pipeline_ids.dedup();
+    CnbBuildStatus {
+        status: value
+            .get("status")
+            .and_then(value_as_string)
+            .unwrap_or_else(|| "unknown".to_string()),
+        active_stages,
+        error_stages,
+        pipeline_ids,
+    }
+}
+
+fn value_as_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .or_else(|| value.as_u64().map(|number| number.to_string()))
+}
+
 fn encode_segment(value: &str) -> String {
     utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
+}
+
+fn valid_revision(value: &str) -> bool {
+    (7..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn permission_hint(status: u16, message: &str) -> String {
@@ -228,6 +350,55 @@ mod tests {
     #[test]
     fn repository_slug_is_fully_encoded() {
         assert_eq!(encode_segment("owner/repo"), "owner%2Frepo");
+    }
+
+    #[test]
+    fn summarizes_build_responses_without_exposing_unrelated_fields() {
+        let payload = json!({
+            "sn": 42,
+            "status": "running",
+            "pipelinesStatus": {
+                "pipeline-1": {
+                    "stages": [
+                        {"name": "构建镜像", "status": "running"},
+                        {"name": "健康检查", "status": "waiting"}
+                    ]
+                }
+            },
+            "token": "must-not-be-copied"
+        });
+        assert_eq!(build_serial(&payload).as_deref(), Some("42"));
+        assert!(build_revision(&payload).is_none());
+        let summary = summarize_build_status(&payload);
+        assert_eq!(summary.status, "running");
+        assert_eq!(summary.active_stages, ["构建镜像"]);
+        assert_eq!(summary.pipeline_ids, ["pipeline-1"]);
+    }
+
+    #[test]
+    fn extracts_only_valid_git_revisions() {
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            build_revision(&json!({"data": {"sha": revision}})).as_deref(),
+            Some(revision)
+        );
+        assert!(build_revision(&json!({"sha": "../../main"})).is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_unsafe_build_revisions_before_network_access() {
+        let client = CnbClient::with_api_base("test-token", "http://127.0.0.1:1").expect("client");
+        let error = client
+            .trigger_build_at_revision(
+                "owner/repo",
+                "main",
+                "api_trigger_production",
+                "production",
+                Some("main; echo unsafe"),
+            )
+            .await
+            .expect_err("unsafe revision must fail");
+        assert!(error.to_string().contains("提交标识格式不正确"));
     }
 
     #[tokio::test]

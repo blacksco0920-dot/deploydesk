@@ -16,5 +16,5 @@ pub use model::*;
 pub use plan::{apply_plan, build_plan, create_default_manifest};
 pub use scanner::inspect_project;
 
-pub const PRODUCT_NAME: &str = "DeployDesk";
+pub const PRODUCT_NAME: &str = "ABCDeploy";
 pub const MANIFEST_FILE: &str = "deploy.yaml";

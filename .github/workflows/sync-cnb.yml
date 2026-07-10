@@ -1,0 +1,33 @@
+# 由 ABCDeploy 生成。
+concurrency:
+  cancel-in-progress: true
+  group: sync-cnb-${{ github.ref_name }}
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - env:
+        CNB_PUSH_TOKEN: ${{ secrets.CNB_PUSH_TOKEN }}
+        CNB_REPOSITORY: blacksco0920/abcdeploy
+      name: Sync branch to CNB
+      run: |-
+        set -eu
+        test -n "$CNB_PUSH_TOKEN"
+        CNB_BASIC_AUTH="$(printf 'cnb:%s' "$CNB_PUSH_TOKEN" | base64 -w0)"
+        export GIT_CONFIG_COUNT=1
+        export GIT_CONFIG_KEY_0=http.https://cnb.cool/.extraHeader
+        export GIT_CONFIG_VALUE_0="Authorization: Basic ${CNB_BASIC_AUTH}"
+        git push "https://cnb.cool/${CNB_REPOSITORY}.git" "HEAD:${GITHUB_REF_NAME}"
+    timeout-minutes: 5
+name: Sync CNB
+on:
+  push:
+    branches:
+    - main
+  workflow_dispatch: {}
+permissions:
+  contents: read

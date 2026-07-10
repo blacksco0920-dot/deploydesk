@@ -71,12 +71,12 @@ pub fn validate_manifest(manifest: &ProjectManifest) -> ManifestValidation {
             "项目名只能包含小写字母、数字和连字符，长度为 2-63",
         );
     }
-    if manifest.source.integration_branch == manifest.source.stable_branch {
+    if unsafe_branch(&manifest.source.release_branch) {
         error(
             &mut issues,
-            "branch_collision",
-            "source",
-            "集成分支和稳定分支不能相同",
+            "invalid_release_branch",
+            "source.release_branch",
+            "发布分支包含 Git 不允许或可能影响流水线的字符",
         );
     }
     for (field, branch) in [
@@ -86,7 +86,7 @@ pub fn validate_manifest(manifest: &ProjectManifest) -> ManifestValidation {
         ),
         ("source.stable_branch", &manifest.source.stable_branch),
     ] {
-        if unsafe_branch(branch) {
+        if !branch.is_empty() && unsafe_branch(branch) {
             error(
                 &mut issues,
                 "invalid_branch",
@@ -94,6 +94,14 @@ pub fn validate_manifest(manifest: &ProjectManifest) -> ManifestValidation {
                 "分支名包含 Git 不允许或可能影响流水线的字符",
             );
         }
+    }
+    if !manifest.source.integration_branch.is_empty() || !manifest.source.stable_branch.is_empty() {
+        warning(
+            &mut issues,
+            "legacy_branch_mapping",
+            "source",
+            "旧版双分支配置仍可读取，但 V2 只从 release_branch 构建一次并逐级晋级",
+        );
     }
     if !repository.is_match(&manifest.providers.build.repository) {
         error(

@@ -462,20 +462,22 @@
       "type": "object",
       "properties": {
         "integration_branch": {
-          "type": "string",
-          "default": "test"
+          "type": "string"
         },
         "provider": {
           "$ref": "#/$defs/SourceProvider",
           "default": "github"
+        },
+        "release_branch": {
+          "type": "string",
+          "default": "main"
         },
         "repository": {
           "type": "string",
           "default": ""
         },
         "stable_branch": {
-          "type": "string",
-          "default": "main"
+          "type": "string"
         }
       }
     },

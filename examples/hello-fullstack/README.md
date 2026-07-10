@@ -1,6 +1,6 @@
 # Hello Fullstack
 
-一个可运行的 NestJS + Vite/React pnpm monorepo，用于体验 DeployDesk 首次接入。
+一个可运行的 NestJS + Vite/React pnpm monorepo，用于体验 ABCDeploy 首次接入。
 
 ```bash
 pnpm install

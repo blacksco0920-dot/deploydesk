@@ -1,6 +1,6 @@
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
 
 use crate::error::{DeployError, Result};
 use crate::model::ProviderCheck;
@@ -56,7 +56,7 @@ pub fn validate_caddyfile(path: &Path) -> Result<ProviderCheck> {
     })
 }
 
-pub fn bootstrap_server(profile: &SshProfile, confirmed: bool) -> Result<ProviderCheck> {
+pub async fn bootstrap_server(profile: &SshProfile, confirmed: bool) -> Result<ProviderCheck> {
     if !confirmed {
         return Err(DeployError::Command {
             command: "caddy bootstrap".to_string(),
@@ -71,57 +71,22 @@ pub fn bootstrap_server(profile: &SshProfile, confirmed: bool) -> Result<Provide
             details: vec!["重新选择本机私钥文件".to_string()],
         });
     }
-    let destination = format!("{}@{}", profile.user, profile.host);
-    let mut child = Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=12",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "-p",
-            &profile.port.to_string(),
-            "-i",
-        ])
-        .arg(&profile.key_path)
-        .arg(destination)
-        .args(["bash", "-s"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| DeployError::Command {
-            command: "ssh caddy bootstrap".to_string(),
-            message: error.to_string(),
-        })?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| DeployError::Command {
-            command: "ssh caddy bootstrap".to_string(),
-            message: "无法写入远程初始化脚本".to_string(),
-        })?
-        .write_all(SERVER_BOOTSTRAP.as_bytes())
-        .map_err(|error| DeployError::Command {
-            command: "ssh caddy bootstrap".to_string(),
-            message: error.to_string(),
-        })?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| DeployError::Command {
-            command: "ssh caddy bootstrap".to_string(),
-            message: error.to_string(),
-        })?;
-    if output.status.success() {
+    let output = crate::providers::ssh::execute(
+        profile,
+        "bash -s",
+        Some(SERVER_BOOTSTRAP.as_bytes()),
+        Duration::from_mins(5),
+    )
+    .await?;
+    if output.exit_status == Some(0) {
         return Ok(ProviderCheck {
             provider: "caddy".to_string(),
             ok: true,
-            summary: format!("服务器 {} 的 DeployDesk Caddy 已就绪", profile.name),
-            details: vec!["已创建 ~/.deploydesk，未修改其他反向代理配置".to_string()],
+            summary: format!("服务器 {} 的 ABCDeploy Caddy 已就绪", profile.name),
+            details: vec!["已准备统一运行目录，未修改其他反向代理配置".to_string()],
         });
     }
-    let message = redact_text(&String::from_utf8_lossy(&output.stderr));
+    let message = redact_text(&output.stderr);
     Ok(ProviderCheck {
         provider: "caddy".to_string(),
         ok: false,

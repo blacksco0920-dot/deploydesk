@@ -10,12 +10,13 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-authors = ["DeployDesk Contributors"]
-repository = "https://github.com/blacksco0920-dot/deploydesk"
+authors = ["ABCDeploy Contributors"]
+repository = "https://github.com/blacksco0920-dot/abcdeploy"
 rust-version = "1.97"
 
 [workspace.dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 dirs = "6.0"
@@ -23,11 +24,14 @@ keyring = "4.1"
 percent-encoding = "2.3"
 regex = "1.11"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+russh = { version = "0.61.2", default-features = false, features = ["ring", "rsa"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 schemars = { version = "1.2", features = ["chrono04"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
+ssh-key = { version = "0.6.7", features = ["ed25519", "getrandom"] }
 tempfile = "3.23"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time"] }

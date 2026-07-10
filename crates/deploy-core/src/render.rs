@@ -174,7 +174,7 @@ fn render_compose(
         path: format!("generated/{}/docker-compose.yml", name.as_str()).into(),
         source,
     })?;
-    content.insert_str(0, "# 由 DeployDesk 生成。真实 .env 只保存在目标环境。\n");
+    content.insert_str(0, "# 由 ABCDeploy 生成。真实 .env 只保存在目标环境。\n");
     Ok(content)
 }
 
@@ -184,7 +184,7 @@ fn render_env_example(
     environment: &EnvironmentConfig,
 ) -> String {
     let mut lines = vec![
-        "# 由 DeployDesk 生成，仅包含变量名和非敏感默认值。".to_string(),
+        "# 由 ABCDeploy 生成，仅包含变量名和非敏感默认值。".to_string(),
         format!("DEPLOYDESK_ENV={}", name.as_str()),
     ];
     for service in &manifest.services {
@@ -272,7 +272,7 @@ fn render_caddy(
     environment: &EnvironmentConfig,
 ) -> String {
     let mut lines = vec![format!(
-        "# {} / {}，由 DeployDesk 生成",
+        "# {} / {}，由 ABCDeploy 生成",
         manifest.project.name,
         name.display_name()
     )];
@@ -311,24 +311,22 @@ fn render_caddy(
 }
 
 fn render_cnb_pipeline(manifest: &ProjectManifest) -> Result<String> {
-    let staging = integration_pipeline(manifest)?;
     let release = release_pipeline(manifest)?;
 
     let mut root = Map::new();
     root.insert(
-        manifest.source.integration_branch.clone(),
-        json!({ "push": [staging] }),
+        manifest.source.release_branch.clone(),
+        json!({ "push": [release.clone()] }),
     );
-    root.insert(
-        manifest.source.stable_branch.clone(),
-        json!({ "push": [release] }),
-    );
+    let mut api_triggers = Map::new();
+    api_triggers.insert("api_trigger_staging".to_string(), json!([release]));
     if manifest.release.production_mode == ProductionMode::Approval {
-        root.insert(
-            "$".to_string(),
-            json!({ "api_trigger_production": [production_pipeline(manifest)?] }),
+        api_triggers.insert(
+            "api_trigger_production".to_string(),
+            json!([production_pipeline(manifest)?]),
         );
     }
+    root.insert("$".to_string(), Value::Object(api_triggers));
     let mut content =
         serde_yaml_ng::to_string(&Value::Object(root)).map_err(|source| DeployError::Yaml {
             path: ".cnb.yml".into(),
@@ -336,28 +334,9 @@ fn render_cnb_pipeline(manifest: &ProjectManifest) -> Result<String> {
         })?;
     content.insert_str(
         0,
-        "# 由 DeployDesk 生成。流水线只引用密钥，不在仓库保存密钥值。\n",
+        "# 由 ABCDeploy 生成。流水线只引用密钥，不在仓库保存密钥值。\n",
     );
     Ok(content)
-}
-
-fn integration_pipeline(manifest: &ProjectManifest) -> Result<Value> {
-    let mut stages = build_stages(manifest);
-    stages.push(json!({
-        "name": "部署测试环境",
-        "script": [deploy_script(
-            manifest,
-            EnvironmentName::Staging,
-            ReleaseChannel::Candidate,
-        )?]
-    }));
-    let imports = [secret_import(manifest, EnvironmentName::Staging)];
-    Ok(pipeline_definition(
-        "deploydesk-integration",
-        &imports,
-        EnvironmentName::Staging,
-        &stages,
-    ))
 }
 
 fn release_pipeline(manifest: &ProjectManifest) -> Result<Value> {
@@ -508,6 +487,12 @@ fn build_script(manifest: &ProjectManifest, service: &ServiceConfig) -> String {
     )
 }
 
+fn image_digest_expression(reference: &str) -> String {
+    format!(
+        "$(docker buildx imagetools inspect {reference} | awk '$1 == \"Digest:\" && $2 ~ /^sha256:/ {{ print $2; exit }}')"
+    )
+}
+
 fn promote_script(manifest: &ProjectManifest) -> String {
     let mut lines = vec![
         "set -eu".to_string(),
@@ -517,10 +502,10 @@ fn promote_script(manifest: &ProjectManifest) -> String {
     for service in &manifest.services {
         let repository = image_repository(manifest, &service.image);
         lines.push(format!("IMAGE_REPOSITORY={}", shell_quote(&repository)));
-        lines.push(
-            "IMAGE_DIGEST=\"$(docker buildx imagetools inspect \"${IMAGE_REPOSITORY}:${IMAGE_TAG}\" --format '{{.Manifest.Digest}}')\""
-                .to_string(),
-        );
+        lines.push(format!(
+            "IMAGE_DIGEST=\"{}\"",
+            image_digest_expression("\"${IMAGE_REPOSITORY}:${IMAGE_TAG}\"")
+        ));
         lines.push(
             "case \"$IMAGE_DIGEST\" in sha256:*) ;; *) echo '镜像摘要解析失败' >&2; exit 1 ;; esac"
                 .to_string(),
@@ -529,10 +514,10 @@ fn promote_script(manifest: &ProjectManifest) -> String {
             "docker buildx imagetools create --prefer-index=false --tag \"${IMAGE_REPOSITORY}:${VERIFIED_TAG}\" \"${IMAGE_REPOSITORY}@${IMAGE_DIGEST}\""
                 .to_string(),
         );
-        lines.push(
-            "VERIFIED_DIGEST=\"$(docker buildx imagetools inspect \"${IMAGE_REPOSITORY}:${VERIFIED_TAG}\" --format '{{.Manifest.Digest}}')\""
-                .to_string(),
-        );
+        lines.push(format!(
+            "VERIFIED_DIGEST=\"{}\"",
+            image_digest_expression("\"${IMAGE_REPOSITORY}:${VERIFIED_TAG}\"")
+        ));
         lines.push("test \"$VERIFIED_DIGEST\" = \"$IMAGE_DIGEST\"".to_string());
     }
     lines.join("\n")
@@ -577,8 +562,10 @@ fn deploy_script(
             "{repository_variable}={}",
             shell_quote(&image_repository(manifest, &service.image))
         ));
+        let image_reference = format!("\"${{{repository_variable}}}:${{RELEASE_TAG}}\"");
         lines.push(format!(
-            "{digest_variable}=\"$(docker buildx imagetools inspect \"${{{repository_variable}}}:${{RELEASE_TAG}}\" --format '{{{{.Manifest.Digest}}}}')\""
+            "{digest_variable}=\"{}\"",
+            image_digest_expression(&image_reference)
         ));
         lines.push(format!(
             "case \"${{{digest_variable}}}\" in sha256:*) ;; *) echo '服务 {} 的镜像摘要无效' >&2; exit 1 ;; esac",
@@ -604,10 +591,14 @@ fn deploy_script(
         format!("SERVER_USER=\"${{{prefix}_SERVER_USER:-}}\""),
         format!("SERVER_SSH_KEY=\"${{{prefix}_SERVER_SSH_KEY:-}}\""),
         format!("SERVER_KNOWN_HOSTS=\"${{{prefix}_SERVER_KNOWN_HOSTS:-}}\""),
-        "test -n \"$SERVER_HOST\"".to_string(),
-        "test -n \"$SERVER_USER\"".to_string(),
-        "test -n \"$SERVER_SSH_KEY\"".to_string(),
-        "test -n \"$SERVER_KNOWN_HOSTS\"".to_string(),
+        "test -n \"$SERVER_HOST\" || { echo '缺少目标环境的 SERVER_HOST' >&2; exit 1; }"
+            .to_string(),
+        "test -n \"$SERVER_USER\" || { echo '缺少目标环境的 SERVER_USER' >&2; exit 1; }"
+            .to_string(),
+        "test -n \"$SERVER_SSH_KEY\" || { echo '缺少目标环境的 SERVER_SSH_KEY' >&2; exit 1; }"
+            .to_string(),
+        "test -n \"$SERVER_KNOWN_HOSTS\" || { echo '缺少已确认的 SERVER_KNOWN_HOSTS' >&2; exit 1; }"
+            .to_string(),
         "case \"$SERVER_PORT\" in ''|*[!0-9]*) echo 'SSH 端口格式不正确' >&2; exit 1 ;; esac"
             .to_string(),
         "SSH_KEY_FILE=\"$RUNTIME_DIRECTORY/deploydesk_key\"".to_string(),
@@ -840,7 +831,7 @@ if docker inspect deploydesk-caddy >/dev/null 2>&1; then
   docker exec deploydesk-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
   docker exec deploydesk-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
 else
-  echo 'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 DeployDesk Caddy。'
+  echo 'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 ABCDeploy Caddy。'
 fi"#,
         remote_directory = shell_quote(remote_directory),
         compose = compose,
@@ -869,7 +860,7 @@ fn image_tag_expression(manifest: &ProjectManifest) -> String {
     manifest
         .release
         .image_tag_template
-        .replace("{commit}", "${CNB_COMMIT_SHORT}")
+        .replace("{commit}", "${CNB_COMMIT}")
 }
 
 fn image_repository(manifest: &ProjectManifest, image: &str) -> String {
@@ -906,10 +897,7 @@ fn render_github_sync(manifest: &ProjectManifest) -> Result<String> {
         "name": "Sync CNB",
         "on": {
             "push": {
-                "branches": [
-                    manifest.source.integration_branch,
-                    manifest.source.stable_branch
-                ]
+            "branches": [manifest.source.release_branch]
             },
             "workflow_dispatch": Value::Object(Map::new())
         },
@@ -934,7 +922,7 @@ fn render_github_sync(manifest: &ProjectManifest) -> Result<String> {
                             "CNB_PUSH_TOKEN": "${{ secrets.CNB_PUSH_TOKEN }}",
                             "CNB_REPOSITORY": manifest.providers.build.repository
                         },
-                        "run": "test -n \"$CNB_PUSH_TOKEN\"\ngit remote add cnb \"https://oauth2:${CNB_PUSH_TOKEN}@cnb.cool/${CNB_REPOSITORY}.git\"\ngit push cnb \"HEAD:${GITHUB_REF_NAME}\" --force"
+                        "run": "set -eu\ntest -n \"$CNB_PUSH_TOKEN\"\nCNB_BASIC_AUTH=\"$(printf 'cnb:%s' \"$CNB_PUSH_TOKEN\" | base64 -w0)\"\nexport GIT_CONFIG_COUNT=1\nexport GIT_CONFIG_KEY_0=http.https://cnb.cool/.extraHeader\nexport GIT_CONFIG_VALUE_0=\"Authorization: Basic ${CNB_BASIC_AUTH}\"\ngit push \"https://cnb.cool/${CNB_REPOSITORY}.git\" \"HEAD:${GITHUB_REF_NAME}\""
                     }
                 ]
             }
@@ -944,7 +932,7 @@ fn render_github_sync(manifest: &ProjectManifest) -> Result<String> {
         path: ".github/workflows/sync-cnb.yml".into(),
         source,
     })?;
-    content.insert_str(0, "# 由 DeployDesk 生成。\n");
+    content.insert_str(0, "# 由 ABCDeploy 生成。\n");
     Ok(content)
 }
 
@@ -964,7 +952,7 @@ mod tests {
     use crate::scanner::inspection_fixture;
 
     #[test]
-    fn renders_three_isolated_compose_files_and_two_branch_pipeline() {
+    fn renders_three_isolated_environments_and_one_release_branch() {
         let mut manifest = create_default_manifest(&inspection_fixture());
         manifest.environments.staging.domains.push(DomainRoute {
             service: "api".to_string(),
@@ -986,13 +974,19 @@ mod tests {
             .iter()
             .find(|file| file.path == ".cnb.yml")
             .expect("pipeline");
-        assert!(pipeline.content.contains("test:"));
         assert!(pipeline.content.contains("main:"));
+        assert!(!pipeline.content.contains("test:"));
+        let pipeline_yaml: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&pipeline.content).expect("parse generated pipeline");
+        let main_pipeline =
+            serde_yaml_ng::to_string(&pipeline_yaml["main"]).expect("serialize main pipeline");
+        assert_eq!(main_pipeline.matches("构建并上传").count(), 1);
+        assert!(pipeline.content.contains("api_trigger_staging"));
         assert!(pipeline.content.contains("api_trigger_production"));
         assert!(pipeline.content.contains("在测试环境验证生产候选"));
         assert!(pipeline.content.contains("标记已验证镜像摘要"));
         assert!(pipeline.content.contains("verified-${IMAGE_TAG}"));
-        assert!(pipeline.content.contains("{{.Manifest.Digest}}"));
+        assert!(pipeline.content.contains("awk '$1 == \"Digest:\""));
         assert!(pipeline.content.contains("StrictHostKeyChecking=yes"));
         assert!(pipeline.content.contains(".release.env.previous"));
         assert!(pipeline.content.contains("--wait-timeout 180"));

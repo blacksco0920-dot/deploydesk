@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="ABCDeploy 小白部署：引导式完成容器构建、测试环境、生产发布、HTTPS 与回滚。"
+    />
+    <meta name="theme-color" content="#f5f6f3" />
+    <meta property="og:title" content="ABCDeploy 小白部署" />
+    <meta
+      property="og:description"
+      content="选择项目，连接服务，确认计划。小白也能完成企业级容器化部署。"
+    />
+    <meta property="og:image" content="/abcdeploy-workspace.png" />
+    <link rel="icon" type="image/svg+xml" href="/abcdeploy.svg" />
+    <link rel="preload" as="image" href="/abcdeploy-workspace.png" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <title>ABCDeploy 小白部署</title>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="ABCDeploy 小白部署首页">
+        <img src="/abcdeploy.svg" alt="" width="34" height="34" />
+        <span><strong>ABCDeploy</strong><small>小白部署</small></span>
+      </a>
+      <nav aria-label="主导航">
+        <a href="#how">怎么用</a>
+        <a href="#safety">安全设计</a>
+        <a href="#download">下载</a>
+        <a href="https://github.com/blacksco0920-dot/abcdeploy">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero" aria-labelledby="hero-title">
+        <img
+          class="hero-product"
+          src="/abcdeploy-workspace.png"
+          alt="ABCDeploy 项目工作台，显示测试环境健康并可发布生产"
+        />
+        <div class="hero-copy">
+          <p class="product-name">ABCDeploy</p>
+          <h1 id="hero-title">小白部署</h1>
+          <p class="hero-lead">
+            选中代码目录，跟着引导连接构建服务和服务器。测试、生产、HTTPS 与回滚，一次配置清楚。
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="#download" data-primary-download>选择适合我的版本</a>
+            <a class="button quiet" href="https://github.com/blacksco0920-dot/abcdeploy">查看开源仓库</a>
+          </div>
+          <p class="release-meta">
+            <span data-release-version>Alpha 0.1.0</span>
+            <span>Apache-2.0</span>
+            <span>macOS · Windows · Linux</span>
+          </p>
+        </div>
+      </section>
+
+      <section class="trust-strip" aria-label="产品原则">
+        <span>先测试，再生产</span>
+        <span>同一镜像精准晋级</span>
+        <span>密钥不进项目文件</span>
+        <span>Caddy 自动 HTTPS</span>
+      </section>
+
+      <section class="section intro" id="how">
+        <div class="section-heading">
+          <p class="eyebrow">第一次部署</p>
+          <h2>只做三件事</h2>
+          <p>系统能识别和推荐的都自动完成；必须由你决定的权限、服务器身份和生产发布会明确展示。</p>
+        </div>
+        <ol class="steps">
+          <li><span>01</span><h3>选择项目</h3><p>只读识别框架、服务、端口和环境变量名称，不读取真实 `.env`。</p></li>
+          <li><span>02</span><h3>连接资源</h3><p>登录 CNB，填写服务器地址。已有 SSH Key 自动发现，没有则在本机生成。</p></li>
+          <li><span>03</span><h3>确认部署</h3><p>预览文件变化，先上线测试环境；验证通过后再发布同一个镜像到生产。</p></li>
+        </ol>
+      </section>
+
+      <section class="section product-proof">
+        <div class="proof-copy">
+          <p class="eyebrow">推荐策略已内置</p>
+          <h2>不用先成为 DevOps 专家</h2>
+          <p>
+            默认采用开发、测试、生产三环境隔离。代码只构建一次，测试通过的镜像摘要才允许晋级生产；失败时保留当前数据并恢复上一健康版本。
+          </p>
+          <dl>
+            <div><dt>构建</dt><dd>CNB 云原生构建</dd></div>
+            <div><dt>运行</dt><dd>Docker Compose</dd></div>
+            <div><dt>入口</dt><dd>Caddy 与自动 HTTPS</dd></div>
+          </dl>
+        </div>
+        <figure>
+          <img src="/abcdeploy-app.png" alt="ABCDeploy 推荐部署方案界面" loading="lazy" />
+          <figcaption>每一步说明结果，不要求先理解流水线语法。</figcaption>
+        </figure>
+      </section>
+
+      <section class="section environments" aria-labelledby="environment-title">
+        <div class="section-heading">
+          <p class="eyebrow">企业级默认值</p>
+          <h2 id="environment-title">三个环境，各司其职</h2>
+        </div>
+        <div class="environment-table" role="table" aria-label="环境职责">
+          <div class="environment-row header" role="row">
+            <span role="columnheader">环境</span><span role="columnheader">用途</span><span role="columnheader">发布方式</span>
+          </div>
+          <div class="environment-row" role="row">
+            <strong role="cell">开发</strong><span role="cell">本机改代码与调试</span><span role="cell">不影响线上</span>
+          </div>
+          <div class="environment-row" role="row">
+            <strong role="cell">测试</strong><span role="cell">验证真实容器和依赖</span><span role="cell">稳定代码自动部署</span>
+          </div>
+          <div class="environment-row" role="row">
+            <strong role="cell">生产</strong><span role="cell">面向正式用户</span><span role="cell">人工确认同一镜像</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="section safety" id="safety">
+        <div class="section-heading">
+          <p class="eyebrow">安全边界</p>
+          <h2>自动化有边界，关键动作有确认</h2>
+        </div>
+        <div class="safety-list">
+          <article><h3>系统钥匙串</h3><p>Token、私钥和运行配置按项目与环境隔离保存，不写入 Git、部署清单或日志。</p></article>
+          <article><h3>服务器身份校验</h3><p>首次连接展示 SSH 指纹；确认后固定身份，指纹变化会立即停止部署。</p></article>
+          <article><h3>生产精准晋级</h3><p>生产只接收测试健康的完整提交和同一镜像摘要，不在发布时重新构建。</p></article>
+          <article><h3>可恢复执行</h3><p>关闭客户端不影响云端任务；失败保留检查点，公网问题只复查 DNS 与 HTTPS。</p></article>
+        </div>
+      </section>
+
+      <section class="section download" id="download">
+        <div class="download-copy">
+          <p class="eyebrow">开源 Alpha</p>
+          <h2>下载 ABCDeploy</h2>
+          <p>当前安装包尚未配置商业代码签名。请从 GitHub Release 下载并核对资产来源。</p>
+        </div>
+        <div class="download-options">
+          <a data-asset="mac-arm" href="https://github.com/blacksco0920-dot/abcdeploy/releases">macOS Apple Silicon<small>适用于 M1、M2、M3、M4、M5</small></a>
+          <a data-asset="mac-intel" href="https://github.com/blacksco0920-dot/abcdeploy/releases">macOS Intel<small>适用于 Intel 处理器 Mac</small></a>
+          <a data-asset="windows" href="https://github.com/blacksco0920-dot/abcdeploy/releases">Windows x64<small>安装程序 `.exe` 或 `.msi`</small></a>
+          <a data-asset="linux" href="https://github.com/blacksco0920-dot/abcdeploy/releases">Linux x64<small>AppImage 或 Debian 软件包</small></a>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>ABCDeploy 小白部署</span>
+      <span>由社区以 Apache-2.0 许可证维护</span>
+      <a href="https://github.com/blacksco0920-dot/abcdeploy/blob/main/SECURITY.md">安全策略</a>
+    </footer>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
