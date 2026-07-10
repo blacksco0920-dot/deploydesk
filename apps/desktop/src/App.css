@@ -763,6 +763,75 @@ input:focus-visible {
   gap: 12px;
 }
 
+.deployment-provider-config {
+  display: grid;
+  grid-template-columns: minmax(210px, 0.7fr) minmax(360px, 1.3fr);
+  align-items: start;
+  gap: 24px;
+  margin: 18px 0 12px;
+  padding: 18px 20px;
+  background: #f8faf9;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.provider-config-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+}
+
+.provider-config-icon {
+  display: grid;
+  flex: 0 0 36px;
+  width: 36px;
+  height: 36px;
+  color: #376e6a;
+  background: #e5f3f0;
+  border-radius: 6px;
+  place-items: center;
+}
+
+.provider-config-heading h2 {
+  margin: 1px 0 0;
+  color: #26343a;
+  font-size: 13px;
+}
+
+.provider-config-heading p {
+  max-width: 310px;
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.provider-config-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: end;
+  gap: 12px;
+}
+
+.registry-choice {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  color: #66747b;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.registry-hint {
+  grid-column: 1 / -1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #587078;
+  font-size: 10px;
+}
+
 .environment-row {
   display: grid;
   grid-template-columns: 170px minmax(260px, 0.85fr) minmax(320px, 1.15fr);
@@ -1114,6 +1183,61 @@ input:focus {
   min-height: 28px;
   margin: 0 18px 15px;
   font-size: 10px;
+}
+
+.repository-setup {
+  padding: 18px;
+  background: #f8faf9;
+  border-top: 1px solid var(--line);
+}
+
+.repository-setup-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-bottom: 14px;
+  color: #376e6a;
+}
+
+.repository-setup-heading > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.repository-setup-heading strong {
+  color: #2b393e;
+  font-size: 11px;
+}
+
+.repository-setup-heading span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.repository-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.repository-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.repository-success {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 13px;
+  color: var(--green);
+  font-size: 10px;
+  font-weight: 600;
 }
 
 .provider-line {
@@ -1580,6 +1704,11 @@ input:focus {
 }
 
 @media (max-width: 1100px) {
+  .deployment-provider-config {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+
   .environment-row {
     grid-template-columns: 150px minmax(240px, 1fr);
   }
@@ -1821,6 +1950,29 @@ input:focus {
   }
 
   .connection-actions {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .deployment-provider-config {
+    padding: 14px;
+  }
+
+  .provider-config-fields,
+  .repository-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .registry-hint,
+  .repository-form .field-wide {
+    grid-column: 1;
+  }
+
+  .repository-setup {
+    padding: 14px;
+  }
+
+  .repository-actions {
     flex-direction: column;
     align-items: flex-start;
   }

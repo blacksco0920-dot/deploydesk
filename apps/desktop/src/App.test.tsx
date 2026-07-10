@@ -13,9 +13,7 @@ describe("DeployDesk desktop flow", () => {
       expect(screen.getByText("云端部署就绪")).toBeInTheDocument(),
     );
 
-    fireEvent.click(
-      screen.getByRole("button", { name: /查看 Ecat 识别示例/ }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: /查看 Ecat 识别示例/ }));
 
     await waitFor(() =>
       expect(
@@ -32,7 +30,10 @@ describe("DeployDesk desktop flow", () => {
       screen.getByText("miniapp", { selector: ".service-name strong" }),
     ).toBeInTheDocument();
 
+    const main = screen.getByRole("main");
+    main.scrollTop = 320;
     fireEvent.click(screen.getByRole("button", { name: "部署计划" }));
+    await waitFor(() => expect(main.scrollTop).toBe(0));
     expect(
       screen.getByRole("heading", { name: "确认后再写入项目" }),
     ).toBeInTheDocument();

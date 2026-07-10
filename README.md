@@ -94,7 +94,7 @@ cargo run -p deployctl -- init /你的项目目录
 
 4. **连接外部服务**
 
-   填写 CNB Token，验证测试/生产 SSH。首次使用新服务器时，SSH 验证成功后勾选授权，再点击“初始化 Caddy”。该操作只创建 `~/.deploydesk` 和 `deploydesk-caddy`；检测到其他 Docker 容器占用 80/443 时会停止。
+   填写 CNB Token 后，可以直接创建默认私有的项目仓库；已有仓库则在“环境配置”填写 `组织/仓库`，并选择 CNB Docker 制品库或 TCR。随后验证测试/生产 SSH。首次使用新服务器时，SSH 验证成功后勾选授权，再点击“初始化 Caddy”。该操作只创建 `~/.deploydesk` 和 `deploydesk-caddy`；检测到其他 Docker 容器占用 80/443 时会停止。
 
 5. **填写 CNB 密钥仓库**
 
@@ -181,11 +181,14 @@ CNB 命令只从进程环境读取 `CNB_TOKEN`，不会从参数接收或打印 
 ```bash
 deployctl cnb me
 deployctl cnb repositories <组织>
+deployctl cnb create-repo <组织> <仓库名> --description "项目构建仓库"
 deployctl cnb settings <组织/仓库>
 deployctl cnb enable-auto <组织/仓库>
 deployctl cnb builds <组织/仓库>
 deployctl cnb trigger <组织/仓库> --branch main --event api_trigger_production
 ```
+
+新仓库默认私有；只有明确需要公开时才追加 `--public`。
 
 ## 本地开发
 

@@ -140,6 +140,21 @@ enum CnbCommand {
     Repositories {
         slug: String,
     },
+    #[command(name = "create-repo", about = "创建 CNB 项目仓库（默认私有）")]
+    CreateRepository {
+        /// CNB 组织或用户名
+        #[arg(value_name = "组织")]
+        slug: String,
+        /// 新仓库名称
+        #[arg(value_name = "仓库名")]
+        name: String,
+        /// 仓库说明
+        #[arg(long, default_value = "", value_name = "说明")]
+        description: String,
+        /// 将仓库设为公开；未指定时创建私有仓库
+        #[arg(long)]
+        public: bool,
+    },
     Settings {
         repository: String,
     },
@@ -389,6 +404,16 @@ async fn handle_cnb(command: CnbCommand) -> Result<()> {
     let result = match command {
         CnbCommand::Me => client.current_user().await?,
         CnbCommand::Repositories { slug } => client.repositories(&slug).await?,
+        CnbCommand::CreateRepository {
+            slug,
+            name,
+            description,
+            public,
+        } => {
+            client
+                .create_repository(&slug, &name, &description, !public)
+                .await?
+        }
         CnbCommand::Settings { repository } => client.build_settings(&repository).await?,
         CnbCommand::EnableAuto { repository } => client.enable_auto_trigger(&repository).await?,
         CnbCommand::Builds { repository, size } => client.recent_builds(&repository, size).await?,

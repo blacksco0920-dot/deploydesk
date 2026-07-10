@@ -6,8 +6,11 @@ import {
   ExternalLink,
   FileKey2,
   FolderOpen,
+  GitBranch,
   KeyRound,
   LoaderCircle,
+  LockKeyhole,
+  Plus,
   Server,
   ServerCog,
   ShieldCheck,
@@ -19,12 +22,14 @@ import {
   checkDocker,
   checkServer,
   connectCnb,
+  createCnbRepository,
   selectPrivateKey,
 } from "../api";
-import type { ProviderCheck, ServerForm } from "../types";
+import type { CnbRepositoryResult, ProviderCheck, ServerForm } from "../types";
 
 interface ConnectionsPanelProps {
   onError: (message: string) => void;
+  onRepositorySelected: (repository: string) => Promise<void>;
 }
 
 const emptyServer = (name: string): ServerForm => ({
@@ -35,11 +40,22 @@ const emptyServer = (name: string): ServerForm => ({
   keyPath: "",
 });
 
-export function ConnectionsPanel({ onError }: ConnectionsPanelProps) {
+export function ConnectionsPanel({
+  onError,
+  onRepositorySelected,
+}: ConnectionsPanelProps) {
   const [token, setToken] = useState("");
+  const [sessionToken, setSessionToken] = useState("");
   const [rememberToken, setRememberToken] = useState(true);
   const [cnbAccount, setCnbAccount] = useState<string | null>(null);
   const [cnbLoading, setCnbLoading] = useState(false);
+  const [repositorySlug, setRepositorySlug] = useState("");
+  const [repositoryName, setRepositoryName] = useState("");
+  const [repositoryDescription, setRepositoryDescription] = useState("");
+  const [privateRepository, setPrivateRepository] = useState(true);
+  const [repositoryLoading, setRepositoryLoading] = useState(false);
+  const [createdRepository, setCreatedRepository] =
+    useState<CnbRepositoryResult | null>(null);
   const [dockerCheck, setDockerCheck] = useState<ProviderCheck | null>(null);
   const [dockerLoading, setDockerLoading] = useState(false);
   const [staging, setStaging] = useState(emptyServer("staging-server"));
@@ -69,11 +85,40 @@ export function ConnectionsPanel({ onError }: ConnectionsPanelProps) {
     try {
       const result = await connectCnb(token, rememberToken);
       setCnbAccount(result.displayName);
+      setSessionToken(rememberToken ? "" : token);
       setToken("");
     } catch (error) {
       onError(toMessage(error));
     } finally {
       setCnbLoading(false);
+    }
+  }
+
+  async function handleRepositoryCreate() {
+    if (!cnbAccount) {
+      onError("请先验证并连接 CNB");
+      return;
+    }
+    if (!repositorySlug.trim() || !repositoryName.trim()) {
+      onError("请填写 CNB 所属组织或用户名，以及仓库名称");
+      return;
+    }
+    setRepositoryLoading(true);
+    setCreatedRepository(null);
+    try {
+      const result = await createCnbRepository({
+        token: sessionToken,
+        slug: repositorySlug,
+        name: repositoryName,
+        description: repositoryDescription,
+        privateRepo: privateRepository,
+      });
+      await onRepositorySelected(result.repository);
+      setCreatedRepository(result);
+    } catch (error) {
+      onError(toMessage(error));
+    } finally {
+      setRepositoryLoading(false);
     }
   }
 
@@ -135,7 +180,9 @@ export function ConnectionsPanel({ onError }: ConnectionsPanelProps) {
         <div>
           <span className="eyebrow">服务连接</span>
           <h1>构建、镜像和服务器</h1>
-          <p>默认只验证权限；服务器初始化必须单独勾选确认，不会直接部署业务。</p>
+          <p>
+            默认只验证权限；服务器初始化必须单独勾选确认，不会直接部署业务。
+          </p>
         </div>
       </header>
 
@@ -200,6 +247,81 @@ export function ConnectionsPanel({ onError }: ConnectionsPanelProps) {
           获取访问令牌
           <ExternalLink size={14} />
         </button>
+        {cnbAccount ? (
+          <div className="repository-setup">
+            <div className="repository-setup-heading">
+              <GitBranch size={18} />
+              <div>
+                <strong>创建 CNB 项目仓库</strong>
+                <span>已有仓库可直接在“环境配置”中填写，无需重复创建。</span>
+              </div>
+            </div>
+            <div className="repository-form">
+              <label>
+                所属组织或用户名
+                <input
+                  autoComplete="off"
+                  onChange={(event) => setRepositorySlug(event.target.value)}
+                  placeholder="例如：your-team"
+                  value={repositorySlug}
+                />
+              </label>
+              <label>
+                仓库名称
+                <input
+                  autoComplete="off"
+                  onChange={(event) => setRepositoryName(event.target.value)}
+                  placeholder="例如：my-project"
+                  value={repositoryName}
+                />
+              </label>
+              <label className="field-wide">
+                仓库说明（可选）
+                <input
+                  onChange={(event) =>
+                    setRepositoryDescription(event.target.value)
+                  }
+                  placeholder="这个仓库将用于项目代码和自动构建"
+                  value={repositoryDescription}
+                />
+              </label>
+            </div>
+            <div className="repository-actions">
+              <label className="checkbox-line">
+                <input
+                  checked={privateRepository}
+                  onChange={(event) =>
+                    setPrivateRepository(event.target.checked)
+                  }
+                  type="checkbox"
+                />
+                <LockKeyhole size={14} />
+                <span>创建为私有仓库</span>
+              </label>
+              <button
+                className="secondary-action"
+                disabled={repositoryLoading}
+                onClick={handleRepositoryCreate}
+                type="button"
+              >
+                {repositoryLoading ? (
+                  <LoaderCircle className="spin" size={17} />
+                ) : (
+                  <Plus size={17} />
+                )}
+                {repositoryLoading ? "正在创建" : "创建并选用"}
+              </button>
+            </div>
+            {createdRepository ? (
+              <span className="repository-success">
+                <CheckCircle2 size={15} />
+                已创建 {createdRepository.repository}（
+                {createdRepository.visibility === "private" ? "私有" : "公开"}
+                ），并写入当前部署计划
+              </span>
+            ) : null}
+          </div>
+        ) : null}
       </section>
 
       <section className="connection-section">
@@ -387,7 +509,9 @@ function ServerConnectionForm({
         验证 SSH
       </button>
       {check ? (
-        <span className={check.ok ? "check-message success" : "check-message error"}>
+        <span
+          className={check.ok ? "check-message success" : "check-message error"}
+        >
           {check.summary}
         </span>
       ) : null}

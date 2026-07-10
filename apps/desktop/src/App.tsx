@@ -6,7 +6,8 @@ import {
   X,
 } from "lucide-react";
 import { isTauri } from "@tauri-apps/api/core";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { parseDocument } from "yaml";
 import {
   applyManifest,
   getPreflight,
@@ -36,6 +37,7 @@ const sectionNames: Record<NavigationSection, string> = {
 };
 
 function App() {
+  const mainContentRef = useRef<HTMLElement>(null);
   const [active, setActive] = useState<NavigationSection>("overview");
   const [preflight, setPreflight] = useState<SystemPreflight | null>(null);
   const [workspace, setWorkspace] = useState<WorkspacePreview | null>(null);
@@ -52,6 +54,10 @@ function App() {
       .then(setPreflight)
       .catch((reason) => setError(toMessage(reason)));
   }, []);
+
+  useEffect(() => {
+    if (mainContentRef.current) mainContentRef.current.scrollTop = 0;
+  }, [active]);
 
   async function selectProject() {
     setError(null);
@@ -70,6 +76,7 @@ function App() {
       setWorkspace(result);
       setProjectPath(path);
       setActive("overview");
+      if (mainContentRef.current) mainContentRef.current.scrollTop = 0;
     } catch (reason) {
       setError(toMessage(reason));
     } finally {
@@ -77,16 +84,18 @@ function App() {
     }
   }
 
-  async function updateManifest(manifestYaml: string) {
-    if (!projectPath) return;
+  async function updateManifest(manifestYaml: string): Promise<boolean> {
+    if (!projectPath) return false;
     setSaving(true);
     setError(null);
     try {
       const result = await previewManifest(projectPath, manifestYaml);
       setWorkspace(result);
       setNotice("环境配置已更新，部署计划已重新计算。");
+      return true;
     } catch (reason) {
       setError(toMessage(reason));
+      return false;
     } finally {
       setSaving(false);
     }
@@ -97,10 +106,7 @@ function App() {
     setApplying(true);
     setError(null);
     try {
-      const result = await applyManifest(
-        projectPath,
-        workspace.manifestYaml,
-      );
+      const result = await applyManifest(projectPath, workspace.manifestYaml);
       setApplyResult(result);
       const refreshed = await openProject(projectPath);
       setWorkspace(refreshed);
@@ -109,6 +115,21 @@ function App() {
       setError(toMessage(reason));
     } finally {
       setApplying(false);
+    }
+  }
+
+  async function selectCnbRepository(repository: string) {
+    if (!workspace) throw new Error("请先选择本地项目");
+    const document = parseDocument(workspace.manifestYaml);
+    document.setIn(["providers", "build", "repository"], repository);
+    if (document.getIn(["providers", "registry", "kind"]) === "cnb") {
+      document.setIn(["providers", "registry", "repository"], repository);
+    }
+    const updated = await updateManifest(document.toString({ lineWidth: 0 }));
+    if (!updated) {
+      throw new Error(
+        `仓库 ${repository} 已创建，但部署计划未能更新，请在环境配置中手动选择`,
+      );
     }
   }
 
@@ -135,7 +156,12 @@ function App() {
           />
         );
       case "connections":
-        return <ConnectionsPanel onError={setError} />;
+        return (
+          <ConnectionsPanel
+            onError={setError}
+            onRepositorySelected={selectCnbRepository}
+          />
+        );
       case "plan":
         return (
           <PlanPanel
@@ -184,7 +210,9 @@ function App() {
             </button>
           </div>
         </header>
-        <main className="main-content">{renderContent()}</main>
+        <main className="main-content" ref={mainContentRef}>
+          {renderContent()}
+        </main>
       </div>
 
       {loading ? (

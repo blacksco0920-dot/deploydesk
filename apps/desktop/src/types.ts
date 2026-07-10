@@ -140,6 +140,19 @@ export interface ProviderCheck {
   details: string[];
 }
 
+export interface CnbRepositoryInput {
+  token: string;
+  slug: string;
+  name: string;
+  description: string;
+  privateRepo: boolean;
+}
+
+export interface CnbRepositoryResult {
+  repository: string;
+  visibility: "private" | "public";
+}
+
 export interface ApplyResult {
   planId: string;
   writtenFiles: string[];
@@ -147,10 +160,7 @@ export interface ApplyResult {
 }
 
 export type NavigationSection =
-  | "overview"
-  | "environments"
-  | "connections"
-  | "plan";
+  "overview" | "environments" | "connections" | "plan";
 
 export interface ServerForm {
   name: string;

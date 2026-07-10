@@ -7,7 +7,7 @@ import { EnvironmentEditor } from "./EnvironmentEditor";
 describe("EnvironmentEditor", () => {
   it("keeps branches independent and writes the selected production policy", async () => {
     const workspace = await openProject("/fixture/ecat-energy");
-    const onSave = vi.fn(async (_manifestYaml: string) => undefined);
+    const onSave = vi.fn(async (_manifestYaml: string) => true);
     render(
       <EnvironmentEditor
         onSave={onSave}
@@ -22,11 +22,20 @@ describe("EnvironmentEditor", () => {
     fireEvent.change(screen.getByLabelText("稳定分支"), {
       target: { value: "release" },
     });
+    fireEvent.change(screen.getByLabelText("CNB 构建仓库"), {
+      target: { value: "team/project" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "TCR" }));
+    fireEvent.change(screen.getByLabelText("TCR Registry 地址"), {
+      target: { value: "ccr.example.com" },
+    });
+    fireEvent.change(screen.getByLabelText("TCR 命名空间"), {
+      target: { value: "team-images" },
+    });
     const secretReferences = screen.getAllByLabelText("CNB 密钥文件");
     fireEvent.change(secretReferences[0], {
       target: {
-        value:
-          "https://cnb.cool/example/secrets/-/blob/main/env.staging.yml",
+        value: "https://cnb.cool/example/secrets/-/blob/main/env.staging.yml",
       },
     });
     fireEvent.change(secretReferences[1], {
@@ -54,5 +63,14 @@ describe("EnvironmentEditor", () => {
     );
     expect(manifest.release.production_mode).toBe("automatic");
     expect(manifest.environments.production.approval_required).toBe(false);
+    expect(manifest.providers.build).toEqual({
+      kind: "cnb",
+      repository: "team/project",
+    });
+    expect(manifest.providers.registry).toEqual({
+      kind: "tcr",
+      registry: "ccr.example.com",
+      namespace: "team-images",
+    });
   });
 });

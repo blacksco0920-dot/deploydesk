@@ -2,6 +2,8 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type {
   ApplyResult,
+  CnbRepositoryInput,
+  CnbRepositoryResult,
   ProviderCheck,
   ServerForm,
   SystemPreflight,
@@ -123,6 +125,18 @@ export async function connectCnb(
   return invoke("connect_cnb", { token, persist });
 }
 
+export async function createCnbRepository(
+  input: CnbRepositoryInput,
+): Promise<CnbRepositoryResult> {
+  if (!isTauri()) {
+    return {
+      repository: `${input.slug.trim()}/${input.name.trim()}`,
+      visibility: input.privateRepo ? "private" : "public",
+    };
+  }
+  return invoke("create_cnb_repository", { ...input });
+}
+
 const demoPreflight: SystemPreflight = {
   operating_system: "macos",
   architecture: "aarch64",
@@ -182,6 +196,14 @@ environments:
     branch: main
     domains: []
     secrets_ref: https://cnb.cool/replace-me/secret/-/blob/main/env.production.yml
+providers:
+  build:
+    kind: cnb
+    repository: owner/ecat-energy
+  registry:
+    kind: cnb
+    repository: owner/ecat-energy
+  reverse_proxy: caddy
 release:
   production_mode: approval
 `,
@@ -309,7 +331,8 @@ release:
         {
           path: ".deploydesk/generated/production/docker-compose.yml",
           kind: "create",
-          after: "name: ecat-energy-production\nservices:\n  api:\n    image: ${DEPLOYDESK_API_IMAGE}\n",
+          after:
+            "name: ecat-energy-production\nservices:\n  api:\n    image: ${DEPLOYDESK_API_IMAGE}\n",
           sensitive: false,
         },
       ],

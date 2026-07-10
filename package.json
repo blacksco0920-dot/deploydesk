@@ -11,6 +11,6 @@
     "lint": "cargo clippy --workspace --all-targets -- -D warnings && pnpm --filter @deploydesk/desktop lint",
     "test": "cargo test --workspace && pnpm --filter @deploydesk/desktop test",
     "tauri:build": "pnpm --filter @deploydesk/desktop tauri build",
-    "tauri:build:mac": "CI=true pnpm --filter @deploydesk/desktop tauri build --bundles app,dmg --ci"
+    "tauri:build:mac": "CI=true APPLE_SIGNING_IDENTITY=- pnpm --filter @deploydesk/desktop tauri build --bundles app,dmg --ci"
   }
 }

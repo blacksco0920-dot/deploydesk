@@ -12,7 +12,7 @@ use deploy_core::{
 };
 use keyring::Entry;
 use serde::Serialize;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const KEYRING_SERVICE: &str = "com.deploydesk.desktop";
 
@@ -46,6 +46,13 @@ struct SecretStatus {
 struct CnbAccount {
     connected: bool,
     display_name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CnbRepositoryResult {
+    repository: String,
+    visibility: String,
 }
 
 #[tauri::command]
@@ -208,8 +215,9 @@ fn delete_secret(key: String) -> Result<SecretStatus, String> {
 }
 
 #[tauri::command]
-async fn connect_cnb(mut token: String, persist: bool) -> Result<CnbAccount, String> {
-    let client = CnbClient::new(token.clone()).map_err(public_error)?;
+async fn connect_cnb(token: String, persist: bool) -> Result<CnbAccount, String> {
+    let token = Zeroizing::new(token);
+    let client = CnbClient::new(token.as_str()).map_err(public_error)?;
     let user = client.current_user().await.map_err(public_error)?;
     let display_name = ["username", "name", "slug", "nickname"]
         .into_iter()
@@ -218,12 +226,45 @@ async fn connect_cnb(mut token: String, persist: bool) -> Result<CnbAccount, Str
         .to_string();
     if persist {
         let entry = Entry::new(KEYRING_SERVICE, "cnb-token").map_err(public_error)?;
-        entry.set_password(&token).map_err(public_error)?;
+        entry.set_password(token.as_str()).map_err(public_error)?;
     }
-    token.zeroize();
     Ok(CnbAccount {
         connected: true,
         display_name,
+    })
+}
+
+#[tauri::command]
+async fn create_cnb_repository(
+    token: String,
+    slug: String,
+    name: String,
+    description: String,
+    private_repo: bool,
+) -> Result<CnbRepositoryResult, String> {
+    let token = resolve_cnb_token(token)?;
+    let client = CnbClient::new(token).map_err(public_error)?;
+    client
+        .create_repository(&slug, &name, &description, private_repo)
+        .await
+        .map_err(public_error)?;
+    Ok(CnbRepositoryResult {
+        repository: format!("{}/{}", slug.trim(), name.trim()),
+        visibility: if private_repo { "private" } else { "public" }.to_string(),
+    })
+}
+
+fn resolve_cnb_token(mut provided: String) -> Result<String, String> {
+    if !provided.trim().is_empty() {
+        let token = provided.trim().to_string();
+        provided.zeroize();
+        return Ok(token);
+    }
+    provided.zeroize();
+    let entry = Entry::new(KEYRING_SERVICE, "cnb-token").map_err(public_error)?;
+    entry.get_password().map_err(|error| match error {
+        keyring::Error::NoEntry => "请重新连接 CNB，并保存令牌后再创建仓库".to_string(),
+        other => public_error(other),
     })
 }
 
@@ -259,6 +300,7 @@ pub fn run() {
             store_secret,
             delete_secret,
             connect_cnb,
+            create_cnb_repository,
         ])
         .run(tauri::generate_context!())
         .expect("DeployDesk failed to start");

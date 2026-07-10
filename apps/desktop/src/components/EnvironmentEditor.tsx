@@ -1,6 +1,7 @@
 import {
   Check,
   Cloud,
+  Container,
   GitBranch,
   HardDrive,
   Laptop,
@@ -15,10 +16,14 @@ import type { WorkspacePreview } from "../types";
 interface EnvironmentEditorProps {
   workspace: WorkspacePreview;
   saving: boolean;
-  onSave: (manifestYaml: string) => Promise<void>;
+  onSave: (manifestYaml: string) => Promise<boolean>;
 }
 
 interface Draft {
+  buildRepository: string;
+  registryKind: "cnb" | "tcr";
+  tcrRegistry: string;
+  tcrNamespace: string;
   integrationBranch: string;
   stableBranch: string;
   stagingServer: string;
@@ -43,6 +48,24 @@ export function EnvironmentEditor({
 
   async function save() {
     const document = parseDocument(workspace.manifestYaml);
+    document.setIn(["providers", "build", "kind"], "cnb");
+    document.setIn(
+      ["providers", "build", "repository"],
+      draft.buildRepository.trim(),
+    );
+    document.setIn(
+      ["providers", "registry"],
+      draft.registryKind === "cnb"
+        ? {
+            kind: "cnb",
+            repository: draft.buildRepository.trim(),
+          }
+        : {
+            kind: "tcr",
+            registry: draft.tcrRegistry.trim(),
+            namespace: draft.tcrNamespace.trim(),
+          },
+    );
     document.setIn(["source", "integration_branch"], draft.integrationBranch);
     document.setIn(["source", "stable_branch"], draft.stableBranch);
     document.setIn(
@@ -107,6 +130,81 @@ export function EnvironmentEditor({
           {saving ? "正在更新计划" : "更新部署计划"}
         </button>
       </header>
+
+      <section className="deployment-provider-config">
+        <div className="provider-config-heading">
+          <span className="provider-config-icon">
+            <Container size={19} />
+          </span>
+          <div>
+            <h2>构建与制品库</h2>
+            <p>CNB 负责构建；镜像可以保存在 CNB Docker 制品库或腾讯云 TCR。</p>
+          </div>
+        </div>
+        <div className="provider-config-fields">
+          <label>
+            CNB 构建仓库
+            <span className="input-with-icon">
+              <GitBranch size={16} />
+              <input
+                onChange={(event) =>
+                  setDraft({ ...draft, buildRepository: event.target.value })
+                }
+                placeholder="组织或用户名/仓库名"
+                value={draft.buildRepository}
+              />
+            </span>
+          </label>
+          <div className="registry-choice">
+            <span>镜像存储</span>
+            <div className="segmented-control">
+              <button
+                className={draft.registryKind === "cnb" ? "selected" : ""}
+                onClick={() => setDraft({ ...draft, registryKind: "cnb" })}
+                type="button"
+              >
+                CNB
+              </button>
+              <button
+                className={draft.registryKind === "tcr" ? "selected" : ""}
+                onClick={() => setDraft({ ...draft, registryKind: "tcr" })}
+                type="button"
+              >
+                TCR
+              </button>
+            </div>
+          </div>
+          {draft.registryKind === "tcr" ? (
+            <>
+              <label>
+                TCR Registry 地址
+                <input
+                  onChange={(event) =>
+                    setDraft({ ...draft, tcrRegistry: event.target.value })
+                  }
+                  placeholder="ccr.ccs.tencentyun.com"
+                  value={draft.tcrRegistry}
+                />
+              </label>
+              <label>
+                TCR 命名空间
+                <input
+                  onChange={(event) =>
+                    setDraft({ ...draft, tcrNamespace: event.target.value })
+                  }
+                  placeholder="例如：your-team"
+                  value={draft.tcrNamespace}
+                />
+              </label>
+            </>
+          ) : (
+            <span className="registry-hint">
+              镜像将保存在 docker.cnb.cool/
+              {draft.buildRepository || "组织/仓库"}
+            </span>
+          )}
+        </div>
+      </section>
 
       <section className="environment-list">
         <article className="environment-row">
@@ -321,14 +419,20 @@ export function EnvironmentEditor({
 function readDraft(workspace: WorkspacePreview): Draft {
   const document = parseDocument(workspace.manifestYaml);
   const manifest = document.toJS() as Record<string, any>;
+  const registry = manifest.providers?.registry;
   return {
+    buildRepository:
+      manifest.providers?.build?.repository ??
+      `owner/${manifest.project?.name ?? workspace.inspection.project_name}`,
+    registryKind: registry?.kind === "tcr" ? "tcr" : "cnb",
+    tcrRegistry: registry?.registry ?? "ccr.ccs.tencentyun.com",
+    tcrNamespace: registry?.namespace ?? "",
     integrationBranch: manifest.source?.integration_branch ?? "test",
     stableBranch: manifest.source?.stable_branch ?? "main",
     stagingServer:
       manifest.environments?.staging?.target?.server ?? "staging-server",
     productionServer:
-      manifest.environments?.production?.target?.server ??
-      "production-server",
+      manifest.environments?.production?.target?.server ?? "production-server",
     stagingDomains: routesToRecord(
       manifest.environments?.staging?.domains ?? [],
     ),
