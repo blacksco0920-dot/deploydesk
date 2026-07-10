@@ -45,6 +45,13 @@ pub struct GeneratedSshIdentity {
     pub created: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SshHostIdentity {
+    pub fingerprint: String,
+    pub public_key: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteCommandOutput {
     pub exit_status: Option<u32>,
@@ -55,7 +62,8 @@ pub struct RemoteCommandOutput {
 #[derive(Clone)]
 struct HostKeyVerifier {
     expected: Option<String>,
-    observed: Arc<Mutex<Option<String>>>,
+    observed_fingerprint: Arc<Mutex<Option<String>>>,
+    observed_public_key: Arc<Mutex<Option<String>>>,
 }
 
 impl client::Handler for HostKeyVerifier {
@@ -68,8 +76,13 @@ impl client::Handler for HostKeyVerifier {
         let fingerprint = key
             .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
             .to_string();
-        if let Ok(mut observed) = self.observed.lock() {
+        if let Ok(mut observed) = self.observed_fingerprint.lock() {
             *observed = Some(fingerprint.clone());
+        }
+        if let Ok(public_key) = key.to_openssh()
+            && let Ok(mut observed) = self.observed_public_key.lock()
+        {
+            *observed = Some(public_key);
         }
         Ok(self
             .expected
@@ -276,8 +289,8 @@ pub async fn check_connection(profile: &SshProfile) -> Result<ProviderCheck> {
             details: vec!["重新选择本机私钥文件".to_string()],
         });
     }
-    let observed = match probe_host_fingerprint(profile).await {
-        Ok(fingerprint) => fingerprint,
+    let identity = match probe_host_identity(profile).await {
+        Ok(identity) => identity,
         Err(error) => {
             return Ok(failed_check(
                 "ssh",
@@ -286,7 +299,7 @@ pub async fn check_connection(profile: &SshProfile) -> Result<ProviderCheck> {
             ));
         }
     };
-    if let Some(check) = host_key_gate(profile, &observed) {
+    if let Some(check) = host_key_gate(profile, &identity.fingerprint) {
         return Ok(check);
     }
 
@@ -305,7 +318,10 @@ pub async fn check_connection(profile: &SshProfile) -> Result<ProviderCheck> {
             provider: "ssh".to_string(),
             ok: true,
             summary: format!("服务器 {} 连接正常", profile.name),
-            details: vec![format!("已验证服务器身份 {observed}，未执行远程写操作")],
+            details: vec![format!(
+                "已验证服务器身份 {}，未执行远程写操作",
+                identity.fingerprint
+            )],
         });
     }
     Ok(failed_check(
@@ -324,17 +340,21 @@ pub async fn execute(
     let expected = profile.host_fingerprint.as_deref().ok_or_else(|| {
         DeployError::MissingCredential("请先确认目标服务器的 SSH 身份指纹".to_string())
     })?;
-    let observed = Arc::new(Mutex::new(None));
+    let observed_fingerprint = Arc::new(Mutex::new(None));
     let verifier = HostKeyVerifier {
         expected: Some(expected.to_string()),
-        observed: Arc::clone(&observed),
+        observed_fingerprint: Arc::clone(&observed_fingerprint),
+        observed_public_key: Arc::new(Mutex::new(None)),
     };
     let config = Arc::new(client_config());
     let connect = client::connect(config, (profile.host.as_str(), profile.port), verifier);
     let mut session = match tokio::time::timeout(Duration::from_secs(12), connect).await {
         Ok(Ok(session)) => session,
         Ok(Err(error)) => {
-            let actual = observed.lock().ok().and_then(|value| value.clone());
+            let actual = observed_fingerprint
+                .lock()
+                .ok()
+                .and_then(|value| value.clone());
             if actual.as_deref().is_some_and(|actual| actual != expected) {
                 return Err(DeployError::MissingCredential(
                     "服务器身份指纹已变化，已阻止连接".to_string(),
@@ -388,11 +408,13 @@ pub async fn execute(
     Ok(output)
 }
 
-async fn probe_host_fingerprint(profile: &SshProfile) -> Result<String> {
-    let observed = Arc::new(Mutex::new(None));
+pub async fn probe_host_identity(profile: &SshProfile) -> Result<SshHostIdentity> {
+    let observed_fingerprint = Arc::new(Mutex::new(None));
+    let observed_public_key = Arc::new(Mutex::new(None));
     let verifier = HostKeyVerifier {
         expected: None,
-        observed: Arc::clone(&observed),
+        observed_fingerprint: Arc::clone(&observed_fingerprint),
+        observed_public_key: Arc::clone(&observed_public_key),
     };
     let connect = client::connect(
         Arc::new(client_config()),
@@ -410,14 +432,26 @@ async fn probe_host_fingerprint(profile: &SshProfile) -> Result<String> {
         .disconnect(Disconnect::ByApplication, "", "English")
         .await
         .map_err(|error| ssh_error("disconnect", &error))?;
-    observed
+    let fingerprint = observed_fingerprint
         .lock()
         .ok()
         .and_then(|value| value.clone())
         .ok_or_else(|| DeployError::Command {
             command: "ssh fingerprint".to_string(),
             message: "服务器没有返回可验证的身份指纹".to_string(),
-        })
+        })?;
+    let public_key = observed_public_key
+        .lock()
+        .ok()
+        .and_then(|value| value.clone())
+        .ok_or_else(|| DeployError::Command {
+            command: "ssh fingerprint".to_string(),
+            message: "服务器没有返回可保存的主机公钥".to_string(),
+        })?;
+    Ok(SshHostIdentity {
+        fingerprint,
+        public_key,
+    })
 }
 
 fn host_key_gate(profile: &SshProfile, observed: &str) -> Option<ProviderCheck> {

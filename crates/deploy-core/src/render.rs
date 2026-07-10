@@ -848,7 +848,7 @@ fn image_tag_expression(manifest: &ProjectManifest) -> String {
     manifest
         .release
         .image_tag_template
-        .replace("{commit}", "${CNB_COMMIT_SHORT}")
+        .replace("{commit}", "${CNB_COMMIT}")
 }
 
 fn image_repository(manifest: &ProjectManifest, image: &str) -> String {
@@ -910,7 +910,7 @@ fn render_github_sync(manifest: &ProjectManifest) -> Result<String> {
                             "CNB_PUSH_TOKEN": "${{ secrets.CNB_PUSH_TOKEN }}",
                             "CNB_REPOSITORY": manifest.providers.build.repository
                         },
-                        "run": "test -n \"$CNB_PUSH_TOKEN\"\ngit remote add cnb \"https://oauth2:${CNB_PUSH_TOKEN}@cnb.cool/${CNB_REPOSITORY}.git\"\ngit push cnb \"HEAD:${GITHUB_REF_NAME}\" --force"
+                        "run": "set -eu\ntest -n \"$CNB_PUSH_TOKEN\"\nCNB_BASIC_AUTH=\"$(printf 'cnb:%s' \"$CNB_PUSH_TOKEN\" | base64 -w0)\"\nexport GIT_CONFIG_COUNT=1\nexport GIT_CONFIG_KEY_0=http.https://cnb.cool/.extraHeader\nexport GIT_CONFIG_VALUE_0=\"Authorization: Basic ${CNB_BASIC_AUTH}\"\ngit push \"https://cnb.cool/${CNB_REPOSITORY}.git\" \"HEAD:${GITHUB_REF_NAME}\""
                     }
                 ]
             }

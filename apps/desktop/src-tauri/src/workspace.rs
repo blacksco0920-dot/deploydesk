@@ -50,6 +50,10 @@ pub struct DeploymentRun {
     pub status: String,
     pub current_stage: String,
     pub build_serial: Option<String>,
+    pub commit_sha: Option<String>,
+    pub source_run_id: Option<String>,
+    pub action_kind: Option<String>,
+    pub action_url: Option<String>,
     pub repository: String,
     pub branch: String,
     pub message: String,
@@ -102,6 +106,10 @@ impl WorkspaceState {
                    status TEXT NOT NULL,
                    current_stage TEXT NOT NULL,
                    build_serial TEXT,
+                   commit_sha TEXT,
+                   source_run_id TEXT,
+                   action_kind TEXT,
+                   action_url TEXT,
                    repository TEXT NOT NULL,
                    branch TEXT NOT NULL,
                    message TEXT NOT NULL,
@@ -114,6 +122,7 @@ impl WorkspaceState {
             )
             .map_err(public_storage_error)?;
         ensure_server_fingerprint_column(&connection)?;
+        ensure_deployment_run_columns(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -296,6 +305,10 @@ impl WorkspaceState {
             status: "queued".to_string(),
             current_stage: "prepare".to_string(),
             build_serial: None,
+            commit_sha: None,
+            source_run_id: None,
+            action_kind: None,
+            action_url: None,
             repository: repository.to_string(),
             branch: branch.to_string(),
             message: "正在请求 CNB 开始构建".to_string(),
@@ -318,13 +331,18 @@ impl WorkspaceState {
             .execute(
                 "INSERT INTO deployment_runs (
                    id, project_path, project_name, environment, status,
-                   current_stage, build_serial, repository, branch, message,
+                   current_stage, build_serial, commit_sha, source_run_id,
+                   action_kind, action_url, repository, branch, message,
                    completed_steps, started_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                  ON CONFLICT(id) DO UPDATE SET
                    status = excluded.status,
                    current_stage = excluded.current_stage,
                    build_serial = excluded.build_serial,
+                   commit_sha = excluded.commit_sha,
+                   source_run_id = excluded.source_run_id,
+                   action_kind = excluded.action_kind,
+                   action_url = excluded.action_url,
                    message = excluded.message,
                    completed_steps = excluded.completed_steps,
                    updated_at = excluded.updated_at",
@@ -336,6 +354,10 @@ impl WorkspaceState {
                     run.status,
                     run.current_stage,
                     run.build_serial,
+                    run.commit_sha,
+                    run.source_run_id,
+                    run.action_kind,
+                    run.action_url,
                     run.repository,
                     run.branch,
                     run.message,
@@ -353,7 +375,8 @@ impl WorkspaceState {
         connection
             .query_row(
                 "SELECT id, project_path, project_name, environment, status,
-                        current_stage, build_serial, repository, branch, message,
+                        current_stage, build_serial, commit_sha, source_run_id,
+                        action_kind, action_url, repository, branch, message,
                         completed_steps, started_at, updated_at
                  FROM deployment_runs WHERE id = ?1",
                 [id],
@@ -370,7 +393,8 @@ impl WorkspaceState {
         let mut statement = connection
             .prepare(
                 "SELECT id, project_path, project_name, environment, status,
-                        current_stage, build_serial, repository, branch, message,
+                        current_stage, build_serial, commit_sha, source_run_id,
+                        action_kind, action_url, repository, branch, message,
                         completed_steps, started_at, updated_at
                  FROM deployment_runs
                  WHERE project_path = ?1
@@ -434,7 +458,7 @@ fn valid_run_status(status: &str) -> bool {
 }
 
 fn deployment_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentRun> {
-    let completed_steps: String = row.get(10)?;
+    let completed_steps: String = row.get(14)?;
     Ok(DeploymentRun {
         id: row.get(0)?,
         project_path: row.get(1)?,
@@ -443,12 +467,16 @@ fn deployment_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Deployme
         status: row.get(4)?,
         current_stage: row.get(5)?,
         build_serial: row.get(6)?,
-        repository: row.get(7)?,
-        branch: row.get(8)?,
-        message: row.get(9)?,
+        commit_sha: row.get(7)?,
+        source_run_id: row.get(8)?,
+        action_kind: row.get(9)?,
+        action_url: row.get(10)?,
+        repository: row.get(11)?,
+        branch: row.get(12)?,
+        message: row.get(13)?,
         completed_steps: serde_json::from_str(&completed_steps).unwrap_or_default(),
-        started_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        started_at: row.get(15)?,
+        updated_at: row.get(16)?,
     })
 }
 
@@ -469,6 +497,40 @@ fn ensure_server_fingerprint_column(connection: &Connection) -> Result<(), Strin
         connection
             .execute("ALTER TABLE servers ADD COLUMN host_fingerprint TEXT", [])
             .map_err(public_storage_error)?;
+    }
+    Ok(())
+}
+
+fn ensure_deployment_run_columns(connection: &Connection) -> Result<(), String> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(deployment_runs)")
+        .map_err(public_storage_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(public_storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(public_storage_error)?;
+    for (column, sql) in [
+        (
+            "commit_sha",
+            "ALTER TABLE deployment_runs ADD COLUMN commit_sha TEXT",
+        ),
+        (
+            "source_run_id",
+            "ALTER TABLE deployment_runs ADD COLUMN source_run_id TEXT",
+        ),
+        (
+            "action_kind",
+            "ALTER TABLE deployment_runs ADD COLUMN action_kind TEXT",
+        ),
+        (
+            "action_url",
+            "ALTER TABLE deployment_runs ADD COLUMN action_url TEXT",
+        ),
+    ] {
+        if !columns.iter().any(|existing| existing == column) {
+            connection.execute(sql, []).map_err(public_storage_error)?;
+        }
     }
     Ok(())
 }
@@ -583,6 +645,21 @@ mod tests {
                    last_checked_at TEXT NOT NULL,
                    created_at TEXT NOT NULL,
                    UNIQUE(host, user, port)
+                 );
+                 CREATE TABLE deployment_runs (
+                   id TEXT PRIMARY KEY,
+                   project_path TEXT NOT NULL,
+                   project_name TEXT NOT NULL,
+                   environment TEXT NOT NULL,
+                   status TEXT NOT NULL,
+                   current_stage TEXT NOT NULL,
+                   build_serial TEXT,
+                   repository TEXT NOT NULL,
+                   branch TEXT NOT NULL,
+                   message TEXT NOT NULL,
+                   completed_steps TEXT NOT NULL,
+                   started_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
                  );",
             )
             .expect("create legacy server table");
@@ -605,6 +682,28 @@ mod tests {
         assert_eq!(
             servers[0].host_fingerprint.as_deref(),
             Some("SHA256:upgraded")
+        );
+
+        let mut run = database
+            .create_deployment_run(
+                directory.path(),
+                "upgraded-project",
+                "staging",
+                "owner/project",
+                "main",
+            )
+            .expect("create upgraded run");
+        run.commit_sha = Some("0123456789abcdef0123456789abcdef01234567".to_string());
+        database
+            .save_deployment_run(&run)
+            .expect("save upgraded run");
+        assert_eq!(
+            database
+                .deployment_run(&run.id)
+                .expect("load upgraded run")
+                .commit_sha
+                .as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
         );
     }
 }

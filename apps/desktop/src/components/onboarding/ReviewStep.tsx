@@ -112,7 +112,7 @@ export function ReviewStep({ applying, onApply, workspace }: ReviewStepProps) {
       <div className="mt-5 flex justify-end">
         <Button disabled={!confirmed || applying || !changed.length} onClick={onApply} size="lg">
           {applying ? <LoaderCircle className="animate-spin-slow" /> : <Rocket />}
-          {applying ? "正在生成部署配置" : "生成部署配置"}
+          {applying ? "正在准备首次部署" : "开始部署测试"}
         </Button>
       </div>
     </div>

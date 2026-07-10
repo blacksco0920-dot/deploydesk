@@ -2,8 +2,11 @@ import { isTauri } from "@tauri-apps/api/core";
 import { ArrowRight, LoaderCircle } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Toaster, toast } from "sonner";
+import { parseDocument } from "yaml";
 import {
   applyManifest,
+  bootstrapServerCaddy,
+  enableCnbAutoTrigger,
   forgetProject,
   getPreflight,
   listRecentProjects,
@@ -12,14 +15,19 @@ import {
   openProject,
   promoteProductionDeployment,
   previewManifest,
+  preparePipelineIdentity,
   refreshDeployment,
+  resumeStagingDeployment,
+  rollbackEnvironment,
   saveProjectStep,
   selectProjectDirectory,
   startStagingDeployment,
+  syncProjectToCnb,
 } from "./api";
 import { ProjectHome } from "./components/ProjectHome";
 import { WorkspaceShell } from "./components/WorkspaceShell";
 import { ConnectionStep } from "./components/onboarding/ConnectionStep";
+import { CloudSetupAction } from "./components/onboarding/CloudSetupAction";
 import { DeploymentProgress } from "./components/onboarding/DeploymentProgress";
 import { InspectionStep } from "./components/onboarding/InspectionStep";
 import { OnboardingLayout } from "./components/onboarding/OnboardingLayout";
@@ -185,11 +193,25 @@ function App() {
 
   async function applyCurrentPlan() {
     if (!workspace || !projectPath) return;
+    if (!lastServer?.host || !lastServer.hostFingerprint) {
+      reportError("目标服务器尚未完成身份验证，请返回连接步骤重新验证");
+      return;
+    }
     setApplying(true);
     try {
+      const serverSetup = await bootstrapServerCaddy(lastServer);
+      if (!serverSetup.ok) throw new Error(serverSetup.summary);
+      await preparePipelineIdentity(projectPath, lastServer);
       const result = await applyManifest(projectPath, workspace.manifestYaml);
       const refreshed = await openProject(projectPath);
       setWorkspace(refreshed);
+      if (currentRun?.actionKind === "cloud-setup") {
+        await saveProjectStep(projectPath, "deploying");
+        setStep("deploying");
+        setScreen("onboarding");
+        toast.success("项目配置已更新，可以继续完成 CNB 保护配置");
+        return;
+      }
       const run = await startStagingDeployment(projectPath);
       setCurrentRun(run);
       setDeploymentRuns((current) => [
@@ -200,7 +222,7 @@ function App() {
       setStep("deploying");
       setScreen("onboarding");
       await refreshProjects();
-      toast.success(`部署配置已生成，共更新 ${result.writtenFiles.length} 个文件`);
+      toast.success(`服务器与部署配置已准备完成，共更新 ${result.writtenFiles.length} 个文件`);
     } catch (error) {
       reportError(toMessage(error));
     } finally {
@@ -251,6 +273,56 @@ function App() {
     }
   }
 
+  async function completeCloudSetup(
+    codeRepository: string,
+    secretRepository: string,
+  ) {
+    if (!workspace || !projectPath || !currentRun) return;
+    setApplying(true);
+    try {
+      const document = parseDocument(workspace.manifestYaml);
+      document.setIn(["providers", "build", "repository"], codeRepository);
+      const data = document.toJS() as {
+        providers?: { registry?: { kind?: string } };
+        source?: { release_branch?: string };
+      };
+      if (data.providers?.registry?.kind === "cnb") {
+        document.setIn(["providers", "registry", "repository"], codeRepository);
+      }
+      document.setIn(
+        ["environments", "staging", "secrets_ref"],
+        `https://cnb.cool/${secretRepository}/-/blob/main/env.staging.yml`,
+      );
+      document.setIn(
+        ["environments", "production", "secrets_ref"],
+        `https://cnb.cool/${secretRepository}/-/blob/main/env.production.yml`,
+      );
+      const manifestYaml = document.toString({ lineWidth: 0 });
+      const preview = await previewManifest(projectPath, manifestYaml);
+      if (!preview.validation.valid) {
+        throw new Error("持续部署配置校验未通过，请检查密钥仓库路径");
+      }
+      await applyManifest(projectPath, manifestYaml);
+      const branch = data.source?.release_branch ?? "main";
+      await syncProjectToCnb(projectPath, codeRepository, branch);
+      const autoTrigger = await enableCnbAutoTrigger(codeRepository);
+      if (!autoTrigger.ok) throw new Error(autoTrigger.summary);
+      const refreshed = await openProject(projectPath);
+      setWorkspace(refreshed);
+      const run = await resumeStagingDeployment(currentRun.id);
+      setCurrentRun(run);
+      setDeploymentRuns((current) => [
+        run,
+        ...current.filter((item) => item.id !== run.id),
+      ]);
+      toast.success("持续部署连接已完成，测试环境开始构建");
+    } catch (error) {
+      reportError(toMessage(error));
+    } finally {
+      setApplying(false);
+    }
+  }
+
   async function finishDeployment() {
     await goToStep("workspace");
   }
@@ -264,6 +336,36 @@ function App() {
       await saveProjectStep(projectPath, "deploying");
       setStep("deploying");
       setScreen("onboarding");
+    } catch (error) {
+      reportError(toMessage(error));
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  async function rollbackProjectEnvironment(
+    environment: DeploymentRun["environment"],
+  ) {
+    if (!lastServer?.hostFingerprint) {
+      reportError("目标服务器身份需要重新验证后才能回滚");
+      return;
+    }
+    setApplying(true);
+    try {
+      const run = await rollbackEnvironment(
+        projectPath,
+        environment,
+        lastServer,
+      );
+      setDeploymentRuns((current) => [
+        run,
+        ...current.filter((item) => item.id !== run.id),
+      ]);
+      if (run.status === "success") {
+        toast.success(run.message);
+      } else {
+        reportError(run.message);
+      }
     } catch (error) {
       reportError(toMessage(error));
     } finally {
@@ -342,7 +444,22 @@ function App() {
             workspace={workspace}
           />
         ) : null}
-        {step === "deploying" && currentRun ? (
+        {step === "deploying" &&
+        currentRun?.actionKind === "cloud-setup" &&
+        lastServer ? (
+          <CloudSetupAction
+            completing={applying}
+            onBackToRequirements={() => goToStep("requirements")}
+            onComplete={completeCloudSetup}
+            onError={reportError}
+            path={projectPath}
+            server={lastServer}
+            workspace={workspace}
+          />
+        ) : null}
+        {step === "deploying" &&
+        currentRun &&
+        currentRun.actionKind !== "cloud-setup" ? (
           <DeploymentProgress
             onRefresh={refreshCurrentDeployment}
             onRetry={retryDeployment}
@@ -380,6 +497,7 @@ function App() {
           }}
           onHome={() => setScreen("home")}
           onPromote={promoteToProduction}
+          onRollback={rollbackProjectEnvironment}
           onRefresh={() => loadProject(projectPath, "workspace")}
           path={projectPath}
           preflight={preflight}

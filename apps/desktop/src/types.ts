@@ -153,14 +153,47 @@ export interface CnbRepositoryResult {
   visibility: "private" | "public";
 }
 
+export interface CnbProjectSetup {
+  repository: string;
+  created: boolean;
+}
+
+export interface SourceSyncResult {
+  repository: string;
+  branch: string;
+  commitSha: string;
+  committed: boolean;
+}
+
 export interface CnbAccount {
   connected: boolean;
   displayName: string;
+  username: string;
 }
 
 export interface SecretStatus {
   key: string;
   stored: boolean;
+}
+
+export interface PipelineIdentityResult {
+  created: boolean;
+  fingerprint: string;
+}
+
+export interface RuntimeSecretStatus {
+  environment: "staging" | "production";
+  variable: string;
+  stored: boolean;
+}
+
+export interface CnbSecretBundle {
+  environment: "staging" | "production";
+  filename: string;
+  fileUrl: string;
+  content: string;
+  missingVariables: string[];
+  deployKeyFingerprint: string;
 }
 
 export interface ApplyResult {
@@ -237,6 +270,10 @@ export interface DeploymentRun {
   status: DeploymentRunStatus;
   currentStage: string;
   buildSerial: string | null;
+  commitSha: string | null;
+  sourceRunId: string | null;
+  actionKind: string | null;
+  actionUrl: string | null;
   repository: string;
   branch: string;
   message: string;

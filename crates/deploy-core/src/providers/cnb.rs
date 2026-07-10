@@ -150,21 +150,42 @@ impl CnbClient {
         event: &str,
         title: &str,
     ) -> Result<Value> {
+        self.trigger_build_at_revision(repository, branch, event, title, None)
+            .await
+    }
+
+    pub async fn trigger_build_at_revision(
+        &self,
+        repository: &str,
+        branch: &str,
+        event: &str,
+        title: &str,
+        revision: Option<&str>,
+    ) -> Result<Value> {
         if !event.starts_with("api_trigger") {
             return Err(DeployError::InvalidManifest(
                 "CNB API 事件必须以 api_trigger 开头".to_string(),
             ));
         }
+        if revision.is_some_and(|value| !valid_revision(value)) {
+            return Err(DeployError::InvalidManifest(
+                "CNB 构建提交标识格式不正确".to_string(),
+            ));
+        }
         let repository = encode_segment(repository);
+        let mut body = json!({
+            "branch": branch,
+            "event": event,
+            "title": title,
+            "sync": "false"
+        });
+        if let Some(revision) = revision {
+            body["sha"] = Value::String(revision.to_string());
+        }
         self.request(
             Method::POST,
             &format!("/{repository}/-/build/start"),
-            Some(json!({
-                "branch": branch,
-                "event": event,
-                "title": title,
-                "sync": "false"
-            })),
+            Some(body),
         )
         .await
     }
@@ -232,6 +253,24 @@ pub fn build_serial(value: &Value) -> Option<String> {
 }
 
 #[must_use]
+pub fn build_revision(value: &Value) -> Option<String> {
+    [
+        "/sha",
+        "/commit",
+        "/commitSha",
+        "/data/sha",
+        "/data/commit",
+        "/build/sha",
+        "/git/sha",
+    ]
+    .into_iter()
+    .filter_map(|path| value.pointer(path).and_then(Value::as_str))
+    .map(str::trim)
+    .find(|value| valid_revision(value))
+    .map(ToString::to_string)
+}
+
+#[must_use]
 pub fn summarize_build_status(value: &Value) -> CnbBuildStatus {
     let mut active_stages = Vec::new();
     let mut error_stages = Vec::new();
@@ -280,6 +319,10 @@ fn encode_segment(value: &str) -> String {
     utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
 }
 
+fn valid_revision(value: &str) -> bool {
+    (7..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn permission_hint(status: u16, message: &str) -> String {
     if status != 403 {
         return message.to_string();
@@ -325,10 +368,37 @@ mod tests {
             "token": "must-not-be-copied"
         });
         assert_eq!(build_serial(&payload).as_deref(), Some("42"));
+        assert!(build_revision(&payload).is_none());
         let summary = summarize_build_status(&payload);
         assert_eq!(summary.status, "running");
         assert_eq!(summary.active_stages, ["构建镜像"]);
         assert_eq!(summary.pipeline_ids, ["pipeline-1"]);
+    }
+
+    #[test]
+    fn extracts_only_valid_git_revisions() {
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            build_revision(&json!({"data": {"sha": revision}})).as_deref(),
+            Some(revision)
+        );
+        assert!(build_revision(&json!({"sha": "../../main"})).is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_unsafe_build_revisions_before_network_access() {
+        let client = CnbClient::with_api_base("test-token", "http://127.0.0.1:1").expect("client");
+        let error = client
+            .trigger_build_at_revision(
+                "owner/repo",
+                "main",
+                "api_trigger_production",
+                "production",
+                Some("main; echo unsafe"),
+            )
+            .await
+            .expect_err("unsafe revision must fail");
+        assert!(error.to_string().contains("提交标识格式不正确"));
     }
 
     #[tokio::test]

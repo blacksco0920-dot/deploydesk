@@ -1202,13 +1202,16 @@ dependencies = [
 name = "deploydesk-desktop"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "deploy-core",
  "keyring",
  "rusqlite",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "sha2 0.10.9",
+ "ssh-key 0.6.7",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

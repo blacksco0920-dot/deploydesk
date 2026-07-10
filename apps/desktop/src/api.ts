@@ -4,14 +4,19 @@ import type {
   ApplyResult,
   CnbRepositoryInput,
   CnbRepositoryResult,
+  CnbProjectSetup,
   CnbAccount,
+  CnbSecretBundle,
   DeploymentRun,
   OnboardingStep,
   ProviderCheck,
+  PipelineIdentityResult,
   RecentProject,
   ServerForm,
   ServerResource,
   SecretStatus,
+  RuntimeSecretStatus,
+  SourceSyncResult,
   GeneratedSshIdentity,
   SshIdentity,
   SystemPreflight,
@@ -191,6 +196,27 @@ export async function startStagingDeployment(
   return invoke<DeploymentRun>("start_staging_deployment", { path });
 }
 
+export async function resumeStagingDeployment(
+  runId: string,
+): Promise<DeploymentRun> {
+  if (!isTauri()) {
+    const run = readDemoRuns().find((item) => item.id === runId);
+    if (!run) throw new Error("找不到这次部署记录");
+    const resumed = {
+      ...run,
+      status: "running" as const,
+      currentStage: "build",
+      actionKind: null,
+      actionUrl: null,
+      message: "CNB 已开始构建，关闭应用后也可以继续查看",
+      updatedAt: new Date().toISOString(),
+    };
+    writeDemoRun(resumed);
+    return resumed;
+  }
+  return invoke<DeploymentRun>("resume_staging_deployment", { runId });
+}
+
 export async function promoteProductionDeployment(
   sourceRunId: string,
 ): Promise<DeploymentRun> {
@@ -199,7 +225,11 @@ export async function promoteProductionDeployment(
     if (!source || source.status !== "success") {
       throw new Error("只有健康检查通过的测试版本才能发布生产");
     }
-    const run = demoRun(source.projectPath, "production");
+    const run = {
+      ...demoRun(source.projectPath, "production"),
+      commitSha: source.commitSha,
+      sourceRunId,
+    };
     writeDemoRun(run);
     return run;
   }
@@ -240,8 +270,11 @@ export async function refreshDeployment(runId: string): Promise<DeploymentRun> {
   return invoke<DeploymentRun>("refresh_deployment", { runId });
 }
 
-export async function listDeploymentRuns(path: string): Promise<DeploymentRun[]> {
-  if (!isTauri()) return readDemoRuns().filter((run) => run.projectPath === path);
+export async function listDeploymentRuns(
+  path: string,
+): Promise<DeploymentRun[]> {
+  if (!isTauri())
+    return readDemoRuns().filter((run) => run.projectPath === path);
   return invoke<DeploymentRun[]>("list_deployment_runs", { path });
 }
 
@@ -267,16 +300,134 @@ export async function bootstrapServerCaddy(
   });
 }
 
+export async function preparePipelineIdentity(
+  path: string,
+  server: ServerForm,
+): Promise<PipelineIdentityResult> {
+  if (!isTauri()) {
+    return { created: true, fingerprint: "SHA256:DemoDeployIdentity" };
+  }
+  return invoke<PipelineIdentityResult>("prepare_pipeline_identity", {
+    path,
+    server,
+  });
+}
+
+export async function getRuntimeSecretStatus(
+  path: string,
+  environment: RuntimeSecretStatus["environment"],
+  variable: string,
+): Promise<RuntimeSecretStatus> {
+  if (!isTauri()) {
+    return {
+      environment,
+      variable,
+      stored: readDemoSecret(path, environment, variable),
+    };
+  }
+  return invoke<RuntimeSecretStatus>("runtime_secret_status", {
+    path,
+    environment,
+    variable,
+  });
+}
+
+export async function storeRuntimeSecret(
+  path: string,
+  environment: RuntimeSecretStatus["environment"],
+  variable: string,
+  value: string,
+): Promise<RuntimeSecretStatus> {
+  if (!isTauri()) {
+    writeDemoSecret(path, environment, variable);
+    return { environment, variable, stored: Boolean(value) };
+  }
+  return invoke<RuntimeSecretStatus>("store_runtime_secret", {
+    path,
+    environment,
+    variable,
+    value,
+  });
+}
+
+export async function generateRuntimeSecret(
+  path: string,
+  environment: RuntimeSecretStatus["environment"],
+  variable: string,
+): Promise<RuntimeSecretStatus> {
+  if (!isTauri()) {
+    writeDemoSecret(path, environment, variable);
+    return { environment, variable, stored: true };
+  }
+  return invoke<RuntimeSecretStatus>("generate_runtime_secret", {
+    path,
+    environment,
+    variable,
+  });
+}
+
+export async function prepareCnbSecretBundle(
+  path: string,
+  environment: RuntimeSecretStatus["environment"],
+  secretRepository: string,
+  server: ServerForm,
+): Promise<CnbSecretBundle> {
+  if (!isTauri()) {
+    return {
+      environment,
+      filename: `env.${environment}.yml`,
+      fileUrl: `https://cnb.cool/${secretRepository}/-/blob/main/env.${environment}.yml`,
+      content: `# ABCDeploy demo\n${environment.toUpperCase()}_SERVER_HOST: ${server.host}\n`,
+      missingVariables: [],
+      deployKeyFingerprint: "SHA256:DemoDeployIdentity",
+    };
+  }
+  return invoke<CnbSecretBundle>("prepare_cnb_secret_bundle", {
+    path,
+    environment,
+    secretRepository,
+    server,
+  });
+}
+
+export async function rollbackEnvironment(
+  path: string,
+  environment: DeploymentRun["environment"],
+  server: ServerForm,
+): Promise<DeploymentRun> {
+  if (!isTauri()) {
+    const run = {
+      ...demoRun(path, environment),
+      status: "success" as const,
+      currentStage: "complete",
+      message: "已安全回滚到上一健康版本",
+      completedSteps: ["rollback", "healthcheck"],
+    };
+    writeDemoRun(run);
+    return run;
+  }
+  return invoke<DeploymentRun>("rollback_environment", {
+    path,
+    environment,
+    server,
+    confirmed: true,
+  });
+}
+
 export async function connectCnb(
   token: string,
   persist: boolean,
 ): Promise<CnbAccount> {
-  if (!isTauri()) return { connected: true, displayName: "示例用户" };
+  if (!isTauri()) {
+    return { connected: true, displayName: "示例用户", username: "demo" };
+  }
   return invoke("connect_cnb", { token, persist });
 }
 
 export async function getCnbAccount(): Promise<CnbAccount> {
-  if (!isTauri()) return { connected: false, displayName: "尚未连接" };
+  if (!isTauri()) {
+    return { connected: false, displayName: "尚未连接", username: "" };
+  }
   return invoke<CnbAccount>("get_cnb_account");
 }
 
@@ -290,6 +441,50 @@ export async function createCnbRepository(
     };
   }
   return invoke("create_cnb_repository", { ...input });
+}
+
+export async function ensureCnbRepository(
+  slug: string,
+  name: string,
+): Promise<CnbProjectSetup> {
+  if (!isTauri()) {
+    return { repository: `${slug}/${name}`, created: true };
+  }
+  return invoke<CnbProjectSetup>("ensure_cnb_repository", { slug, name });
+}
+
+export async function enableCnbAutoTrigger(
+  repository: string,
+): Promise<ProviderCheck> {
+  if (!isTauri()) {
+    return {
+      provider: "cnb-auto-trigger",
+      ok: true,
+      summary: "CNB 自动构建已开启",
+      details: [],
+    };
+  }
+  return invoke<ProviderCheck>("enable_cnb_auto_trigger", { repository });
+}
+
+export async function syncProjectToCnb(
+  path: string,
+  repository: string,
+  branch: string,
+): Promise<SourceSyncResult> {
+  if (!isTauri()) {
+    return {
+      repository,
+      branch,
+      commitSha: "0123456789abcdef0123456789abcdef01234567",
+      committed: true,
+    };
+  }
+  return invoke<SourceSyncResult>("sync_project_to_cnb", {
+    path,
+    repository,
+    branch,
+  });
 }
 
 export async function getSecretStatus(key: string): Promise<SecretStatus> {
@@ -324,9 +519,9 @@ const demoPreflight: SystemPreflight = {
       resolution: null,
     },
     {
-      name: "OpenSSH",
+      name: "内置安全连接",
       available: true,
-      version: "OpenSSH_10.2",
+      version: "ABCDeploy SSH",
       required_for: "安全连接目标服务器",
       resolution: null,
     },
@@ -349,6 +544,29 @@ const demoPreflight: SystemPreflight = {
 
 const DEMO_PROJECTS_KEY = "abcdeploy.demo.projects";
 const DEMO_RUNS_KEY = "abcdeploy.demo.runs";
+const DEMO_SECRETS_KEY = "abcdeploy.demo.secrets";
+
+function demoSecretId(path: string, environment: string, variable: string) {
+  return `${path}:${environment}:${variable}`;
+}
+
+function readDemoSecret(path: string, environment: string, variable: string) {
+  const values = JSON.parse(
+    localStorage.getItem(DEMO_SECRETS_KEY) ?? "[]",
+  ) as string[];
+  return values.includes(demoSecretId(path, environment, variable));
+}
+
+function writeDemoSecret(path: string, environment: string, variable: string) {
+  const values = JSON.parse(
+    localStorage.getItem(DEMO_SECRETS_KEY) ?? "[]",
+  ) as string[];
+  const id = demoSecretId(path, environment, variable);
+  localStorage.setItem(
+    DEMO_SECRETS_KEY,
+    JSON.stringify([...new Set([...values, id])]),
+  );
+}
 
 function readDemoProjects(): RecentProject[] {
   try {
@@ -374,7 +592,10 @@ function rememberDemoProject(path: string, workspace: WorkspacePreview) {
   };
   localStorage.setItem(
     DEMO_PROJECTS_KEY,
-    JSON.stringify([recent, ...projects.filter((project) => project.path !== path)]),
+    JSON.stringify([
+      recent,
+      ...projects.filter((project) => project.path !== path),
+    ]),
   );
 }
 
@@ -391,6 +612,10 @@ function demoRun(
     status: "running",
     currentStage: environment === "production" ? "deploy" : "build",
     buildSerial: `demo-${Date.now()}`,
+    commitSha: "0123456789abcdef0123456789abcdef01234567",
+    sourceRunId: null,
+    actionKind: null,
+    actionUrl: null,
     repository: "owner/ecat-energy",
     branch: "main",
     message:

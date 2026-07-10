@@ -70,6 +70,7 @@ export function ConnectionStep({
   const [cnb, setCnb] = useState<CnbAccount>({
     connected: false,
     displayName: "尚未连接",
+    username: "",
   });
   const [checkingCnb, setCheckingCnb] = useState(true);
   const [cnbDialog, setCnbDialog] = useState(false);

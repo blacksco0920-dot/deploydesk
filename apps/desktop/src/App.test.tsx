@@ -73,7 +73,7 @@ describe("ABCDeploy beginner flow", () => {
       ).toBeInTheDocument(),
     );
     fireEvent.click(screen.getByRole("checkbox"));
-    fireEvent.click(screen.getByRole("button", { name: "生成部署配置" }));
+    fireEvent.click(screen.getByRole("button", { name: "开始部署测试" }));
 
     await waitFor(() =>
       expect(

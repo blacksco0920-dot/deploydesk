@@ -131,6 +131,9 @@ export function DeploymentProgress({
             <p className="m-0">CNB 仓库：{run.repository}</p>
             <p className="m-0">发布分支：{run.branch}</p>
             <p className="m-0">构建编号：{run.buildSerial ?? "等待 CNB 返回"}</p>
+            <p className="m-0">
+              提交版本：{run.commitSha?.slice(0, 12) ?? "等待 CNB 返回"}
+            </p>
           </div>
         </details>
         <div className="flex items-center gap-2">

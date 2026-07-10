@@ -26,7 +26,7 @@ $:
       script:
       - |-
         set -eu
-        IMAGE_TAG="sha-${CNB_COMMIT_SHORT}"
+        IMAGE_TAG="sha-${CNB_COMMIT}"
         RELEASE_TAG="verified-${IMAGE_TAG}"
         RUNTIME_DIRECTORY='.deploydesk/runtime/production'
         rm -rf "$RUNTIME_DIRECTORY"
@@ -164,7 +164,7 @@ $:
     - name: 构建并上传 api
       script:
       - |-
-        IMAGE_TAG="sha-${CNB_COMMIT_SHORT}"
+        IMAGE_TAG="sha-${CNB_COMMIT}"
         IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-api'
         IMAGE_REFERENCE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
         docker build --file 'apps/api/Dockerfile' --tag "$IMAGE_REFERENCE" '.'
@@ -172,7 +172,7 @@ $:
     - name: 构建并上传 web
       script:
       - |-
-        IMAGE_TAG="sha-${CNB_COMMIT_SHORT}"
+        IMAGE_TAG="sha-${CNB_COMMIT}"
         IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-web'
         IMAGE_REFERENCE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
         docker build --file 'apps/web/Dockerfile' --tag "$IMAGE_REFERENCE" '.'
@@ -181,7 +181,7 @@ $:
       script:
       - |-
         set -eu
-        IMAGE_TAG="sha-${CNB_COMMIT_SHORT}"
+        IMAGE_TAG="sha-${CNB_COMMIT}"
         RELEASE_TAG="$IMAGE_TAG"
         RUNTIME_DIRECTORY='.deploydesk/runtime/staging'
         rm -rf "$RUNTIME_DIRECTORY"
@@ -292,7 +292,7 @@ $:
       script:
       - |-
         set -eu
-        IMAGE_TAG="sha-${CNB_COMMIT_SHORT}"
+        IMAGE_TAG="sha-${CNB_COMMIT}"
         VERIFIED_TAG="verified-${IMAGE_TAG}"
         IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-api'
         IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
@@ -338,7 +338,7 @@ main:
     - name: 构建并上传 api
       script:
       - |-
-        IMAGE_TAG="sha-${CNB_COMMIT_SHORT}"
+        IMAGE_TAG="sha-${CNB_COMMIT}"
         IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-api'
         IMAGE_REFERENCE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
         docker build --file 'apps/api/Dockerfile' --tag "$IMAGE_REFERENCE" '.'
@@ -346,7 +346,7 @@ main:
     - name: 构建并上传 web
       script:
       - |-
-        IMAGE_TAG="sha-${CNB_COMMIT_SHORT}"
+        IMAGE_TAG="sha-${CNB_COMMIT}"
         IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-web'
         IMAGE_REFERENCE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
         docker build --file 'apps/web/Dockerfile' --tag "$IMAGE_REFERENCE" '.'
@@ -355,7 +355,7 @@ main:
       script:
       - |-
         set -eu
-        IMAGE_TAG="sha-${CNB_COMMIT_SHORT}"
+        IMAGE_TAG="sha-${CNB_COMMIT}"
         RELEASE_TAG="$IMAGE_TAG"
         RUNTIME_DIRECTORY='.deploydesk/runtime/staging'
         rm -rf "$RUNTIME_DIRECTORY"
@@ -466,7 +466,7 @@ main:
       script:
       - |-
         set -eu
-        IMAGE_TAG="sha-${CNB_COMMIT_SHORT}"
+        IMAGE_TAG="sha-${CNB_COMMIT}"
         VERIFIED_TAG="verified-${IMAGE_TAG}"
         IMAGE_REPOSITORY='docker.cnb.cool/owner/deploydesk-hello-fullstack/deploydesk-hello-fullstack-api'
         IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"

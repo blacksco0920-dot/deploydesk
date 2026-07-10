@@ -9,6 +9,7 @@ import {
   History,
   Home,
   RefreshCw,
+  RotateCcw,
   Rocket,
   Server,
   Settings,
@@ -56,6 +57,7 @@ interface WorkspaceShellProps {
   onForget: () => void;
   onHome: () => void;
   onPromote: (run: DeploymentRun) => void;
+  onRollback: (environment: DeploymentRun["environment"]) => void;
   onRefresh: () => void;
   runs: DeploymentRun[];
 }
@@ -68,11 +70,15 @@ export function WorkspaceShell({
   onForget,
   onHome,
   onPromote,
+  onRollback,
   onRefresh,
   runs,
 }: WorkspaceShellProps) {
   const [active, setActive] = useState<WorkspaceSection>("project");
   const [confirmForget, setConfirmForget] = useState(false);
+  const [rollbackTarget, setRollbackTarget] = useState<
+    DeploymentRun["environment"] | null
+  >(null);
 
   return (
     <TooltipProvider delayDuration={350}>
@@ -179,7 +185,12 @@ export function WorkspaceShell({
           <main className="min-h-0 overflow-auto">
             <div className="mx-auto w-full max-w-[980px] px-6 py-8">
               {active === "project" ? (
-                <ProjectView onPromote={onPromote} runs={runs} workspace={workspace} />
+                <ProjectView
+                  onPromote={onPromote}
+                  onRollback={setRollbackTarget}
+                  runs={runs}
+                  workspace={workspace}
+                />
               ) : null}
               {active === "deployments" ? (
                 <DeploymentsView runs={runs} workspace={workspace} />
@@ -219,21 +230,59 @@ export function WorkspaceShell({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <Dialog
+        onOpenChange={(open) => !open && setRollbackTarget(null)}
+        open={Boolean(rollbackTarget)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              回滚{rollbackTarget === "production" ? "生产" : "测试"}环境？
+            </DialogTitle>
+            <DialogDescription>
+              将恢复上一健康版本的镜像摘要。数据库、运行配置、域名和其他环境不会改变；旧版本启动失败时会恢复当前版本。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button onClick={() => setRollbackTarget(null)} variant="secondary">
+              取消
+            </Button>
+            <Button
+              onClick={() => {
+                if (rollbackTarget) onRollback(rollbackTarget);
+                setRollbackTarget(null);
+              }}
+            >
+              <RotateCcw />
+              确认回滚{rollbackTarget === "production" ? "生产" : "测试"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </TooltipProvider>
   );
 }
 
 function ProjectView({
   onPromote,
+  onRollback,
   runs,
   workspace,
 }: {
   onPromote: (run: DeploymentRun) => void;
+  onRollback: (environment: DeploymentRun["environment"]) => void;
   runs: DeploymentRun[];
   workspace: WorkspacePreview;
 }) {
   const staging = runs.find((run) => run.environment === "staging");
   const production = runs.find((run) => run.environment === "production");
+  const stagingHistory = runs.filter(
+    (run) => run.environment === "staging" && run.status === "success",
+  ).length;
+  const productionHistory = runs.filter(
+    (run) => run.environment === "production" && run.status === "success",
+  ).length;
   return (
     <div>
       <div className="mb-8 flex items-start justify-between gap-5">
@@ -260,16 +309,39 @@ function ProjectView({
 
       <section className="grid gap-px overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--border)] sm:grid-cols-2">
         <EnvironmentSummary
+          action={
+            staging?.status === "success" && stagingHistory >= 2 ? (
+              <Button
+                onClick={() => onRollback("staging")}
+                size="sm"
+                variant="ghost"
+              >
+                <RotateCcw />
+                回滚
+              </Button>
+            ) : null
+          }
           description={staging?.message ?? "等待首次部署"}
           name="测试环境"
           status={runStatus(staging)}
         />
         <EnvironmentSummary
           action={
-            staging?.status === "success" && production?.status !== "success" ? (
+            staging?.status === "success" &&
+            staging.commitSha &&
+            production?.status !== "success" ? (
               <Button onClick={() => onPromote(staging)} size="sm" variant="secondary">
                 <Rocket />
                 发布生产
+              </Button>
+            ) : production?.status === "success" && productionHistory >= 2 ? (
+              <Button
+                onClick={() => onRollback("production")}
+                size="sm"
+                variant="ghost"
+              >
+                <RotateCcw />
+                回滚
               </Button>
             ) : null
           }
