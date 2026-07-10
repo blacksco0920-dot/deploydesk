@@ -206,6 +206,7 @@ pnpm dev
 
 ## 文档
 
+- [V2 产品定义与可点击原型](docs/v2/README.md)
 - [架构设计](docs/architecture.md)
 - [分支、环境与镜像晋级](docs/deployment-model.md)
 - [Ecat 只读验证记录](docs/ecat-verification.md)
