@@ -137,6 +137,10 @@ $:
           docker network connect '"'"'deploydesk-abcdeploy-production'"'"' deploydesk-caddy 2>/dev/null || true
           docker exec deploydesk-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
           docker exec deploydesk-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+        elif docker inspect infra-caddy >/dev/null 2>&1; then
+          docker network connect '"'"'deploydesk-abcdeploy-production'"'"' infra-caddy 2>/dev/null || true
+          docker exec infra-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker exec infra-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
         else
           echo '"'"'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 ABCDeploy Caddy。'"'"'
         fi'
@@ -290,6 +294,9 @@ $:
           docker network connect '"'"'deploydesk-abcdeploy-staging'"'"' deploydesk-caddy 2>/dev/null || true
           docker exec deploydesk-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
           docker exec deploydesk-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+        elif docker inspect infra-caddy >/dev/null 2>&1; then
+          docker network connect '"'"'deploydesk-abcdeploy-staging'"'"' infra-caddy 2>/dev/null || true
+          docker exec infra-caddy wget -q --spider http://abcdeploy-staging-site:80/
         else
           echo '"'"'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 ABCDeploy Caddy。'"'"'
         fi'
@@ -456,6 +463,9 @@ main:
           docker network connect '"'"'deploydesk-abcdeploy-staging'"'"' deploydesk-caddy 2>/dev/null || true
           docker exec deploydesk-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
           docker exec deploydesk-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+        elif docker inspect infra-caddy >/dev/null 2>&1; then
+          docker network connect '"'"'deploydesk-abcdeploy-staging'"'"' infra-caddy 2>/dev/null || true
+          docker exec infra-caddy wget -q --spider http://abcdeploy-staging-site:80/
         else
           echo '"'"'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 ABCDeploy Caddy。'"'"'
         fi'
