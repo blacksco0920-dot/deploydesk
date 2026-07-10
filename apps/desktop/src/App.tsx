@@ -1,100 +1,154 @@
-import {
-  CheckCircle2,
-  FolderOpen,
-  LoaderCircle,
-  RefreshCw,
-  X,
-} from "lucide-react";
 import { isTauri } from "@tauri-apps/api/core";
-import { useEffect, useRef, useState } from "react";
-import { parseDocument } from "yaml";
+import { ArrowRight, LoaderCircle } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Toaster, toast } from "sonner";
 import {
   applyManifest,
+  forgetProject,
   getPreflight,
+  listRecentProjects,
   openProject,
   previewManifest,
+  saveProjectStep,
   selectProjectDirectory,
 } from "./api";
-import { ConnectionsPanel } from "./components/ConnectionsPanel";
-import { EnvironmentEditor } from "./components/EnvironmentEditor";
-import { PlanPanel } from "./components/PlanPanel";
-import { ProjectOverview } from "./components/ProjectOverview";
-import { Sidebar } from "./components/Sidebar";
-import { WelcomePanel } from "./components/WelcomePanel";
+import { ProjectHome } from "./components/ProjectHome";
+import { WorkspaceShell } from "./components/WorkspaceShell";
+import { ConnectionStep } from "./components/onboarding/ConnectionStep";
+import { InspectionStep } from "./components/onboarding/InspectionStep";
+import { OnboardingLayout } from "./components/onboarding/OnboardingLayout";
+import { RecommendationStep } from "./components/onboarding/RecommendationStep";
+import { RequirementsStep } from "./components/onboarding/RequirementsStep";
+import { ReviewStep } from "./components/onboarding/ReviewStep";
+import { Button } from "./components/ui/button";
 import type {
-  ApplyResult,
-  NavigationSection,
+  OnboardingStep,
+  RecentProject,
+  ServerForm,
   SystemPreflight,
   WorkspacePreview,
 } from "./types";
-import "./App.css";
 
-const sectionNames: Record<NavigationSection, string> = {
-  overview: "项目识别",
-  environments: "环境配置",
-  connections: "服务连接",
-  plan: "部署计划",
-};
+type AppScreen = "home" | "onboarding" | "workspace";
+
+const onboardingSteps: OnboardingStep[] = [
+  "inspection",
+  "connections",
+  "recommendation",
+  "requirements",
+  "review",
+];
 
 function App() {
-  const mainContentRef = useRef<HTMLElement>(null);
-  const [active, setActive] = useState<NavigationSection>("overview");
+  const [screen, setScreen] = useState<AppScreen>("home");
+  const [step, setStep] = useState<OnboardingStep>("inspection");
   const [preflight, setPreflight] = useState<SystemPreflight | null>(null);
+  const [projects, setProjects] = useState<RecentProject[]>([]);
   const [workspace, setWorkspace] = useState<WorkspacePreview | null>(null);
   const [projectPath, setProjectPath] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [applying, setApplying] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [applyResult, setApplyResult] = useState<ApplyResult | null>(null);
+  const [connectionsReady, setConnectionsReady] = useState(false);
+  const [lastServer, setLastServer] = useState<ServerForm | undefined>();
 
-  useEffect(() => {
-    getPreflight()
-      .then(setPreflight)
-      .catch((reason) => setError(toMessage(reason)));
+  const reportError = useCallback((message: string) => {
+    toast.error(message, { duration: 7000 });
   }, []);
 
+  const handleConnectionState = useCallback(
+    (state: { cnb: boolean; server: boolean; serverForm: ServerForm }) => {
+      setConnectionsReady(state.cnb && state.server);
+      setLastServer(state.serverForm);
+    },
+    [],
+  );
+
+  const refreshProjects = useCallback(async () => {
+    const recent = await listRecentProjects();
+    setProjects(recent);
+    return recent;
+  }, []);
+
+  const loadProject = useCallback(
+    async (path: string, resumeStep: OnboardingStep = "inspection") => {
+      setLoading(true);
+      try {
+        const result = await openProject(path);
+        setWorkspace(result);
+        setProjectPath(path);
+        setStep(resumeStep);
+        setScreen(resumeStep === "workspace" ? "workspace" : "onboarding");
+        await refreshProjects();
+      } catch (error) {
+        reportError(toMessage(error));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [refreshProjects, reportError],
+  );
+
   useEffect(() => {
-    if (mainContentRef.current) mainContentRef.current.scrollTop = 0;
-  }, [active]);
+    let active = true;
+    Promise.all([getPreflight(), listRecentProjects()])
+      .then(async ([system, recent]) => {
+        if (!active) return;
+        setPreflight(system);
+        setProjects(recent);
+        if (recent.length === 1 && recent[0].pathExists) {
+          await loadProject(recent[0].path, recent[0].currentStep);
+        }
+      })
+      .catch((error) => reportError(toMessage(error)))
+      .finally(() => active && setLoading(false));
+    return () => {
+      active = false;
+    };
+  }, [loadProject, reportError]);
 
   async function selectProject() {
-    setError(null);
     const selected = await selectProjectDirectory();
-    if (!selected) return;
-    await loadProject(selected);
+    if (selected) await loadProject(selected);
   }
 
-  async function loadProject(path: string) {
-    setLoading(true);
-    setError(null);
-    setNotice(null);
-    setApplyResult(null);
+  async function forgetRecent(project: RecentProject) {
     try {
-      const result = await openProject(path);
-      setWorkspace(result);
-      setProjectPath(path);
-      setActive("overview");
-      if (mainContentRef.current) mainContentRef.current.scrollTop = 0;
-    } catch (reason) {
-      setError(toMessage(reason));
-    } finally {
-      setLoading(false);
+      await forgetProject(project.path);
+      await refreshProjects();
+      if (project.path === projectPath) {
+        setWorkspace(null);
+        setProjectPath("");
+        setScreen("home");
+      }
+      toast.success("已移除本机项目记录");
+    } catch (error) {
+      reportError(toMessage(error));
     }
   }
 
-  async function updateManifest(manifestYaml: string): Promise<boolean> {
+  async function goToStep(next: OnboardingStep) {
+    if (!projectPath) return;
+    try {
+      await saveProjectStep(projectPath, next);
+      setStep(next);
+      setScreen(next === "workspace" ? "workspace" : "onboarding");
+      await refreshProjects();
+    } catch (error) {
+      reportError(toMessage(error));
+    }
+  }
+
+  async function updateManifest(manifestYaml: string) {
     if (!projectPath) return false;
     setSaving(true);
-    setError(null);
     try {
       const result = await previewManifest(projectPath, manifestYaml);
       setWorkspace(result);
-      setNotice("环境配置已更新，部署计划已重新计算。");
+      toast.success("推荐方案已更新");
       return true;
-    } catch (reason) {
-      setError(toMessage(reason));
+    } catch (error) {
+      reportError(toMessage(error));
       return false;
     } finally {
       setSaving(false);
@@ -104,141 +158,143 @@ function App() {
   async function applyCurrentPlan() {
     if (!workspace || !projectPath) return;
     setApplying(true);
-    setError(null);
     try {
       const result = await applyManifest(projectPath, workspace.manifestYaml);
-      setApplyResult(result);
       const refreshed = await openProject(projectPath);
       setWorkspace(refreshed);
-      setNotice("部署配置已写入，原文件已自动备份。");
-    } catch (reason) {
-      setError(toMessage(reason));
+      await saveProjectStep(projectPath, "workspace");
+      setStep("workspace");
+      setScreen("workspace");
+      await refreshProjects();
+      toast.success(`部署配置已生成，共更新 ${result.writtenFiles.length} 个文件`);
+    } catch (error) {
+      reportError(toMessage(error));
     } finally {
       setApplying(false);
     }
   }
 
-  async function selectCnbRepository(repository: string) {
-    if (!workspace) throw new Error("请先选择本地项目");
-    const document = parseDocument(workspace.manifestYaml);
-    document.setIn(["providers", "build", "repository"], repository);
-    if (document.getIn(["providers", "registry", "kind"]) === "cnb") {
-      document.setIn(["providers", "registry", "repository"], repository);
-    }
-    const updated = await updateManifest(document.toString({ lineWidth: 0 }));
-    if (!updated) {
-      throw new Error(
-        `仓库 ${repository} 已创建，但部署计划未能更新，请在环境配置中手动选择`,
-      );
+  function backStep() {
+    const index = onboardingSteps.indexOf(step);
+    if (index > 0) void goToStep(onboardingSteps[index - 1]);
+  }
+
+  function nextStep() {
+    const index = onboardingSteps.indexOf(step);
+    if (index >= 0 && index < onboardingSteps.length - 1) {
+      void goToStep(onboardingSteps[index + 1]);
     }
   }
 
-  function renderContent() {
-    if (!workspace) {
-      return (
-        <WelcomePanel
-          loading={loading}
-          onDemo={() => loadProject("/demo/ecat-energy")}
-          onSelect={selectProject}
-          showDemo={!isTauri()}
-        />
+  function renderOnboarding() {
+    if (!workspace) return null;
+    const footer =
+      step === "review" ? (
+        <span className="text-xs text-[var(--muted-foreground)]">
+          请在上方确认变更
+        </span>
+      ) : (
+        <Button
+          disabled={step === "connections" && !connectionsReady}
+          onClick={nextStep}
+        >
+          {step === "inspection"
+            ? "结果正确，继续"
+            : step === "connections"
+              ? "使用这些连接"
+              : step === "recommendation"
+                ? "使用推荐方案"
+                : "查看部署计划"}
+          <ArrowRight />
+        </Button>
       );
-    }
-    switch (active) {
-      case "overview":
-        return <ProjectOverview workspace={workspace} />;
-      case "environments":
-        return (
-          <EnvironmentEditor
-            onSave={updateManifest}
+
+    return (
+      <OnboardingLayout
+        footer={footer}
+        onBack={step === "inspection" ? undefined : backStep}
+        onClose={() => setScreen("home")}
+        projectName={workspace.inspection.project_name}
+        step={step}
+      >
+        {step === "inspection" ? <InspectionStep workspace={workspace} /> : null}
+        {step === "connections" ? (
+          <ConnectionStep
+            initialServer={lastServer}
+            onError={reportError}
+            onStateChange={handleConnectionState}
+          />
+        ) : null}
+        {step === "recommendation" ? (
+          <RecommendationStep workspace={workspace} />
+        ) : null}
+        {step === "requirements" ? (
+          <RequirementsStep
+            onError={reportError}
+            onUpdate={updateManifest}
             saving={saving}
             workspace={workspace}
           />
-        );
-      case "connections":
-        return (
-          <ConnectionsPanel
-            onError={setError}
-            onRepositorySelected={selectCnbRepository}
-          />
-        );
-      case "plan":
-        return (
-          <PlanPanel
+        ) : null}
+        {step === "review" ? (
+          <ReviewStep
             applying={applying}
-            applyResult={applyResult}
             onApply={applyCurrentPlan}
             workspace={workspace}
           />
-        );
-    }
+        ) : null}
+      </OnboardingLayout>
+    );
   }
 
   return (
-    <div className="app-shell">
-      <Sidebar
-        active={active}
-        hasWorkspace={Boolean(workspace)}
-        onChange={setActive}
-        preflight={preflight}
-      />
-      <div className="workspace-shell">
-        <header className="topbar">
-          <div className="breadcrumb">
-            <span>{workspace?.inspection.project_name ?? "工作区"}</span>
-            <span>/</span>
-            <strong>{sectionNames[active]}</strong>
-          </div>
-          <div className="topbar-actions">
-            {workspace ? (
-              <button
-                className="icon-action"
-                onClick={() => loadProject(projectPath)}
-                title="重新识别项目"
-                type="button"
-              >
-                <RefreshCw size={17} />
-              </button>
-            ) : null}
-            <button
-              className="secondary-action compact"
-              onClick={selectProject}
-              type="button"
-            >
-              <FolderOpen size={16} />
-              {workspace ? "切换项目" : "选择项目"}
-            </button>
-          </div>
-        </header>
-        <main className="main-content" ref={mainContentRef}>
-          {renderContent()}
-        </main>
-      </div>
+    <>
+      {screen === "home" ? (
+        <ProjectHome
+          loading={loading}
+          onDemo={() => loadProject("/demo/ecat-energy")}
+          onForget={forgetRecent}
+          onOpen={(project) => loadProject(project.path, project.currentStep)}
+          onSelect={selectProject}
+          preflight={preflight}
+          projects={projects}
+          showDemo={!isTauri()}
+        />
+      ) : null}
 
-      {loading ? (
-        <div className="loading-layer" role="status">
-          <LoaderCircle className="spin" size={25} />
-          <span>正在只读识别项目</span>
+      {screen === "onboarding" ? renderOnboarding() : null}
+
+      {screen === "workspace" && workspace ? (
+        <WorkspaceShell
+          onDeploy={() => goToStep("review")}
+          onForget={() => {
+            const current = projects.find((project) => project.path === projectPath);
+            if (current) void forgetRecent(current);
+          }}
+          onHome={() => setScreen("home")}
+          onRefresh={() => loadProject(projectPath, "workspace")}
+          path={projectPath}
+          preflight={preflight}
+          workspace={workspace}
+        />
+      ) : null}
+
+      {loading && screen !== "home" ? (
+        <div className="fixed inset-0 z-[100] grid place-items-center bg-[var(--background)]/80 backdrop-blur-sm">
+          <div className="flex items-center gap-2 text-sm text-[var(--muted-foreground)]">
+            <LoaderCircle className="size-5 animate-spin-slow" />
+            正在只读识别项目
+          </div>
         </div>
       ) : null}
-      {error ? (
-        <div className="toast error-toast" role="alert">
-          <span>{error}</span>
-          <button onClick={() => setError(null)} title="关闭" type="button">
-            <X size={16} />
-          </button>
-        </div>
-      ) : null}
-      {notice ? (
-        <div className="toast success-toast" role="status">
-          <CheckCircle2 size={17} />
-          <span>{notice}</span>
-          <button onClick={() => setNotice(null)} title="关闭" type="button">
-            <X size={16} />
-          </button>
-        </div>
-      ) : null}
-    </div>
+
+      <Toaster
+        closeButton
+        position="top-right"
+        richColors
+        toastOptions={{ duration: 4500 }}
+      />
+    </>
   );
 }
 

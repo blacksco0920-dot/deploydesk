@@ -4,8 +4,14 @@ import type {
   ApplyResult,
   CnbRepositoryInput,
   CnbRepositoryResult,
+  CnbAccount,
+  OnboardingStep,
   ProviderCheck,
+  RecentProject,
   ServerForm,
+  SecretStatus,
+  GeneratedSshIdentity,
+  SshIdentity,
   SystemPreflight,
   WorkspacePreview,
 } from "./types";
@@ -20,14 +26,43 @@ export async function selectProjectDirectory(): Promise<string | null> {
   return typeof selected === "string" ? selected : null;
 }
 
-export async function selectPrivateKey(): Promise<string | null> {
+export async function selectPrivateKey(
+  defaultPath?: string,
+): Promise<string | null> {
   if (!isTauri()) return null;
   const selected = await open({
+    defaultPath,
     directory: false,
     multiple: false,
     title: "选择 SSH 私钥",
   });
   return typeof selected === "string" ? selected : null;
+}
+
+export async function discoverSshIdentities(): Promise<SshIdentity[]> {
+  if (!isTauri()) {
+    return [
+      {
+        name: "abcdeploy_ed25519",
+        path: "/Users/demo/.ssh/abcdeploy_ed25519",
+        source: "ABCDeploy 专用身份",
+        fingerprint: "SHA256:ABCDeployDemoIdentity",
+        managed: true,
+      },
+    ];
+  }
+  return invoke<SshIdentity[]>("discover_ssh_identities");
+}
+
+export async function generateSshIdentity(): Promise<GeneratedSshIdentity> {
+  if (!isTauri()) {
+    return {
+      identity: (await discoverSshIdentities())[0],
+      publicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDemo abcdeploy",
+      created: true,
+    };
+  }
+  return invoke<GeneratedSshIdentity>("generate_ssh_identity");
 }
 
 export async function getPreflight(): Promise<SystemPreflight> {
@@ -36,8 +71,41 @@ export async function getPreflight(): Promise<SystemPreflight> {
 }
 
 export async function openProject(path: string): Promise<WorkspacePreview> {
-  if (!isTauri()) return demoWorkspace(path);
+  if (!isTauri()) {
+    const workspace = demoWorkspace(path);
+    rememberDemoProject(path, workspace);
+    return workspace;
+  }
   return invoke<WorkspacePreview>("open_project", { path });
+}
+
+export async function listRecentProjects(): Promise<RecentProject[]> {
+  if (!isTauri()) return readDemoProjects();
+  return invoke<RecentProject[]>("list_recent_projects");
+}
+
+export async function saveProjectStep(
+  path: string,
+  step: OnboardingStep,
+): Promise<void> {
+  if (!isTauri()) {
+    const projects = readDemoProjects().map((project) =>
+      project.path === path ? { ...project, currentStep: step } : project,
+    );
+    localStorage.setItem(DEMO_PROJECTS_KEY, JSON.stringify(projects));
+    return;
+  }
+  return invoke("save_project_step", { path, step });
+}
+
+export async function forgetProject(path: string): Promise<boolean> {
+  if (!isTauri()) {
+    const projects = readDemoProjects();
+    const remaining = projects.filter((project) => project.path !== path);
+    localStorage.setItem(DEMO_PROJECTS_KEY, JSON.stringify(remaining));
+    return remaining.length !== projects.length;
+  }
+  return invoke<boolean>("forget_project", { path });
 }
 
 export async function previewManifest(
@@ -120,9 +188,14 @@ export async function bootstrapServerCaddy(
 export async function connectCnb(
   token: string,
   persist: boolean,
-): Promise<{ connected: boolean; displayName: string }> {
+): Promise<CnbAccount> {
   if (!isTauri()) return { connected: true, displayName: "示例用户" };
   return invoke("connect_cnb", { token, persist });
+}
+
+export async function getCnbAccount(): Promise<CnbAccount> {
+  if (!isTauri()) return { connected: false, displayName: "尚未连接" };
+  return invoke<CnbAccount>("get_cnb_account");
 }
 
 export async function createCnbRepository(
@@ -135,6 +208,24 @@ export async function createCnbRepository(
     };
   }
   return invoke("create_cnb_repository", { ...input });
+}
+
+export async function getSecretStatus(key: string): Promise<SecretStatus> {
+  if (!isTauri()) return { key, stored: false };
+  return invoke<SecretStatus>("secret_status", { key });
+}
+
+export async function storeSecret(
+  key: string,
+  value: string,
+): Promise<SecretStatus> {
+  if (!isTauri()) return { key, stored: Boolean(value) };
+  return invoke<SecretStatus>("store_secret", { key, value });
+}
+
+export async function deleteSecret(key: string): Promise<SecretStatus> {
+  if (!isTauri()) return { key, stored: false };
+  return invoke<SecretStatus>("delete_secret", { key });
 }
 
 const demoPreflight: SystemPreflight = {
@@ -173,6 +264,36 @@ const demoPreflight: SystemPreflight = {
     },
   ],
 };
+
+const DEMO_PROJECTS_KEY = "abcdeploy.demo.projects";
+
+function readDemoProjects(): RecentProject[] {
+  try {
+    const raw = localStorage.getItem(DEMO_PROJECTS_KEY);
+    return raw ? (JSON.parse(raw) as RecentProject[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function rememberDemoProject(path: string, workspace: WorkspacePreview) {
+  const projects = readDemoProjects();
+  const previous = projects.find((project) => project.path === path);
+  const recent: RecentProject = {
+    id: previous?.id ?? `demo-${workspace.inspection.project_name}`,
+    path,
+    name: workspace.inspection.project_name,
+    currentStep: previous?.currentStep ?? "inspection",
+    manifestExists: workspace.manifestExists,
+    serviceCount: workspace.inspection.services.length,
+    lastOpenedAt: new Date().toISOString(),
+    pathExists: true,
+  };
+  localStorage.setItem(
+    DEMO_PROJECTS_KEY,
+    JSON.stringify([recent, ...projects.filter((project) => project.path !== path)]),
+  );
+}
 
 function demoWorkspace(path: string): WorkspacePreview {
   return {

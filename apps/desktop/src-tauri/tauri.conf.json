@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "DeployDesk",
+  "productName": "ABCDeploy",
   "version": "0.1.0",
-  "identifier": "com.deploydesk.desktop",
+  "identifier": "cloud.finagent.abcdeploy",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "DeployDesk",
+        "title": "ABCDeploy 小白部署",
         "width": 1180,
         "height": 760,
         "minWidth": 960,
@@ -29,8 +29,8 @@
     "active": true,
     "targets": "all",
     "category": "DeveloperTool",
-    "shortDescription": "引导式容器化部署工作台",
-    "longDescription": "从项目识别、环境配置到 CNB 构建、服务器部署和回滚的本地优先工作台。",
+    "shortDescription": "面向编程新手的企业级部署工具",
+    "longDescription": "自动识别项目并引导完成容器构建、测试环境、生产发布、HTTPS 和回滚。",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

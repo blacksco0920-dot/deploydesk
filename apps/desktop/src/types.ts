@@ -153,10 +153,40 @@ export interface CnbRepositoryResult {
   visibility: "private" | "public";
 }
 
+export interface CnbAccount {
+  connected: boolean;
+  displayName: string;
+}
+
+export interface SecretStatus {
+  key: string;
+  stored: boolean;
+}
+
 export interface ApplyResult {
   planId: string;
   writtenFiles: string[];
   backupDirectory: string;
+}
+
+export type OnboardingStep =
+  | "inspection"
+  | "connections"
+  | "recommendation"
+  | "requirements"
+  | "review"
+  | "deploying"
+  | "workspace";
+
+export interface RecentProject {
+  id: string;
+  path: string;
+  name: string;
+  currentStep: OnboardingStep;
+  manifestExists: boolean;
+  serviceCount: number;
+  lastOpenedAt: string;
+  pathExists: boolean;
 }
 
 export type NavigationSection =
@@ -168,4 +198,18 @@ export interface ServerForm {
   user: string;
   port: number;
   keyPath: string;
+}
+
+export interface SshIdentity {
+  name: string;
+  path: string;
+  source: string;
+  fingerprint: string | null;
+  managed: boolean;
+}
+
+export interface GeneratedSshIdentity {
+  identity: SshIdentity;
+  publicKey: string;
+  created: boolean;
 }
