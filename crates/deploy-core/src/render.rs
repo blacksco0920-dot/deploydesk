@@ -956,7 +956,7 @@ fn image_variable(service: &ServiceConfig) -> String {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
 
     use super::*;
     use crate::model::DomainRoute;
@@ -1034,7 +1034,13 @@ mod tests {
 
     #[test]
     fn generated_cnb_shell_is_syntax_valid_when_bash_is_available() {
-        if Command::new("bash").arg("--version").output().is_err() {
+        let bash_probe = Command::new("bash")
+            .arg("-n")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !matches!(bash_probe, Ok(status) if status.success()) {
             return;
         }
         let manifest = create_default_manifest(&inspection_fixture());
