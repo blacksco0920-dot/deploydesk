@@ -54,11 +54,11 @@ $:
         fs.writeFileSync(outputPath, `${lines.join("\n")}\n`, { mode: 0o600 });
         DEPLOYDESK_NODE
         DEPLOYDESK_API_IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-api'
-        DEPLOYDESK_API_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_API_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
+        DEPLOYDESK_API_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_API_IMAGE_REPOSITORY}:${RELEASE_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
         case "${DEPLOYDESK_API_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 api 的镜像摘要无效' >&2; exit 1 ;; esac
         DEPLOYDESK_API_IMAGE="${DEPLOYDESK_API_IMAGE_REPOSITORY}@${DEPLOYDESK_API_IMAGE_DIGEST}"
         DEPLOYDESK_WEB_IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-web'
-        DEPLOYDESK_WEB_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_WEB_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
+        DEPLOYDESK_WEB_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_WEB_IMAGE_REPOSITORY}:${RELEASE_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
         case "${DEPLOYDESK_WEB_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 web 的镜像摘要无效' >&2; exit 1 ;; esac
         DEPLOYDESK_WEB_IMAGE="${DEPLOYDESK_WEB_IMAGE_REPOSITORY}@${DEPLOYDESK_WEB_IMAGE_DIGEST}"
         {
@@ -209,11 +209,11 @@ $:
         fs.writeFileSync(outputPath, `${lines.join("\n")}\n`, { mode: 0o600 });
         DEPLOYDESK_NODE
         DEPLOYDESK_API_IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-api'
-        DEPLOYDESK_API_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_API_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
+        DEPLOYDESK_API_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_API_IMAGE_REPOSITORY}:${RELEASE_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
         case "${DEPLOYDESK_API_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 api 的镜像摘要无效' >&2; exit 1 ;; esac
         DEPLOYDESK_API_IMAGE="${DEPLOYDESK_API_IMAGE_REPOSITORY}@${DEPLOYDESK_API_IMAGE_DIGEST}"
         DEPLOYDESK_WEB_IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-web'
-        DEPLOYDESK_WEB_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_WEB_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
+        DEPLOYDESK_WEB_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_WEB_IMAGE_REPOSITORY}:${RELEASE_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
         case "${DEPLOYDESK_WEB_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 web 的镜像摘要无效' >&2; exit 1 ;; esac
         DEPLOYDESK_WEB_IMAGE="${DEPLOYDESK_WEB_IMAGE_REPOSITORY}@${DEPLOYDESK_WEB_IMAGE_DIGEST}"
         {
@@ -295,16 +295,16 @@ $:
         IMAGE_TAG="sha-${CNB_COMMIT}"
         VERIFIED_TAG="verified-${IMAGE_TAG}"
         IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-api'
-        IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
+        IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
         case "$IMAGE_DIGEST" in sha256:*) ;; *) echo '镜像摘要解析失败' >&2; exit 1 ;; esac
         docker buildx imagetools create --prefer-index=false --tag "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
-        VERIFIED_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" --format '{{.Manifest.Digest}}')"
+        VERIFIED_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
         test "$VERIFIED_DIGEST" = "$IMAGE_DIGEST"
         IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-web'
-        IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
+        IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
         case "$IMAGE_DIGEST" in sha256:*) ;; *) echo '镜像摘要解析失败' >&2; exit 1 ;; esac
         docker buildx imagetools create --prefer-index=false --tag "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
-        VERIFIED_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" --format '{{.Manifest.Digest}}')"
+        VERIFIED_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
         test "$VERIFIED_DIGEST" = "$IMAGE_DIGEST"
 main:
   push:
@@ -383,11 +383,11 @@ main:
         fs.writeFileSync(outputPath, `${lines.join("\n")}\n`, { mode: 0o600 });
         DEPLOYDESK_NODE
         DEPLOYDESK_API_IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-api'
-        DEPLOYDESK_API_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_API_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
+        DEPLOYDESK_API_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_API_IMAGE_REPOSITORY}:${RELEASE_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
         case "${DEPLOYDESK_API_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 api 的镜像摘要无效' >&2; exit 1 ;; esac
         DEPLOYDESK_API_IMAGE="${DEPLOYDESK_API_IMAGE_REPOSITORY}@${DEPLOYDESK_API_IMAGE_DIGEST}"
         DEPLOYDESK_WEB_IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-web'
-        DEPLOYDESK_WEB_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_WEB_IMAGE_REPOSITORY}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
+        DEPLOYDESK_WEB_IMAGE_DIGEST="$(docker buildx imagetools inspect "${DEPLOYDESK_WEB_IMAGE_REPOSITORY}:${RELEASE_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
         case "${DEPLOYDESK_WEB_IMAGE_DIGEST}" in sha256:*) ;; *) echo '服务 web 的镜像摘要无效' >&2; exit 1 ;; esac
         DEPLOYDESK_WEB_IMAGE="${DEPLOYDESK_WEB_IMAGE_REPOSITORY}@${DEPLOYDESK_WEB_IMAGE_DIGEST}"
         {
@@ -469,14 +469,14 @@ main:
         IMAGE_TAG="sha-${CNB_COMMIT}"
         VERIFIED_TAG="verified-${IMAGE_TAG}"
         IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-api'
-        IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
+        IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
         case "$IMAGE_DIGEST" in sha256:*) ;; *) echo '镜像摘要解析失败' >&2; exit 1 ;; esac
         docker buildx imagetools create --prefer-index=false --tag "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
-        VERIFIED_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" --format '{{.Manifest.Digest}}')"
+        VERIFIED_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
         test "$VERIFIED_DIGEST" = "$IMAGE_DIGEST"
         IMAGE_REPOSITORY='docker.cnb.cool/owner/abcdeploy-hello-fullstack/abcdeploy-hello-fullstack-web'
-        IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
+        IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${IMAGE_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
         case "$IMAGE_DIGEST" in sha256:*) ;; *) echo '镜像摘要解析失败' >&2; exit 1 ;; esac
         docker buildx imagetools create --prefer-index=false --tag "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
-        VERIFIED_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" --format '{{.Manifest.Digest}}')"
+        VERIFIED_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
         test "$VERIFIED_DIGEST" = "$IMAGE_DIGEST"

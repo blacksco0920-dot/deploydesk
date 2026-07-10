@@ -487,6 +487,12 @@ fn build_script(manifest: &ProjectManifest, service: &ServiceConfig) -> String {
     )
 }
 
+fn image_digest_expression(reference: &str) -> String {
+    format!(
+        "$(docker buildx imagetools inspect {reference} | awk '$1 == \"Digest:\" && $2 ~ /^sha256:/ {{ print $2; exit }}')"
+    )
+}
+
 fn promote_script(manifest: &ProjectManifest) -> String {
     let mut lines = vec![
         "set -eu".to_string(),
@@ -496,10 +502,10 @@ fn promote_script(manifest: &ProjectManifest) -> String {
     for service in &manifest.services {
         let repository = image_repository(manifest, &service.image);
         lines.push(format!("IMAGE_REPOSITORY={}", shell_quote(&repository)));
-        lines.push(
-            "IMAGE_DIGEST=\"$(docker buildx imagetools inspect \"${IMAGE_REPOSITORY}:${IMAGE_TAG}\" --format '{{.Manifest.Digest}}')\""
-                .to_string(),
-        );
+        lines.push(format!(
+            "IMAGE_DIGEST=\"{}\"",
+            image_digest_expression("\"${IMAGE_REPOSITORY}:${IMAGE_TAG}\"")
+        ));
         lines.push(
             "case \"$IMAGE_DIGEST\" in sha256:*) ;; *) echo '镜像摘要解析失败' >&2; exit 1 ;; esac"
                 .to_string(),
@@ -508,10 +514,10 @@ fn promote_script(manifest: &ProjectManifest) -> String {
             "docker buildx imagetools create --prefer-index=false --tag \"${IMAGE_REPOSITORY}:${VERIFIED_TAG}\" \"${IMAGE_REPOSITORY}@${IMAGE_DIGEST}\""
                 .to_string(),
         );
-        lines.push(
-            "VERIFIED_DIGEST=\"$(docker buildx imagetools inspect \"${IMAGE_REPOSITORY}:${VERIFIED_TAG}\" --format '{{.Manifest.Digest}}')\""
-                .to_string(),
-        );
+        lines.push(format!(
+            "VERIFIED_DIGEST=\"{}\"",
+            image_digest_expression("\"${IMAGE_REPOSITORY}:${VERIFIED_TAG}\"")
+        ));
         lines.push("test \"$VERIFIED_DIGEST\" = \"$IMAGE_DIGEST\"".to_string());
     }
     lines.join("\n")
@@ -556,8 +562,10 @@ fn deploy_script(
             "{repository_variable}={}",
             shell_quote(&image_repository(manifest, &service.image))
         ));
+        let image_reference = format!("\"${{{repository_variable}}}:${{RELEASE_TAG}}\"");
         lines.push(format!(
-            "{digest_variable}=\"$(docker buildx imagetools inspect \"${{{repository_variable}}}:${{RELEASE_TAG}}\" --format '{{{{.Manifest.Digest}}}}')\""
+            "{digest_variable}=\"{}\"",
+            image_digest_expression(&image_reference)
         ));
         lines.push(format!(
             "case \"${{{digest_variable}}}\" in sha256:*) ;; *) echo '服务 {} 的镜像摘要无效' >&2; exit 1 ;; esac",
@@ -974,7 +982,7 @@ mod tests {
         assert!(pipeline.content.contains("在测试环境验证生产候选"));
         assert!(pipeline.content.contains("标记已验证镜像摘要"));
         assert!(pipeline.content.contains("verified-${IMAGE_TAG}"));
-        assert!(pipeline.content.contains("{{.Manifest.Digest}}"));
+        assert!(pipeline.content.contains("awk '$1 == \"Digest:\""));
         assert!(pipeline.content.contains("StrictHostKeyChecking=yes"));
         assert!(pipeline.content.contains(".release.env.previous"));
         assert!(pipeline.content.contains("--wait-timeout 180"));
