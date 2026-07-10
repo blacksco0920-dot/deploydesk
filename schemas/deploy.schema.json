@@ -1,0 +1,520 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProjectManifest",
+  "type": "object",
+  "properties": {
+    "environments": {
+      "$ref": "#/$defs/EnvironmentSet"
+    },
+    "project": {
+      "$ref": "#/$defs/ProjectConfig"
+    },
+    "providers": {
+      "$ref": "#/$defs/ProviderConfig"
+    },
+    "release": {
+      "$ref": "#/$defs/ReleasePolicy",
+      "default": {
+        "auto_rollback": true,
+        "backup_before_migration": true,
+        "image_tag_template": "sha-{commit}",
+        "keep_releases": 5,
+        "production_mode": "approval"
+      }
+    },
+    "services": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ServiceConfig"
+      }
+    },
+    "source": {
+      "$ref": "#/$defs/SourceConfig"
+    },
+    "version": {
+      "type": "integer",
+      "format": "uint32",
+      "default": 1,
+      "minimum": 0
+    }
+  },
+  "required": [
+    "project",
+    "source",
+    "environments",
+    "providers"
+  ],
+  "$defs": {
+    "BuildProviderConfig": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/BuildProviderKind",
+          "default": "cnb"
+        },
+        "repository": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository"
+      ]
+    },
+    "BuildProviderKind": {
+      "type": "string",
+      "enum": [
+        "cnb"
+      ]
+    },
+    "DatabaseBinding": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "user": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "user"
+      ]
+    },
+    "DomainRoute": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string",
+          "default": "/"
+        },
+        "service": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "service",
+        "host"
+      ]
+    },
+    "EnvironmentConfig": {
+      "type": "object",
+      "properties": {
+        "approval_required": {
+          "type": "boolean",
+          "default": false
+        },
+        "auto_deploy": {
+          "type": "boolean",
+          "default": false
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "database": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DatabaseBinding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "domains": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/DomainRoute"
+          }
+        },
+        "redis_namespace": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "secrets_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "target": {
+          "$ref": "#/$defs/TargetConfig"
+        }
+      },
+      "required": [
+        "target"
+      ]
+    },
+    "EnvironmentSet": {
+      "type": "object",
+      "properties": {
+        "development": {
+          "$ref": "#/$defs/EnvironmentConfig"
+        },
+        "production": {
+          "$ref": "#/$defs/EnvironmentConfig"
+        },
+        "staging": {
+          "$ref": "#/$defs/EnvironmentConfig"
+        }
+      },
+      "required": [
+        "development",
+        "staging",
+        "production"
+      ]
+    },
+    "EnvironmentVariable": {
+      "type": "object",
+      "properties": {
+        "default": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "type": "string",
+          "default": ""
+        },
+        "name": {
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean",
+          "default": false
+        },
+        "secret": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "HealthcheckConfig": {
+      "type": "object",
+      "properties": {
+        "interval_seconds": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 10,
+          "minimum": 0
+        },
+        "path": {
+          "type": "string",
+          "default": "/health"
+        },
+        "retries": {
+          "type": "integer",
+          "format": "uint16",
+          "default": 12,
+          "maximum": 65535,
+          "minimum": 0
+        }
+      }
+    },
+    "MigrationConfig": {
+      "type": "object",
+      "properties": {
+        "backup_required": {
+          "type": "boolean",
+          "default": true
+        },
+        "command": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "command"
+      ]
+    },
+    "ProductionMode": {
+      "type": "string",
+      "enum": [
+        "automatic",
+        "approval"
+      ]
+    },
+    "ProjectCommands": {
+      "type": "object",
+      "properties": {
+        "install": {
+          "type": "string",
+          "default": "corepack pnpm install --frozen-lockfile"
+        },
+        "verify": {
+          "type": "array",
+          "default": [
+            "corepack pnpm build"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "ProjectConfig": {
+      "type": "object",
+      "properties": {
+        "commands": {
+          "$ref": "#/$defs/ProjectCommands",
+          "default": {
+            "install": "corepack pnpm install --frozen-lockfile",
+            "verify": [
+              "corepack pnpm build"
+            ]
+          }
+        },
+        "description": {
+          "type": "string",
+          "default": ""
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "ProviderConfig": {
+      "type": "object",
+      "properties": {
+        "build": {
+          "$ref": "#/$defs/BuildProviderConfig"
+        },
+        "registry": {
+          "$ref": "#/$defs/RegistryConfig"
+        },
+        "reverse_proxy": {
+          "$ref": "#/$defs/ReverseProxyProvider",
+          "default": "caddy"
+        }
+      },
+      "required": [
+        "build",
+        "registry"
+      ]
+    },
+    "RegistryConfig": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "cnb"
+            },
+            "repository": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "repository"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "tcr"
+            },
+            "namespace": {
+              "type": "string"
+            },
+            "registry": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "registry",
+            "namespace"
+          ]
+        }
+      ]
+    },
+    "ReleasePolicy": {
+      "type": "object",
+      "properties": {
+        "auto_rollback": {
+          "type": "boolean",
+          "default": true
+        },
+        "backup_before_migration": {
+          "type": "boolean",
+          "default": true
+        },
+        "image_tag_template": {
+          "type": "string",
+          "default": "sha-{commit}"
+        },
+        "keep_releases": {
+          "type": "integer",
+          "format": "uint16",
+          "default": 5,
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "production_mode": {
+          "$ref": "#/$defs/ProductionMode",
+          "default": "approval"
+        }
+      }
+    },
+    "ReverseProxyProvider": {
+      "type": "string",
+      "enum": [
+        "caddy"
+      ]
+    },
+    "ServiceConfig": {
+      "type": "object",
+      "properties": {
+        "build_args": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "container_port": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "context": {
+          "type": "string",
+          "default": "."
+        },
+        "dockerfile": {
+          "type": "string"
+        },
+        "healthcheck": {
+          "$ref": "#/$defs/HealthcheckConfig"
+        },
+        "id": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ServiceKind"
+        },
+        "migration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MigrationConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "runtime_env": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EnvironmentVariable"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "image",
+        "dockerfile",
+        "container_port",
+        "healthcheck"
+      ]
+    },
+    "ServiceKind": {
+      "type": "string",
+      "enum": [
+        "api",
+        "web",
+        "worker",
+        "static"
+      ]
+    },
+    "SourceConfig": {
+      "type": "object",
+      "properties": {
+        "integration_branch": {
+          "type": "string",
+          "default": "test"
+        },
+        "provider": {
+          "$ref": "#/$defs/SourceProvider",
+          "default": "github"
+        },
+        "repository": {
+          "type": "string",
+          "default": ""
+        },
+        "stable_branch": {
+          "type": "string",
+          "default": "main"
+        }
+      }
+    },
+    "SourceProvider": {
+      "type": "string",
+      "enum": [
+        "github",
+        "cnb",
+        "local"
+      ]
+    },
+    "TargetConfig": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/TargetKind"
+        },
+        "namespace": {
+          "type": "string"
+        },
+        "server": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "kind",
+        "namespace"
+      ]
+    },
+    "TargetKind": {
+      "type": "string",
+      "enum": [
+        "local",
+        "server"
+      ]
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "@ecat-energy/miniapp",
+  "private": true,
+  "scripts": {
+    "build:h5": "taro build --type h5"
+  },
+  "dependencies": {
+    "@tarojs/taro": "^4.0.0"
+  }
+}

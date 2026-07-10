@@ -1,0 +1,10 @@
+{
+  "name": "@ecat-energy/admin",
+  "private": true,
+  "scripts": {
+    "build": "vite build"
+  },
+  "devDependencies": {
+    "vite": "^7.0.0"
+  }
+}
