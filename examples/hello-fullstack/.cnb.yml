@@ -142,7 +142,7 @@ $:
         old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
         if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
         CADDY_CONTAINER="$(cat "$HOME/.deploydesk/caddy/container-name" 2>/dev/null || printf '"'"'deploydesk-caddy'"'"')"
-        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites'"'"')"
+        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites")"
         case "$CADDY_CONTAINER" in '"'"''"'"'|*[!A-Za-z0-9_.-]*) echo '"'"'AD-SRV-205：Caddy 容器记录无效'"'"' >&2; exit 1 ;; esac
         case "$CADDY_SITE_DIRECTORY" in /*) ;; *) echo '"'"'AD-SRV-205：Caddy 路由目录记录无效'"'"' >&2; exit 1 ;; esac
         test -d "$CADDY_SITE_DIRECTORY" && test -w "$CADDY_SITE_DIRECTORY" || { echo '"'"'AD-SRV-205：Caddy 路由目录不可写'"'"' >&2; exit 1; }
@@ -330,7 +330,7 @@ $:
         old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
         if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
         CADDY_CONTAINER="$(cat "$HOME/.deploydesk/caddy/container-name" 2>/dev/null || printf '"'"'deploydesk-caddy'"'"')"
-        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites'"'"')"
+        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites")"
         case "$CADDY_CONTAINER" in '"'"''"'"'|*[!A-Za-z0-9_.-]*) echo '"'"'AD-SRV-205：Caddy 容器记录无效'"'"' >&2; exit 1 ;; esac
         case "$CADDY_SITE_DIRECTORY" in /*) ;; *) echo '"'"'AD-SRV-205：Caddy 路由目录记录无效'"'"' >&2; exit 1 ;; esac
         test -d "$CADDY_SITE_DIRECTORY" && test -w "$CADDY_SITE_DIRECTORY" || { echo '"'"'AD-SRV-205：Caddy 路由目录不可写'"'"' >&2; exit 1; }
@@ -525,7 +525,7 @@ $:
         old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
         if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
         CADDY_CONTAINER="$(cat "$HOME/.deploydesk/caddy/container-name" 2>/dev/null || printf '"'"'deploydesk-caddy'"'"')"
-        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites'"'"')"
+        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites")"
         case "$CADDY_CONTAINER" in '"'"''"'"'|*[!A-Za-z0-9_.-]*) echo '"'"'AD-SRV-205：Caddy 容器记录无效'"'"' >&2; exit 1 ;; esac
         case "$CADDY_SITE_DIRECTORY" in /*) ;; *) echo '"'"'AD-SRV-205：Caddy 路由目录记录无效'"'"' >&2; exit 1 ;; esac
         test -d "$CADDY_SITE_DIRECTORY" && test -w "$CADDY_SITE_DIRECTORY" || { echo '"'"'AD-SRV-205：Caddy 路由目录不可写'"'"' >&2; exit 1; }
@@ -690,7 +690,7 @@ $:
         old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
         if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
         CADDY_CONTAINER="$(cat "$HOME/.deploydesk/caddy/container-name" 2>/dev/null || printf '"'"'deploydesk-caddy'"'"')"
-        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites'"'"')"
+        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites")"
         case "$CADDY_CONTAINER" in '"'"''"'"'|*[!A-Za-z0-9_.-]*) echo '"'"'AD-SRV-205：Caddy 容器记录无效'"'"' >&2; exit 1 ;; esac
         case "$CADDY_SITE_DIRECTORY" in /*) ;; *) echo '"'"'AD-SRV-205：Caddy 路由目录记录无效'"'"' >&2; exit 1 ;; esac
         test -d "$CADDY_SITE_DIRECTORY" && test -w "$CADDY_SITE_DIRECTORY" || { echo '"'"'AD-SRV-205：Caddy 路由目录不可写'"'"' >&2; exit 1; }
@@ -879,7 +879,7 @@ main:
         old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
         if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
         CADDY_CONTAINER="$(cat "$HOME/.deploydesk/caddy/container-name" 2>/dev/null || printf '"'"'deploydesk-caddy'"'"')"
-        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites'"'"')"
+        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites")"
         case "$CADDY_CONTAINER" in '"'"''"'"'|*[!A-Za-z0-9_.-]*) echo '"'"'AD-SRV-205：Caddy 容器记录无效'"'"' >&2; exit 1 ;; esac
         case "$CADDY_SITE_DIRECTORY" in /*) ;; *) echo '"'"'AD-SRV-205：Caddy 路由目录记录无效'"'"' >&2; exit 1 ;; esac
         test -d "$CADDY_SITE_DIRECTORY" && test -w "$CADDY_SITE_DIRECTORY" || { echo '"'"'AD-SRV-205：Caddy 路由目录不可写'"'"' >&2; exit 1; }
