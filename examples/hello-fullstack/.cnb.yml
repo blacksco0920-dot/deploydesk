@@ -184,6 +184,7 @@ $:
       - apt-get update && apt-get install -y --no-install-recommends ca-certificates git openssh-client && rm -rf /var/lib/apt/lists/*
     - name: 安装依赖
       script:
+      - corepack enable
       - corepack pnpm install --frozen-lockfile
     - name: 验证 1
       script:
@@ -732,6 +733,7 @@ main:
       - apt-get update && apt-get install -y --no-install-recommends ca-certificates git openssh-client && rm -rf /var/lib/apt/lists/*
     - name: 安装依赖
       script:
+      - corepack enable
       - corepack pnpm install --frozen-lockfile
     - name: 验证 1
       script:

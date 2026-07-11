@@ -487,7 +487,7 @@ fn build_stages(manifest: &ProjectManifest) -> Vec<Value> {
         system_tools_stage(),
         json!({
             "name": "安装依赖",
-            "script": [manifest.project.commands.install]
+            "script": ["corepack enable", manifest.project.commands.install]
         }),
     ];
     for (index, command) in manifest.project.commands.verify.iter().enumerate() {
@@ -1115,6 +1115,7 @@ mod tests {
             serde_yaml_ng::to_string(&pipeline_yaml["main"]).expect("serialize main pipeline");
         assert_eq!(main_pipeline.matches("构建并上传").count(), 1);
         assert!(pipeline.content.contains("api_trigger_staging"));
+        assert!(pipeline.content.contains("corepack enable"));
         assert!(pipeline.content.contains("api_trigger_production"));
         assert!(pipeline.content.contains("tag_deploy.staging"));
         assert!(pipeline.content.contains("tag_deploy.production"));

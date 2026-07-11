@@ -68,6 +68,13 @@ interface PendingCloudSetup {
   issue: UserFacingIssue;
 }
 
+interface PendingDeploymentSync {
+  repository: string;
+  branch: string;
+  writtenFiles: number;
+  issue: UserFacingIssue;
+}
+
 export function shouldRefreshDeploymentStatus(
   screen: AppScreen,
   step: OnboardingStep,
@@ -106,6 +113,8 @@ function App() {
     useState<UserFacingIssue | null>(null);
   const [pendingCloudSetup, setPendingCloudSetup] =
     useState<PendingCloudSetup | null>(null);
+  const [pendingDeploymentSync, setPendingDeploymentSync] =
+    useState<PendingDeploymentSync | null>(null);
 
   const reportError = useCallback((message: string) => {
     const issue = issueFromUnknown(message, "当前步骤没有完成");
@@ -311,21 +320,78 @@ function App() {
         toast.success("项目配置已更新，可以继续完成 CNB 保护配置");
         return;
       }
-      const run = await startStagingDeployment(projectPath);
-      setCurrentRun(run);
-      setDeploymentRuns((current) => [
-        run,
-        ...current.filter((item) => item.id !== run.id),
-      ]);
-      await saveProjectStep(projectPath, "deploying");
-      setStep("deploying");
-      setScreen("onboarding");
-      await refreshProjects();
+      const document = parseDocument(refreshed.manifestYaml);
+      const data = document.toJS() as {
+        providers?: { build?: { repository?: string } };
+        source?: { release_branch?: string };
+      };
+      const repository = data.providers?.build?.repository?.trim();
+      if (!repository) throw new Error("CNB 代码仓库尚未配置");
+      const branch = data.source?.release_branch ?? "main";
+      try {
+        await syncAndStartStaging(repository, branch, false);
+      } catch (error) {
+        const issue = issueFromUnknown(error, "项目代码尚未同步");
+        if (issue.code === "AD-GIT-101") {
+          setPendingDeploymentSync({
+            repository,
+            branch,
+            writtenFiles: result.writtenFiles.length,
+            issue,
+          });
+          return;
+        }
+        throw error;
+      }
       toast.success(
         `服务器与部署配置已准备完成，共更新 ${result.writtenFiles.length} 个文件`,
       );
     } catch (error) {
       reportDeploymentIssue(issueFromUnknown(error, "首次部署未能开始"));
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  async function syncAndStartStaging(
+    repository: string,
+    branch: string,
+    allowUncommitted: boolean,
+  ) {
+    const source = await syncProjectToCnb(
+      projectPath,
+      repository,
+      branch,
+      allowUncommitted,
+    );
+    const run = await startStagingDeployment(
+      projectPath,
+      source.commitSha,
+      true,
+    );
+    setCurrentRun(run);
+    setDeploymentRuns((current) => [
+      run,
+      ...current.filter((item) => item.id !== run.id),
+    ]);
+    await saveProjectStep(projectPath, "deploying");
+    setStep("deploying");
+    setScreen("onboarding");
+    await refreshProjects();
+  }
+
+  async function continuePendingDeploymentSync() {
+    if (!pendingDeploymentSync) return;
+    const pending = pendingDeploymentSync;
+    setPendingDeploymentSync(null);
+    setApplying(true);
+    try {
+      await syncAndStartStaging(pending.repository, pending.branch, true);
+      toast.success(
+        `已部署最近一次提交，共更新 ${pending.writtenFiles} 个部署文件`,
+      );
+    } catch (error) {
+      reportDeploymentIssue(issueFromUnknown(error, "测试部署未能开始"));
     } finally {
       setApplying(false);
     }
@@ -445,7 +511,7 @@ function App() {
       }
       await applyManifest(projectPath, manifestYaml);
       const branch = data.source?.release_branch ?? "main";
-      await syncProjectToCnb(
+      const source = await syncProjectToCnb(
         projectPath,
         codeRepository,
         branch,
@@ -455,7 +521,10 @@ function App() {
       if (!autoTrigger.ok) throw new Error(autoTrigger.summary);
       const refreshed = await openProject(projectPath);
       setWorkspace(refreshed);
-      const run = await resumeStagingDeployment(currentRun.id);
+      const run = await resumeStagingDeployment(
+        currentRun.id,
+        source.commitSha,
+      );
       setCurrentRun(run);
       setDeploymentRuns((current) => [
         run,
@@ -739,14 +808,23 @@ function App() {
       ) : null}
 
       <Dialog
-        onOpenChange={(open) => !open && setPendingCloudSetup(null)}
-        open={Boolean(pendingCloudSetup)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPendingCloudSetup(null);
+            setPendingDeploymentSync(null);
+          }
+        }}
+        open={Boolean(pendingCloudSetup || pendingDeploymentSync)}
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{pendingCloudSetup?.issue.title}</DialogTitle>
+            <DialogTitle>
+              {pendingCloudSetup?.issue.title ??
+                pendingDeploymentSync?.issue.title}
+            </DialogTitle>
             <DialogDescription>
-              {pendingCloudSetup?.issue.message}
+              {pendingCloudSetup?.issue.message ??
+                pendingDeploymentSync?.issue.message}
             </DialogDescription>
           </DialogHeader>
           <p className="m-0 text-sm leading-6 text-[var(--muted-foreground)]">
@@ -756,22 +834,30 @@ function App() {
           <DialogFooter>
             <Button
               disabled={applying}
-              onClick={() => setPendingCloudSetup(null)}
+              onClick={() => {
+                setPendingCloudSetup(null);
+                setPendingDeploymentSync(null);
+              }}
               variant="secondary"
             >
               暂不部署
             </Button>
             <Button
-              disabled={applying || !pendingCloudSetup}
+              disabled={
+                applying || (!pendingCloudSetup && !pendingDeploymentSync)
+              }
               onClick={() => {
-                if (!pendingCloudSetup) return;
-                const setup = pendingCloudSetup;
-                setPendingCloudSetup(null);
-                void completeCloudSetup(
-                  setup.codeRepository,
-                  setup.secretRepository,
-                  true,
-                );
+                if (pendingCloudSetup) {
+                  const setup = pendingCloudSetup;
+                  setPendingCloudSetup(null);
+                  void completeCloudSetup(
+                    setup.codeRepository,
+                    setup.secretRepository,
+                    true,
+                  );
+                  return;
+                }
+                void continuePendingDeploymentSync();
               }}
             >
               {applying ? <LoaderCircle className="animate-spin-slow" /> : null}

@@ -66,4 +66,23 @@ describe("user-facing deployment errors", () => {
     expect(browser.title).toBe("系统浏览器没有打开");
     expect(browser.nextSteps[0]).toContain("手动打开");
   });
+
+  it("explains a diverged CNB branch without recommending force push", () => {
+    const issue = issueFromUnknown(
+      "AD-GIT-102：CNB 部署分支已有更新，当前代码不能安全覆盖",
+    );
+
+    expect(issue.title).toBe("部署分支需要先同步");
+    expect(issue.nextSteps[0]).toContain("安全同步");
+    expect(issue.nextSteps[0]).toContain("不要强制覆盖");
+  });
+
+  it("explains that missing trigger permission has an automatic fallback", () => {
+    const issue = issueFromUnknown(
+      "AD-CNB-103：CNB 没有找到这次提交的自动构建",
+    );
+
+    expect(issue.title).toBe("CNB 权限还差一步");
+    expect(issue.nextSteps[0]).toContain("自动构建");
+  });
 });

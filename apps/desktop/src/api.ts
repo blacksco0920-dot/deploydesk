@@ -227,17 +227,24 @@ export async function bindProjectServer(
 
 export async function startStagingDeployment(
   path: string,
+  expectedRevision?: string,
+  preferPushBuild = false,
 ): Promise<DeploymentRun> {
   if (!isTauri()) {
     const run = demoRun(path, "staging");
     writeDemoRun(run);
     return run;
   }
-  return invoke<DeploymentRun>("start_staging_deployment", { path });
+  return invoke<DeploymentRun>("start_staging_deployment", {
+    path,
+    expectedRevision: expectedRevision ?? null,
+    preferPushBuild,
+  });
 }
 
 export async function resumeStagingDeployment(
   runId: string,
+  expectedRevision?: string,
 ): Promise<DeploymentRun> {
   if (!isTauri()) {
     const run = readDemoRuns().find((item) => item.id === runId);
@@ -254,7 +261,10 @@ export async function resumeStagingDeployment(
     writeDemoRun(resumed);
     return resumed;
   }
-  return invoke<DeploymentRun>("resume_staging_deployment", { runId });
+  return invoke<DeploymentRun>("resume_staging_deployment", {
+    runId,
+    expectedRevision: expectedRevision ?? null,
+  });
 }
 
 export async function promoteProductionDeployment(

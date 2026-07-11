@@ -46,9 +46,13 @@ export function ReviewStep({
 
       <section className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
         <SummaryRow
-          description={`新增或更新 ${changed.length} 个部署文件，原文件自动备份`}
+          description={
+            changed.length
+              ? `新增或更新 ${changed.length} 个部署文件，原文件自动备份`
+              : "部署配置已是最新，无需改动"
+          }
           icon={FileCode2}
-          status="即将执行"
+          status={changed.length ? "即将执行" : "已就绪"}
           title="写入项目部署配置"
         />
         <SummaryRow
@@ -178,11 +182,7 @@ export function ReviewStep({
       </label>
 
       <div className="mt-5 flex justify-end">
-        <Button
-          disabled={!confirmed || applying || !changed.length}
-          onClick={onApply}
-          size="lg"
-        >
+        <Button disabled={!confirmed || applying} onClick={onApply} size="lg">
           {applying ? (
             <LoaderCircle className="animate-spin-slow" />
           ) : (

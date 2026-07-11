@@ -340,6 +340,8 @@ fn set_app_setting(
 #[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
 async fn start_staging_deployment(
     path: String,
+    expected_revision: Option<String>,
+    prefer_push_build: bool,
     state: State<'_, WorkspaceState>,
 ) -> Result<DeploymentRun, String> {
     let root = PathBuf::from(&path);
@@ -355,6 +357,7 @@ async fn start_staging_deployment(
         &manifest.providers.build.repository,
         &manifest.source.release_branch,
     )?;
+    run.commit_sha = checked_git_revision(expected_revision.as_deref())?;
     state.set_project_step(&root, "deploying")?;
     if cloud_setup_required(&manifest) {
         run.status = "needs_action".to_string();
@@ -367,13 +370,14 @@ async fn start_staging_deployment(
         state.save_deployment_run(&run)?;
         return Ok(run);
     }
-    Ok(trigger_cnb_run(run, "api_trigger_staging", None, &state).await)
+    Ok(trigger_cnb_run(run, "api_trigger_staging", None, prefer_push_build, &state).await)
 }
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
 async fn resume_staging_deployment(
     run_id: String,
+    expected_revision: Option<String>,
     state: State<'_, WorkspaceState>,
 ) -> Result<DeploymentRun, String> {
     let mut run = state.deployment_run(&run_id)?;
@@ -388,6 +392,7 @@ async fn resume_staging_deployment(
     run.repository
         .clone_from(&manifest.providers.build.repository);
     run.branch.clone_from(&manifest.source.release_branch);
+    run.commit_sha = checked_git_revision(expected_revision.as_deref())?;
     run.status = "queued".to_string();
     run.current_stage = "prepare".to_string();
     run.action_kind = None;
@@ -395,7 +400,7 @@ async fn resume_staging_deployment(
     run.message = "持续部署连接已完成，正在请求 CNB 构建".to_string();
     run.updated_at = Utc::now().to_rfc3339();
     state.save_deployment_run(&run)?;
-    Ok(trigger_cnb_run(run, "api_trigger_staging", None, &state).await)
+    Ok(trigger_cnb_run(run, "api_trigger_staging", None, true, &state).await)
 }
 
 fn cloud_setup_required(manifest: &deploy_core::model::ProjectManifest) -> bool {
@@ -441,7 +446,14 @@ async fn promote_production_deployment(
     run.source_run_id = Some(source.id);
     run.candidate_tag = source.candidate_tag;
     state.save_deployment_run(&run)?;
-    Ok(trigger_cnb_run(run, "api_trigger_production", Some(&revision), &state).await)
+    Ok(trigger_cnb_run(
+        run,
+        "api_trigger_production",
+        Some(&revision),
+        false,
+        &state,
+    )
+    .await)
 }
 
 #[tauri::command]
@@ -884,11 +896,27 @@ async fn trigger_cnb_run(
     mut run: DeploymentRun,
     event: &str,
     revision: Option<&str>,
+    prefer_push_build: bool,
     state: &WorkspaceState,
 ) -> DeploymentRun {
+    if run.commit_sha.is_none() && run.environment == "staging" {
+        run.commit_sha = local_git_revision(Path::new(&run.project_path));
+    }
+    let expected_revision = run.commit_sha.clone();
     let result = async {
         let token = Zeroizing::new(resolve_cnb_token(String::new())?);
         let client = CnbClient::new(token.as_str()).map_err(public_error)?;
+        if prefer_push_build
+            && let Some(expected_revision) = expected_revision.as_deref()
+            && let Some(serial) = recover_push_triggered_staging_build(
+                &client,
+                &run.repository,
+                expected_revision,
+            )
+            .await?
+        {
+            return Ok::<(Option<String>, bool), String>((Some(serial), true));
+        }
         let response = client
             .trigger_build_at_revision(
                 &run.repository,
@@ -897,8 +925,34 @@ async fn trigger_cnb_run(
                 &format!("ABCDeploy · {} · {}", run.project_name, run.environment),
                 revision,
             )
-            .await
-            .map_err(public_error)?;
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error)
+                if event == "api_trigger_staging"
+                    && prefer_push_build
+                    && public_error(&error).contains("repo-cnb-trigger:rw") =>
+            {
+                let trigger_error = public_error(error);
+                let Some(expected_revision) = expected_revision.as_deref() else {
+                    return Err(trigger_error);
+                };
+                if let Some(serial) = recover_push_triggered_staging_build(
+                    &client,
+                    &run.repository,
+                    expected_revision,
+                )
+                .await?
+                {
+                    return Ok::<(Option<String>, bool), String>((Some(serial), true));
+                }
+                return Err(
+                    "CNB 没有找到这次提交的自动构建，当前令牌也不能主动开始构建。请在 CNB 令牌中补充 repo-cnb-trigger:rw，然后返回“服务连接”重新保存"
+                        .to_string(),
+                );
+            }
+            Err(error) => return Err(public_error(error)),
+        };
         if let Some(revision) = build_revision(&response) {
             run.commit_sha = Some(revision);
         }
@@ -914,29 +968,35 @@ async fn trigger_cnb_run(
                     .as_str()
                     .map(ToString::to_string)
                     .or_else(|| value.as_u64().map(|number| number.to_string()))
-            })
+                })
         };
-        Ok::<Option<String>, String>(serial)
+        Ok::<(Option<String>, bool), String>((serial, false))
     }
     .await;
 
     match result {
-        Ok(serial) => {
+        Ok((serial, recovered_from_push)) => {
             run.build_serial = serial;
             run.status = "running".to_string();
             run.current_stage = "build".to_string();
             run.action_kind = None;
             run.action_url = None;
             run.issue_code = None;
-            run.message = "CNB 已开始构建，关闭应用后也可以继续查看".to_string();
+            run.message = if recovered_from_push {
+                "代码推送已自动开始 CNB 构建，无需补充令牌权限".to_string()
+            } else {
+                "CNB 已开始构建，关闭应用后也可以继续查看".to_string()
+            };
         }
         Err(message) => {
-            run.status = if message.contains("权限不足") || message.contains("重新连接") {
+            let permission_error =
+                message.contains("权限不足") || message.contains("repo-cnb-trigger:rw");
+            run.status = if permission_error || message.contains("重新连接") {
                 "needs_action".to_string()
             } else {
                 "failed".to_string()
             };
-            run.issue_code = Some(if message.contains("权限不足") {
+            run.issue_code = Some(if permission_error {
                 "AD-CNB-103".to_string()
             } else if message.contains("重新连接") {
                 "AD-CNB-101".to_string()
@@ -949,6 +1009,58 @@ async fn trigger_cnb_run(
     run.updated_at = Utc::now().to_rfc3339();
     let _ = state.save_deployment_run(&run);
     run
+}
+
+fn local_git_revision(root: &Path) -> Option<String> {
+    git_stdout(root, &["rev-parse", "HEAD"])
+        .ok()
+        .and_then(|value| checked_git_revision(Some(&value)).ok().flatten())
+}
+
+fn checked_git_revision(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("CNB 构建提交标识格式不正确".to_string());
+    }
+    Ok(Some(value.to_string()))
+}
+
+async fn recover_push_triggered_staging_build(
+    client: &CnbClient,
+    repository: &str,
+    expected_revision: &str,
+) -> Result<Option<String>, String> {
+    for attempt in 0..5 {
+        let payload = client
+            .recent_builds(repository, 20)
+            .await
+            .map_err(public_error)?;
+        if let Some(serial) = staging_build_serial_for_revision(&payload, expected_revision) {
+            return Ok(Some(serial));
+        }
+        if attempt < 4 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    Ok(None)
+}
+
+fn staging_build_serial_for_revision(
+    payload: &serde_json::Value,
+    expected_revision: &str,
+) -> Option<String> {
+    build_records(payload)
+        .into_iter()
+        .find(|record| {
+            record.revision.as_deref() == Some(expected_revision)
+                && matches!(
+                    record.event.as_str(),
+                    "push" | "git_push" | "api_trigger_staging" | "tag_deploy.staging"
+                )
+        })
+        .map(|record| record.serial)
 }
 
 fn update_run_from_cnb(run: &mut DeploymentRun, payload: &serde_json::Value) {
@@ -2136,6 +2248,7 @@ fn deployment_owned_paths(root: &Path) -> Vec<String> {
     [
         "deploy.yaml",
         ".cnb.yml",
+        ".cnb/tag_deploy.yml",
         ".github/workflows/sync-cnb.yml",
         ".deploydesk/.gitignore",
         ".deploydesk/generated",
@@ -2206,13 +2319,27 @@ fn git_launch_error(action: &str, error: &std::io::Error) -> String {
 
 fn git_failure(action: &str, stderr: &[u8]) -> String {
     let message = redact_text(&String::from_utf8_lossy(stderr));
-    format!(
-        "{action}未完成：{}",
-        message
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("Git 返回未知错误")
-    )
+    let normalized = message.to_ascii_lowercase();
+    if action == "同步代码到 CNB"
+        && (normalized.contains("non-fast-forward")
+            || normalized.contains("fetch first")
+            || normalized.contains("[rejected]"))
+    {
+        return "AD-GIT-102：CNB 部署分支已有更新，当前代码不能安全覆盖；请先同步分支后重试"
+            .to_string();
+    }
+    let summary = message
+        .lines()
+        .find(|line| {
+            let line = line.trim_start().to_ascii_lowercase();
+            line.starts_with("fatal:")
+                || line.starts_with("error:")
+                || line.contains("[rejected]")
+                || line.contains("permission denied")
+        })
+        .or_else(|| message.lines().find(|line| !line.trim().is_empty()))
+        .unwrap_or("Git 返回未知错误");
+    format!("{action}未完成：{}", summary.trim())
 }
 
 fn read_keyring_secret(key: &str) -> Result<String, String> {
@@ -2387,11 +2514,12 @@ mod tests {
 
     use super::{
         DeploymentRun, apply_public_route_checks, cache_secret, cached_secret,
-        cloud_setup_required, cnb_account_from_responses, cnb_public_error, evict_cached_secret,
-        existing_cnb_repository, is_deployment_internal_path, is_deployment_owned_path,
-        parse_deployment_artifacts, rollback_script, runtime_config_key, runtime_config_template,
-        runtime_secret_key, same_artifact_digests, stage_key, update_run_from_cnb,
-        validate_git_branch, validate_repository_slug,
+        cloud_setup_required, cnb_account_from_responses, cnb_public_error, deployment_owned_paths,
+        evict_cached_secret, existing_cnb_repository, git_failure, is_deployment_internal_path,
+        is_deployment_owned_path, parse_deployment_artifacts, rollback_script, runtime_config_key,
+        runtime_config_template, runtime_secret_key, same_artifact_digests, stage_key,
+        staging_build_serial_for_revision, update_run_from_cnb, validate_git_branch,
+        validate_repository_slug,
     };
     use deploy_core::error::DeployError;
     use deploy_core::model::PublicRouteCheck;
@@ -2667,6 +2795,61 @@ providers:
         assert!(!is_deployment_internal_path(
             ".deploydesk/generated/staging/Caddyfile"
         ));
+    }
+
+    #[test]
+    fn maps_diverged_cnb_pushes_to_a_recoverable_error() {
+        let message = git_failure(
+            "同步代码到 CNB",
+            b"To https://cnb.cool/team/project.git\n ! [rejected] HEAD -> main (non-fast-forward)\nerror: failed to push some refs\n",
+        );
+
+        assert!(message.starts_with("AD-GIT-102"));
+        assert!(!message.contains("https://"));
+    }
+
+    #[test]
+    fn includes_cnb_deployment_approval_in_the_automatic_commit() {
+        let project = tempdir().expect("temp project");
+        fs::create_dir_all(project.path().join(".cnb")).expect("create cnb directory");
+        fs::write(
+            project.path().join(".cnb/tag_deploy.yml"),
+            "deployments: []\n",
+        )
+        .expect("write deployment config");
+
+        let paths = deployment_owned_paths(project.path());
+        assert!(paths.contains(&".cnb/tag_deploy.yml".to_string()));
+    }
+
+    #[test]
+    fn recovers_only_staging_builds_for_the_pushed_revision() {
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let payload = serde_json::json!({
+            "data": [
+                {
+                    "sn": "production-1",
+                    "event": "api_trigger_production",
+                    "status": "running",
+                    "sha": revision
+                },
+                {
+                    "sn": "push-2",
+                    "event": "push",
+                    "status": "running",
+                    "sha": revision
+                }
+            ]
+        });
+
+        assert_eq!(
+            staging_build_serial_for_revision(&payload, revision).as_deref(),
+            Some("push-2")
+        );
+        assert!(
+            staging_build_serial_for_revision(&payload, "fedcba9876543210fedcba9876543210fedcba98")
+                .is_none()
+        );
     }
 
     #[test]

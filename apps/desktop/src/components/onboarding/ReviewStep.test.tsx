@@ -38,6 +38,33 @@ describe("ReviewStep deployment failures", () => {
     fireEvent.click(screen.getByRole("button", { name: "重新检查并继续" }));
     expect(onApply).toHaveBeenCalledOnce();
   });
+
+  it("allows a later deployment when generated configuration is unchanged", () => {
+    const onApply = vi.fn(async () => undefined);
+    const unchanged = workspace();
+    unchanged.plan.changes = unchanged.plan.changes.map((change) => ({
+      ...change,
+      kind: "unchanged",
+    }));
+
+    render(
+      <ReviewStep
+        applying={false}
+        issue={null}
+        onApply={onApply}
+        onBackToConnections={vi.fn()}
+        workspace={unchanged}
+      />,
+    );
+
+    expect(screen.getByText("部署配置已是最新，无需改动")).toBeInTheDocument();
+    expect(screen.getByText("已就绪")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("checkbox"));
+    const deploy = screen.getByRole("button", { name: "开始部署测试" });
+    expect(deploy).toBeEnabled();
+    fireEvent.click(deploy);
+    expect(onApply).toHaveBeenCalledOnce();
+  });
 });
 
 function workspace(): WorkspacePreview {

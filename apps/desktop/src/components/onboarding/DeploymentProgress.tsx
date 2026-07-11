@@ -199,7 +199,7 @@ function recoveryHint(run: DeploymentRun) {
   if (run.issueCode === "AD-CNB-101")
     return "重新连接 CNB 后刷新，不会重复初始化服务器。";
   if (run.issueCode === "AD-CNB-103")
-    return "补充构建触发权限，或选择已有可用仓库后重试。";
+    return "客户端已先查找代码推送产生的自动构建；仍未找到时，再按提示补充对应权限。";
   if (run.issueCode === "AD-REL-201")
     return "重新验证目标服务器连接，然后刷新以读取本次镜像摘要。";
   if (run.issueCode === "AD-REL-301")

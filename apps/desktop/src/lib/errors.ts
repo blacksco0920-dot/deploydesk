@@ -38,13 +38,17 @@ export function issueFromUnknown(
 function nextStepsForCode(code?: string): string[] {
   if (code === "AD-GIT-101")
     return ["回到编程工具提交这些改动，或明确选择部署上次已提交版本"];
+  if (code === "AD-GIT-102")
+    return ["让编程工具安全同步 main 与当前分支；不要强制覆盖远端"];
   if (code === "AD-SYS-101") return ["重新点击复制；仍失败时重新启动客户端"];
   if (code === "AD-SYS-102")
     return ["配置已经复制，请在浏览器中手动打开 cnb.cool"];
   if (code === "AD-CNB-101") return ["重新连接 CNB，然后回到当前任务刷新状态"];
   if (code === "AD-CNB-102") return ["检查网络能否访问 cnb.cool，然后重新尝试"];
   if (code === "AD-CNB-103")
-    return ["按连接页提示补充令牌权限，或让组织管理员提升当前账号角色"];
+    return [
+      "客户端已先尝试复用代码推送产生的自动构建；仍失败时，按连接页提示补充对应令牌权限",
+    ];
   if (code === "AD-CNB-104")
     return ["返回 CNB 连接步骤刷新组织；没有组织时先在 CNB 创建组织"];
   if (code === "AD-CNB-105")
@@ -64,8 +68,10 @@ function nextStepsForCode(code?: string): string[] {
 
 function titleForCode(code?: string): string | undefined {
   if (code === "AD-GIT-101") return "项目改动还没有提交";
+  if (code === "AD-GIT-102") return "部署分支需要先同步";
   if (code === "AD-SYS-101") return "配置没有复制成功";
   if (code === "AD-SYS-102") return "系统浏览器没有打开";
+  if (code === "AD-CNB-103") return "CNB 权限还差一步";
   return undefined;
 }
 
