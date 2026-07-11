@@ -1101,9 +1101,15 @@ fn update_run_from_cnb(run: &mut DeploymentRun, payload: &serde_json::Value) {
             );
         }
         "waiting" | "pending" | "queued" => {
-            run.status = "queued".to_string();
             run.issue_code = None;
-            run.message = "CNB 正在分配构建资源".to_string();
+            if let Some(stage) = current {
+                run.status = "running".to_string();
+                run.current_stage = stage_key(Some(&stage));
+                run.message = format!("正在执行：{stage}");
+            } else {
+                run.status = "queued".to_string();
+                run.message = "CNB 正在分配构建资源".to_string();
+            }
         }
         _ => {
             run.status = "running".to_string();
@@ -2591,6 +2597,19 @@ mod tests {
                 .contains(&"healthcheck".to_string())
         );
         assert_eq!(stage_key(Some("上传镜像")), "publish");
+
+        update_run_from_cnb(
+            &mut deployment,
+            &json!({
+                "status": "pending",
+                "pipelinesStatus": {
+                    "pipeline": {"stages": [{"name": "构建并上传 api", "status": "start"}]}
+                }
+            }),
+        );
+        assert_eq!(deployment.status, "running");
+        assert_eq!(deployment.current_stage, "build");
+        assert_eq!(deployment.message, "正在执行：构建并上传 api");
     }
 
     #[test]
