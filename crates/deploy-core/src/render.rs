@@ -941,7 +941,7 @@ cp .release.env ".history/$release_id.env"
 old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +{prune_from} || true)"
 if [ -n "$old_releases" ]; then printf '%s\n' "$old_releases" | xargs rm -f; fi
 CADDY_CONTAINER="$(cat "$HOME/.deploydesk/caddy/container-name" 2>/dev/null || printf 'deploydesk-caddy')"
-CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '%s' "$HOME/.deploydesk/caddy/sites')"
+CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '%s' "$HOME/.deploydesk/caddy/sites")"
 case "$CADDY_CONTAINER" in ''|*[!A-Za-z0-9_.-]*) echo 'AD-SRV-205：Caddy 容器记录无效' >&2; exit 1 ;; esac
 case "$CADDY_SITE_DIRECTORY" in /*) ;; *) echo 'AD-SRV-205：Caddy 路由目录记录无效' >&2; exit 1 ;; esac
 test -d "$CADDY_SITE_DIRECTORY" && test -w "$CADDY_SITE_DIRECTORY" || {{ echo 'AD-SRV-205：Caddy 路由目录不可写' >&2; exit 1; }}
@@ -1250,6 +1250,35 @@ mod tests {
                 .expect("check shell syntax");
             assert!(status.success(), "invalid generated script: {script}");
         }
+    }
+
+    #[test]
+    fn generated_remote_deploy_shell_is_syntax_valid_when_bash_is_available() {
+        let bash_probe = Command::new("bash")
+            .arg("-n")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !matches!(bash_probe, Ok(status) if status.success()) {
+            return;
+        }
+        let manifest = create_default_manifest(&inspection_fixture());
+        let script = remote_deploy_script(
+            &manifest,
+            EnvironmentName::Staging,
+            ".deploydesk/apps/example/staging",
+            "deploydesk-example-staging",
+        );
+        let mut file = tempfile::NamedTempFile::new().expect("temporary remote script");
+        file.write_all(script.as_bytes())
+            .expect("write remote script");
+        let status = Command::new("bash")
+            .arg("-n")
+            .arg(file.path())
+            .status()
+            .expect("check remote shell syntax");
+        assert!(status.success(), "invalid remote deploy script: {script}");
     }
 
     fn collect_scripts(value: &serde_yaml_ng::Value, scripts: &mut Vec<String>) {
