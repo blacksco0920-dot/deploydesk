@@ -82,6 +82,23 @@ export function shouldRefreshDeploymentStatus(
   return screen === "workspace" || step === "deploying";
 }
 
+export function requiresCloudSetup(manifestYaml: string) {
+  try {
+    const data = parseDocument(manifestYaml).toJS() as {
+      environments?: {
+        staging?: { secrets_ref?: string };
+        production?: { secrets_ref?: string };
+      };
+    };
+    return [
+      data.environments?.staging?.secrets_ref,
+      data.environments?.production?.secrets_ref,
+    ].some((reference) => !reference || reference.includes("replace-me"));
+  } catch {
+    return true;
+  }
+}
+
 const onboardingSteps: OnboardingStep[] = [
   "inspection",
   "connections",
@@ -303,7 +320,9 @@ function App() {
         bindProjectServer(projectPath, "staging", lastServer),
         bindProjectServer(projectPath, "production", lastServer),
       ]);
-      await preparePipelineIdentity(projectPath, lastServer);
+      if (requiresCloudSetup(workspace.manifestYaml)) {
+        await preparePipelineIdentity(projectPath, lastServer);
+      }
       const result = await applyManifest(projectPath, workspace.manifestYaml);
       const refreshed = await openProject(projectPath);
       setWorkspace(refreshed);

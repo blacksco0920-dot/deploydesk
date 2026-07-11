@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
-import App, { shouldRefreshDeploymentStatus } from "./App";
+import App, { requiresCloudSetup, shouldRefreshDeploymentStatus } from "./App";
 
 describe("ABCDeploy beginner flow", () => {
   beforeEach(() => localStorage.clear());
@@ -11,6 +11,26 @@ describe("ABCDeploy beginner flow", () => {
     );
     expect(shouldRefreshDeploymentStatus("onboarding", "deploying")).toBe(true);
     expect(shouldRefreshDeploymentStatus("workspace", "workspace")).toBe(true);
+  });
+
+  it("prepares the pipeline identity only while cloud secrets are missing", () => {
+    expect(
+      requiresCloudSetup(`
+environments:
+  staging:
+    secrets_ref: https://cnb.cool/team/secrets/-/blob/main/env.staging.yml
+  production:
+    secrets_ref: https://cnb.cool/team/secrets/-/blob/main/env.production.yml
+`),
+    ).toBe(false);
+    expect(
+      requiresCloudSetup(`
+environments:
+  staging:
+    secrets_ref: replace-me
+  production: {}
+`),
+    ).toBe(true);
   });
 
   it("recognizes a project, connects reusable resources and recommends a release plan", async () => {
