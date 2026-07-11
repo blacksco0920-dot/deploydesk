@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -44,6 +45,7 @@ use workspace::{DeploymentArtifact, DeploymentRun, RecentProject, ServerResource
 
 const KEYRING_SERVICE: &str = "cloud.finagent.abcdeploy";
 const LEGACY_KEYRING_SERVICE: &str = "com.deploydesk.desktop";
+static SECRET_CACHE: OnceLock<Mutex<BTreeMap<String, Zeroizing<String>>>> = OnceLock::new();
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1523,8 +1525,7 @@ fn store_secret(key: String, mut value: String) -> Result<SecretStatus, String> 
     if value.is_empty() {
         return Err("密钥不能为空".to_string());
     }
-    let entry = Entry::new(KEYRING_SERVICE, &key).map_err(public_error)?;
-    let result = entry.set_password(&value).map_err(public_error);
+    let result = write_keyring_secret(&key, &value);
     value.zeroize();
     result?;
     Ok(SecretStatus { key, stored: true })
@@ -1533,6 +1534,7 @@ fn store_secret(key: String, mut value: String) -> Result<SecretStatus, String> 
 #[tauri::command]
 fn delete_secret(key: String) -> Result<SecretStatus, String> {
     validate_secret_key(&key)?;
+    evict_cached_secret(&key);
     for service in [KEYRING_SERVICE, LEGACY_KEYRING_SERVICE] {
         let entry = Entry::new(service, &key).map_err(public_error)?;
         match entry.delete_credential() {
@@ -1550,8 +1552,7 @@ async fn connect_cnb(token: String, persist: bool) -> Result<CnbAccount, String>
     let user = client.current_user().await.map_err(cnb_public_error)?;
     let groups = client.user_groups().await.map_err(cnb_public_error)?;
     if persist {
-        let entry = Entry::new(KEYRING_SERVICE, "cnb-token").map_err(public_error)?;
-        entry.set_password(token.as_str()).map_err(public_error)?;
+        write_keyring_secret("cnb-token", token.as_str())?;
     }
     Ok(cnb_account_from_responses(&user, &groups))
 }
@@ -2094,7 +2095,9 @@ fn write_keyring_secret(key: &str, value: &str) -> Result<(), String> {
     Entry::new(KEYRING_SERVICE, key)
         .map_err(public_error)?
         .set_password(value)
-        .map_err(public_error)
+        .map_err(public_error)?;
+    cache_secret(key, value);
+    Ok(())
 }
 
 fn shell_quote(value: &str) -> String {
@@ -2187,9 +2190,17 @@ fn git_failure(action: &str, stderr: &[u8]) -> String {
 }
 
 fn read_keyring_secret(key: &str) -> Result<String, String> {
+    validate_secret_key(key)?;
+    if let Some(value) = cached_secret(key) {
+        return Ok(value);
+    }
+
     let current = Entry::new(KEYRING_SERVICE, key).map_err(public_error)?;
     match current.get_password() {
-        Ok(value) => return Ok(value),
+        Ok(value) => {
+            cache_secret(key, &value);
+            return Ok(value);
+        }
         Err(keyring::Error::NoEntry) => {}
         Err(error) => return Err(public_error(error)),
     }
@@ -2198,12 +2209,37 @@ fn read_keyring_secret(key: &str) -> Result<String, String> {
     match legacy.get_password() {
         Ok(mut value) => {
             current.set_password(&value).map_err(public_error)?;
+            cache_secret(key, &value);
             let migrated = value.clone();
             value.zeroize();
             Ok(migrated)
         }
         Err(keyring::Error::NoEntry) => Err("missing".to_string()),
         Err(error) => Err(public_error(error)),
+    }
+}
+
+fn secret_cache() -> &'static Mutex<BTreeMap<String, Zeroizing<String>>> {
+    SECRET_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn cached_secret(key: &str) -> Option<String> {
+    secret_cache()
+        .lock()
+        .ok()?
+        .get(key)
+        .map(|value| value.as_str().to_owned())
+}
+
+fn cache_secret(key: &str, value: &str) {
+    if let Ok(mut cache) = secret_cache().lock() {
+        cache.insert(key.to_string(), Zeroizing::new(value.to_string()));
+    }
+}
+
+fn evict_cached_secret(key: &str) {
+    if let Ok(mut cache) = secret_cache().lock() {
+        cache.remove(key);
     }
 }
 
@@ -2323,11 +2359,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DeploymentRun, apply_public_route_checks, cloud_setup_required, cnb_account_from_responses,
-        cnb_public_error, existing_cnb_repository, is_deployment_owned_path,
-        parse_deployment_artifacts, rollback_script, runtime_config_key, runtime_config_template,
-        runtime_secret_key, same_artifact_digests, stage_key, update_run_from_cnb,
-        validate_git_branch, validate_repository_slug,
+        DeploymentRun, apply_public_route_checks, cache_secret, cached_secret,
+        cloud_setup_required, cnb_account_from_responses, cnb_public_error, evict_cached_secret,
+        existing_cnb_repository, is_deployment_owned_path, parse_deployment_artifacts,
+        rollback_script, runtime_config_key, runtime_config_template, runtime_secret_key,
+        same_artifact_digests, stage_key, update_run_from_cnb, validate_git_branch,
+        validate_repository_slug,
     };
     use deploy_core::error::DeployError;
     use deploy_core::model::PublicRouteCheck;
@@ -2452,6 +2489,19 @@ providers:
         assert!(!staging.contains(&first.path().to_string_lossy().to_string()));
         assert!(runtime_secret_key(first.path(), "development", "JWT_SECRET").is_err());
         assert!(runtime_secret_key(first.path(), "staging", "unsafe-name").is_err());
+    }
+
+    #[test]
+    fn keeps_unlocked_secrets_only_in_the_current_app_session() {
+        let key = "test-session-secret-cache";
+        evict_cached_secret(key);
+        assert_eq!(cached_secret(key), None);
+
+        cache_secret(key, "temporary-value");
+        assert_eq!(cached_secret(key).as_deref(), Some("temporary-value"));
+
+        evict_cached_secret(key);
+        assert_eq!(cached_secret(key), None);
     }
 
     #[test]

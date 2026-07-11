@@ -54,6 +54,13 @@ import type {
 
 type AppScreen = "home" | "onboarding" | "workspace";
 
+export function shouldRefreshDeploymentStatus(
+  screen: AppScreen,
+  step: OnboardingStep,
+) {
+  return screen === "workspace" || step === "deploying";
+}
+
 const onboardingSteps: OnboardingStep[] = [
   "inspection",
   "connections",
@@ -139,7 +146,10 @@ function App() {
         setWorkspace(result);
         setProjectPath(path);
         await setAppSetting("active-project", path);
-        if (result.manifestExists) {
+        if (
+          result.manifestExists &&
+          (resumeStep === "deploying" || resumeStep === "workspace")
+        ) {
           await syncExternalDeployments(path).catch(() => []);
         }
         const runs = await listDeploymentRuns(path);
@@ -352,11 +362,12 @@ function App() {
   }, [projectPath, refreshProjects]);
 
   useEffect(() => {
+    if (!shouldRefreshDeploymentStatus(screen, step)) return;
     const timer = window.setInterval(() => {
       void refreshWorkspaceDeployments().catch(() => undefined);
     }, 8000);
     return () => window.clearInterval(timer);
-  }, [refreshWorkspaceDeployments]);
+  }, [refreshWorkspaceDeployments, screen, step]);
 
   async function retryDeployment() {
     if (!projectPath) return;

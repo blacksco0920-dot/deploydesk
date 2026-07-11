@@ -1,9 +1,17 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
-import App from "./App";
+import App, { shouldRefreshDeploymentStatus } from "./App";
 
 describe("ABCDeploy beginner flow", () => {
   beforeEach(() => localStorage.clear());
+
+  it("only refreshes remote deployment status on deployment screens", () => {
+    expect(shouldRefreshDeploymentStatus("onboarding", "recommendation")).toBe(
+      false,
+    );
+    expect(shouldRefreshDeploymentStatus("onboarding", "deploying")).toBe(true);
+    expect(shouldRefreshDeploymentStatus("workspace", "workspace")).toBe(true);
+  });
 
   it("recognizes a project, connects reusable resources and recommends a release plan", async () => {
     render(<App />);
