@@ -140,7 +140,8 @@ pub fn inspect_project(root: &Path) -> Result<InspectionReport> {
             } else {
                 package.name.rsplit('/').next().unwrap_or(&package.name)
             };
-            let dockerfile = find_service_dockerfile(&root, package_dir, &dockerfiles);
+            let service_id = sanitize_id(id_source);
+            let dockerfile = find_service_dockerfile(&root, package_dir, &service_id, &dockerfiles);
             let build_command = package
                 .scripts
                 .get("build")
@@ -152,7 +153,7 @@ pub fn inspect_project(root: &Path) -> Result<InspectionReport> {
                         .map(|_| package_script_command(package_manager, "build:h5"))
                 });
             services.push(DetectedService {
-                id: sanitize_id(id_source),
+                id: service_id,
                 package_name: package.name,
                 path: if relative_dir.is_empty() {
                     ".".to_string()
@@ -327,6 +328,7 @@ const fn suggested_port(framework: Framework) -> u16 {
 fn find_service_dockerfile(
     root: &Path,
     package_dir: &Path,
+    service_id: &str,
     dockerfiles: &[String],
 ) -> Option<String> {
     let direct = package_dir.join("Dockerfile");
@@ -337,6 +339,15 @@ fn find_service_dockerfile(
     dockerfiles
         .iter()
         .find(|path| path.starts_with(&package_relative))
+        .or_else(|| {
+            let expected_name = format!("Dockerfile.{service_id}");
+            dockerfiles.iter().find(|path| {
+                Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&expected_name))
+            })
+        })
         .cloned()
 }
 
@@ -593,5 +604,38 @@ mod tests {
         let json = serde_json::to_string(&report).expect("serialize");
         assert!(!json.contains("must-not-appear"));
         assert!(!json.contains("postgresql://example"));
+    }
+
+    #[test]
+    fn reuses_service_named_dockerfiles_from_an_infra_directory() {
+        let directory = tempdir().expect("tempdir");
+        fs::create_dir_all(directory.path().join("apps/api")).expect("create app");
+        fs::create_dir_all(directory.path().join("infra")).expect("create infra");
+        fs::write(
+            directory.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - apps/*\n",
+        )
+        .expect("workspace");
+        fs::write(
+            directory.path().join("package.json"),
+            r#"{"name":"sample-app","private":true}"#,
+        )
+        .expect("root package");
+        fs::write(
+            directory.path().join("apps/api/package.json"),
+            r#"{"name":"@sample/api","scripts":{"build":"nest build"},"dependencies":{"@nestjs/core":"1"}}"#,
+        )
+        .expect("api package");
+        fs::write(
+            directory.path().join("infra/Dockerfile.api"),
+            "FROM node:22-slim\n",
+        )
+        .expect("dockerfile");
+
+        let report = inspect_project(directory.path()).expect("inspection");
+        assert_eq!(
+            report.services[0].dockerfile.as_deref(),
+            Some("infra/Dockerfile.api")
+        );
     }
 }
