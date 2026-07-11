@@ -2302,7 +2302,7 @@ fn git_stdout(root: &Path, arguments: &[&str]) -> Result<String, String> {
         .output()
         .map_err(|error| git_launch_error("读取 Git 项目", &error))?;
     if !output.status.success() {
-        return Err(git_failure("读取 Git 项目", &output.stderr));
+        return Err(git_failure("读取 Git 项目", &output.stdout, &output.stderr));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -2314,7 +2314,7 @@ fn run_git_command(mut command: Command, action: &str) -> Result<(), String> {
     if output.status.success() {
         return Ok(());
     }
-    Err(git_failure(action, &output.stderr))
+    Err(git_failure(action, &output.stdout, &output.stderr))
 }
 
 fn git_launch_error(action: &str, error: &std::io::Error) -> String {
@@ -2325,8 +2325,12 @@ fn git_launch_error(action: &str, error: &std::io::Error) -> String {
     }
 }
 
-fn git_failure(action: &str, stderr: &[u8]) -> String {
-    let message = redact_text(&String::from_utf8_lossy(stderr));
+fn git_failure(action: &str, stdout: &[u8], stderr: &[u8]) -> String {
+    let message = redact_text(&format!(
+        "{}\n{}",
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr)
+    ));
     let normalized = message.to_ascii_lowercase();
     if action == "同步代码到 CNB"
         && (normalized.contains("non-fast-forward")
@@ -2345,7 +2349,12 @@ fn git_failure(action: &str, stderr: &[u8]) -> String {
                 || line.contains("[rejected]")
                 || line.contains("permission denied")
         })
-        .or_else(|| message.lines().find(|line| !line.trim().is_empty()))
+        .or_else(|| {
+            message.lines().find(|line| {
+                let line = line.trim();
+                !line.is_empty() && !line.to_ascii_lowercase().starts_with("to ")
+            })
+        })
         .unwrap_or("Git 返回未知错误");
     format!("{action}未完成：{}", summary.trim())
 }
@@ -2809,10 +2818,26 @@ providers:
     fn maps_diverged_cnb_pushes_to_a_recoverable_error() {
         let message = git_failure(
             "同步代码到 CNB",
+            b"",
             b"To https://cnb.cool/team/project.git\n ! [rejected] HEAD -> main (non-fast-forward)\nerror: failed to push some refs\n",
         );
 
         assert!(message.starts_with("AD-GIT-102"));
+        assert!(!message.contains("https://"));
+    }
+
+    #[test]
+    fn uses_git_stdout_when_stderr_only_contains_the_remote_destination() {
+        let message = git_failure(
+            "同步代码到 CNB",
+            b"remote: branch protection denied this update\n",
+            b"To https://cnb.cool/team/project.git\n",
+        );
+
+        assert_eq!(
+            message,
+            "同步代码到 CNB未完成：remote: branch protection denied this update"
+        );
         assert!(!message.contains("https://"));
     }
 
