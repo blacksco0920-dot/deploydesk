@@ -504,7 +504,7 @@ fn build_stages(manifest: &ProjectManifest) -> Vec<Value> {
 fn system_tools_stage() -> Value {
     json!({
         "name": "准备安全部署工具",
-        "script": ["apt-get update && apt-get install -y --no-install-recommends ca-certificates openssh-client && rm -rf /var/lib/apt/lists/*"]
+        "script": ["apt-get update && apt-get install -y --no-install-recommends ca-certificates git openssh-client && rm -rf /var/lib/apt/lists/*"]
     })
 }
 

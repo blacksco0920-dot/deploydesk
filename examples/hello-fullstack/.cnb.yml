@@ -16,7 +16,7 @@ $:
     stages:
     - name: 准备安全部署工具
       script:
-      - apt-get update && apt-get install -y --no-install-recommends ca-certificates openssh-client && rm -rf /var/lib/apt/lists/*
+      - apt-get update && apt-get install -y --no-install-recommends ca-certificates git openssh-client && rm -rf /var/lib/apt/lists/*
     - name: 登录镜像仓库
       script:
       - |-
@@ -181,7 +181,7 @@ $:
     stages:
     - name: 准备安全部署工具
       script:
-      - apt-get update && apt-get install -y --no-install-recommends ca-certificates openssh-client && rm -rf /var/lib/apt/lists/*
+      - apt-get update && apt-get install -y --no-install-recommends ca-certificates git openssh-client && rm -rf /var/lib/apt/lists/*
     - name: 安装依赖
       script:
       - corepack pnpm install --frozen-lockfile
@@ -398,7 +398,7 @@ $:
     stages:
     - name: 准备安全部署工具
       script:
-      - apt-get update && apt-get install -y --no-install-recommends ca-certificates openssh-client && rm -rf /var/lib/apt/lists/*
+      - apt-get update && apt-get install -y --no-install-recommends ca-certificates git openssh-client && rm -rf /var/lib/apt/lists/*
     - name: 登录镜像仓库
       script:
       - |-
@@ -563,7 +563,7 @@ $:
     stages:
     - name: 准备安全部署工具
       script:
-      - apt-get update && apt-get install -y --no-install-recommends ca-certificates openssh-client && rm -rf /var/lib/apt/lists/*
+      - apt-get update && apt-get install -y --no-install-recommends ca-certificates git openssh-client && rm -rf /var/lib/apt/lists/*
     - name: 登录镜像仓库
       script:
       - |-
@@ -729,7 +729,7 @@ main:
     stages:
     - name: 准备安全部署工具
       script:
-      - apt-get update && apt-get install -y --no-install-recommends ca-certificates openssh-client && rm -rf /var/lib/apt/lists/*
+      - apt-get update && apt-get install -y --no-install-recommends ca-certificates git openssh-client && rm -rf /var/lib/apt/lists/*
     - name: 安装依赖
       script:
       - corepack pnpm install --frozen-lockfile
