@@ -88,10 +88,48 @@ jobs:
           tagName: v__VERSION__
           releaseName: ABCDeploy v__VERSION__
           releaseBody: |
-            ABCDeploy 小白部署 Alpha 安装包。
+            ABCDeploy 小白部署 V2 预览安装包。
 
             当前构建未配置商业代码签名证书，请下载后校验 GitHub Release 资产摘要。
           releaseDraft: false
           prerelease: true
           generateReleaseNotes: true
           args: ${{ matrix.args }}
+
+  checksums:
+    name: 发布清单与校验值
+    needs: publish
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: 检出发布脚本
+        uses: actions/checkout@v6
+
+      - name: 下载全部安装包
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          mkdir -p release-assets
+          gh release download "v${VERSION}" --dir release-assets
+
+      - name: 生成校验值和国内镜像清单
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          find release-assets -type f ! -name 'latest.json' ! -name 'SHA256SUMS' -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sed 's#release-assets/##' > release-assets/SHA256SUMS
+          node scripts/build-release-manifest.mjs \
+            release-assets release-assets/latest.json "$VERSION"
+
+      - name: 上传发布清单
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          gh release upload "v${VERSION}" \
+            release-assets/SHA256SUMS \
+            release-assets/latest.json \
+            --clobber

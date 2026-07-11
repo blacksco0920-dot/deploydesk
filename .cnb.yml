@@ -1,6 +1,15 @@
 # 由 ABCDeploy 生成。流水线只引用密钥，不在仓库保存密钥值。
 # 试点兼容历史密钥字段；新项目由桌面端生成独立流水线身份与完整 known_hosts。
 $:
+  tag_deploy.production:
+  - name: deploydesk-production-from-cnb
+    stages:
+    - name: 使用同一候选版本发布正式环境
+      type: cnb:apply
+      options:
+        event: api_trigger_production
+        sync: true
+        title: ABCDeploy production promotion
   api_trigger_production:
   - docker:
       image: node:22-slim
@@ -312,6 +321,20 @@ $:
         docker buildx imagetools create --prefer-index=false --tag "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
         VERIFIED_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
         test "$VERIFIED_DIGEST" = "$IMAGE_DIGEST"
+    - name: 创建可在手机发布的候选版本
+      script:
+      - |-
+        set -eu
+        CANDIDATE_TAG="deploydesk-${CNB_COMMIT}"
+        AUTH_HEADER="Authorization: Basic $(printf 'cnb:%s' "$CNB_TOKEN" | base64 | tr -d '\n')"
+        REMOTE_SHA="$(git -c http.extraHeader="$AUTH_HEADER" ls-remote "$CNB_REPO_URL_HTTPS" "refs/tags/$CANDIDATE_TAG" | awk 'NR == 1 { print $1 }')"
+        if [ -n "$REMOTE_SHA" ]; then
+          test "$REMOTE_SHA" = "$CNB_COMMIT"
+        else
+          git tag -f "$CANDIDATE_TAG" "$CNB_COMMIT"
+          git -c http.extraHeader="$AUTH_HEADER" push "$CNB_REPO_URL_HTTPS" "refs/tags/$CANDIDATE_TAG"
+        fi
+        unset AUTH_HEADER
 production:
   push:
   - name: abcdeploy-production-approval
@@ -491,3 +514,17 @@ main:
         docker buildx imagetools create --prefer-index=false --tag "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
         VERIFIED_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REPOSITORY}:${VERIFIED_TAG}" | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }')"
         test "$VERIFIED_DIGEST" = "$IMAGE_DIGEST"
+    - name: 创建可在手机发布的候选版本
+      script:
+      - |-
+        set -eu
+        CANDIDATE_TAG="deploydesk-${CNB_COMMIT}"
+        AUTH_HEADER="Authorization: Basic $(printf 'cnb:%s' "$CNB_TOKEN" | base64 | tr -d '\n')"
+        REMOTE_SHA="$(git -c http.extraHeader="$AUTH_HEADER" ls-remote "$CNB_REPO_URL_HTTPS" "refs/tags/$CANDIDATE_TAG" | awk 'NR == 1 { print $1 }')"
+        if [ -n "$REMOTE_SHA" ]; then
+          test "$REMOTE_SHA" = "$CNB_COMMIT"
+        else
+          git tag -f "$CANDIDATE_TAG" "$CNB_COMMIT"
+          git -c http.extraHeader="$AUTH_HEADER" push "$CNB_REPO_URL_HTTPS" "refs/tags/$CANDIDATE_TAG"
+        fi
+        unset AUTH_HEADER

@@ -6,17 +6,18 @@
 
 面向 vibe coding 用户的引导式容器化部署桌面客户端。选择代码目录后，ABCDeploy 会识别项目、推荐三环境方案，并引导完成 CNB 构建、服务器部署、Caddy HTTPS、生产晋级和版本回滚。
 
-**[访问官网](https://abcdeploy.finagent.cloud)** · **[下载预览版](https://github.com/blacksco0920-dot/abcdeploy/releases)**
+**[访问官网与国内下载](https://abcdeploy.finagent.cloud)** · **[开源仓库与备用下载](https://github.com/blacksco0920-dot/abcdeploy/releases)**
 
 ![ABCDeploy 项目工作台](apps/site/public/abcdeploy-workspace.png)
 
-> 当前为 `0.1.0 Alpha`。适合试点和测试环境；正式业务上线前仍应确认数据库备份、域名归属和平台代码签名状态。
+> 当前为 `0.2.0-preview.1`。适合试点和测试环境；正式业务上线前仍应确认数据库备份、域名归属和平台代码签名状态。
 
 ## 为什么做这个项目
 
 传统部署工具往往先要求用户理解镜像、流水线、SSH、反向代理和环境隔离。ABCDeploy 把这些知识变成推荐默认值和可恢复步骤：系统能判断的自动完成，必须由用户授权的操作明确展示。
 
 - 重新打开应用会自动恢复项目与部署进度。
+- 持久侧边栏同时展示多个项目；切换项目不会中断其他构建任务。
 - 只填写服务器地址，自动发现或生成本机 SSH 身份。
 - 内部安全值自动生成，第三方配置按测试/生产分别保存。
 - 代码只构建一次，测试通过后将同一提交和镜像摘要晋级生产。
@@ -33,9 +34,10 @@ flowchart LR
   B --> C[不可变镜像与完整提交 SHA]
   C --> D[自动部署测试环境]
   D --> E[容器与公网健康检查]
-  E --> F{用户确认发布}
-  F --> G[同一提交晋级生产]
-  G --> H[同一镜像摘要]
+  E --> F[创建候选版本 Tag]
+  F --> G{CNB 或客户端确认发布}
+  G --> H[同一提交晋级生产]
+  H --> I[同一镜像摘要]
 ```
 
 测试和生产只共享已验证的程序镜像。两套环境的域名、变量、数据库、容器网络和发布记录始终独立。
@@ -49,17 +51,18 @@ flowchart LR
 ## 支持能力
 
 - 识别 NestJS、Next.js、Vite、UniApp、Taro、Prisma 和 pnpm workspace。
-- 生成 `deploy.yaml`、Docker Compose、Caddy、CNB 流水线和 GitHub 同步工作流。
-- 使用 CNB Docker 制品库或腾讯云 TCR。
+- 生成 `deploy.yaml`、Docker Compose、Caddy 和 CNB 流水线；导入 GitHub 项目时可保留兼容同步工作流。
+- 使用通用 OCI 镜像仓库契约，国内默认推荐腾讯云 TCR，也可使用 CNB Docker 制品库。
 - 使用内置纯 Rust SSH，支持 RSA/Ed25519 私钥和固定服务器指纹。
 - 为每个项目生成独立流水线身份，用户登录私钥不会上传到 CNB。
-- 使用操作系统钥匙串保存 Token 与分环境运行配置。
+- 使用操作系统钥匙串保存 Token 与测试、生产两份完整运行配置文件。
 - 保留部署记录、完整提交 SHA、CNB 构建编号和回滚结果。
+- 失败时展示稳定错误码、处理步骤和可折叠技术详情。
 - 提供 Rust CLI `deployctl`，用于自动化、Schema 生成和排障。
 
 ## 安装
 
-在 [GitHub Releases](https://github.com/blacksco0920-dot/abcdeploy/releases) 下载：
+优先从 [ABCDeploy 官网](https://abcdeploy.finagent.cloud) 下载；无法访问时可使用 [GitHub Releases](https://github.com/blacksco0920-dot/abcdeploy/releases) 备用入口：
 
 - macOS Apple Silicon / Intel：`.dmg`
 - Windows x64：NSIS `.exe` 或 `.msi`
@@ -102,10 +105,10 @@ cargo run -p deployctl -- init /你的项目目录
 
 ### 2. 跟随五步引导
 
-1. **选择项目**：只读识别依赖、脚本、Dockerfile、Prisma Schema 和 `.env.example` 的变量名。
+1. **选择项目**：只读识别依赖、脚本、Dockerfile、Prisma Schema 和 `.env.example` 模板。
 2. **连接服务**：粘贴一次 CNB Token；填写服务器地址并确认 SSH 指纹。
 3. **确认推荐方案**：默认使用一个发布分支、测试自动部署、生产人工晋级。
-4. **补充必要信息**：填写可选域名和系统无法推断的第三方配置；测试与生产分别保存。
+4. **补充必要信息**：填写可选域名；直接编辑测试、生产两份完整 `.env`，注释和自定义字段原样保留。
 5. **查看部署计划**：预览将写入的每个文件，确认后才初始化 Caddy 和启动部署。
 
 ### 3. 完成一次 CNB 保护配置
@@ -117,7 +120,7 @@ ABCDeploy 可以通过 API 创建普通私有代码仓库，但 CNB 密钥仓库
 3. 用户分别点击“复制安全配置”，粘贴到对应文件并保存。
 4. 回到应用确认完成，部署会从原检查点继续，不重复准备服务器。
 
-安全配置包含 ABCDeploy 为该项目创建的流水线私钥、已确认的服务器公钥和对应环境的运行值。内容只在用户点击复制时交给前端，不写入 SQLite、项目目录或日志。
+安全配置包含 ABCDeploy 为该项目创建的流水线私钥、已确认的服务器公钥和对应环境的完整运行配置文件。内容只在用户点击复制时交给前端，不写入 SQLite、项目目录或日志。
 
 CNB 密钥仓库说明见 [官方文档](https://docs.cnb.cool/zh/repo/secret.html)。
 
@@ -138,7 +141,7 @@ deploy.yaml                                      项目部署协议
 
 ## 安全设计
 
-- Token、流水线私钥和运行值通过操作系统钥匙串保存。
+- Token、流水线私钥和分环境运行配置文件通过操作系统钥匙串保存。
 - 服务器首次连接必须人工确认 SHA-256 指纹，后续指纹变化立即停止。
 - 流水线使用项目专属 Ed25519 身份，只把公钥幂等写入服务器。
 - GitHub 同步使用临时 HTTP Header，Token 不进入 URL、命令参数或 Git 配置。
@@ -148,6 +151,7 @@ deploy.yaml                                      项目部署协议
 - 外部错误在进入 UI 和持久化层前统一脱敏。
 
 更完整的边界和漏洞报告方式见 [SECURITY.md](SECURITY.md)。
+面向用户的故障编号见 [错误码说明](docs/error-codes.md)。
 
 ## 本地开发
 
@@ -173,6 +177,7 @@ pnpm tauri:build
 
 - [架构设计](docs/architecture.md)
 - [分支、环境与镜像晋级](docs/deployment-model.md)
+- [安装包发布与国内分发](docs/release.md)
 - [V2 产品定义](docs/v2/README.md)
 - [安全策略](SECURITY.md)
 - [贡献指南](CONTRIBUTING.md)

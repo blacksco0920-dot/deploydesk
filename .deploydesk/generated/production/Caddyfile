@@ -1,5 +1,2 @@
 # abcdeploy / 生产环境，由 ABCDeploy 生成
-
-abcdeploy.finagent.cloud {
-	reverse_proxy abcdeploy-production-site:80
-}
+# 官网与安装包静态目录由 server-ops 的统一 Caddy 路由管理。

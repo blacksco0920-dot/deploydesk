@@ -44,6 +44,7 @@ export interface InspectionReport {
   services: DetectedService[];
   prisma_schemas: string[];
   dockerfiles: string[];
+  environment_files: string[];
   environment_variables: Array<{
     name: string;
     secret: boolean;
@@ -138,6 +139,18 @@ export interface ProviderCheck {
   ok: boolean;
   summary: string;
   details: string[];
+  code?: string | null;
+  nextSteps?: string[];
+  retryable?: boolean;
+}
+
+export interface UserFacingIssue {
+  code: string;
+  title: string;
+  message: string;
+  nextSteps: string[];
+  technicalDetails: string[];
+  retryable: boolean;
 }
 
 export interface CnbRepositoryInput {
@@ -187,6 +200,21 @@ export interface RuntimeSecretStatus {
   stored: boolean;
 }
 
+export interface RuntimeConfigFile {
+  environment: "staging" | "production";
+  filename: string;
+  sourceFiles: string[];
+  content: string;
+  templateContent: string;
+  stored: boolean;
+}
+
+export interface RuntimeConfigStatus {
+  environment: "staging" | "production";
+  filename: string;
+  stored: boolean;
+}
+
 export interface CnbSecretBundle {
   environment: "staging" | "production";
   filename: string;
@@ -220,6 +248,10 @@ export interface RecentProject {
   serviceCount: number;
   lastOpenedAt: string;
   pathExists: boolean;
+  latestStatus: DeploymentRunStatus | null;
+  latestEnvironment: "staging" | "production" | null;
+  latestMessage: string | null;
+  activeRunCount: number;
 }
 
 export type NavigationSection =
@@ -257,6 +289,12 @@ export interface ServerResource extends ServerForm {
 export type DeploymentRunStatus =
   "queued" | "running" | "needs_action" | "success" | "failed" | "cancelled";
 
+export interface DeploymentArtifact {
+  service: string;
+  image: string;
+  digest: string;
+}
+
 export interface DeploymentRun {
   id: string;
   projectPath: string;
@@ -267,8 +305,11 @@ export interface DeploymentRun {
   buildSerial: string | null;
   commitSha: string | null;
   sourceRunId: string | null;
+  candidateTag: string | null;
+  artifacts: DeploymentArtifact[];
   actionKind: string | null;
   actionUrl: string | null;
+  issueCode: string | null;
   repository: string;
   branch: string;
   message: string;

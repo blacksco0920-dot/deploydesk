@@ -9,12 +9,13 @@ use sha2::{Digest, Sha256};
 use crate::error::{DeployError, Result};
 use crate::manifest::validate_manifest;
 use crate::model::{
-    BuildProviderConfig, BuildProviderKind, DatabaseBinding, DeploymentPlan, DiagnosticLevel,
-    DomainRoute, EnvironmentConfig, EnvironmentName, EnvironmentPlanSummary, EnvironmentSet,
-    EnvironmentVariable, FileChange, FileChangeKind, HealthcheckConfig, InspectionReport,
-    MigrationConfig, PlanStep, ProductionMode, ProjectCommands, ProjectConfig, ProjectManifest,
-    ProviderConfig, RegistryConfig, ReleasePolicy, ReverseProxyProvider, ServiceConfig,
-    ServiceKind, SourceConfig, SourceProvider, StepExecutor, TargetConfig, TargetKind, UserAction,
+    ApprovalProviderConfig, BuildProviderConfig, BuildProviderKind, DatabaseBinding,
+    DeploymentPlan, DiagnosticLevel, DnsProviderConfig, DomainRoute, EnvironmentConfig,
+    EnvironmentName, EnvironmentPlanSummary, EnvironmentSet, EnvironmentVariable, FileChange,
+    FileChangeKind, HealthcheckConfig, InspectionReport, MigrationConfig, PlanStep, ProductionMode,
+    ProjectCommands, ProjectConfig, ProjectManifest, ProviderConfig, RegistryConfig, ReleasePolicy,
+    ReverseProxyProvider, RuntimeProviderConfig, SecretProviderConfig, ServiceConfig, ServiceKind,
+    SourceConfig, SourceProvider, StepExecutor, TargetConfig, TargetKind, UserAction,
     UserActionCategory,
 };
 use crate::redact::redact_text;
@@ -88,7 +89,7 @@ pub fn create_default_manifest(report: &InspectionReport) -> ProjectManifest {
             commands: ProjectCommands::default(),
         },
         source: SourceConfig {
-            provider: SourceProvider::Github,
+            provider: SourceProvider::Cnb,
             repository: format!("owner/{}", report.project_name),
             release_branch: "main".to_string(),
             integration_branch: String::new(),
@@ -161,6 +162,10 @@ pub fn create_default_manifest(report: &InspectionReport) -> ProjectManifest {
             registry: RegistryConfig::Cnb {
                 repository: format!("owner/{}", report.project_name),
             },
+            runtime: RuntimeProviderConfig::SshDockerCompose,
+            secrets: SecretProviderConfig::CnbSecretRepository,
+            approval: ApprovalProviderConfig::CnbDeployment,
+            dns: DnsProviderConfig::Manual,
             reverse_proxy: ReverseProxyProvider::Caddy,
         },
         release: ReleasePolicy {

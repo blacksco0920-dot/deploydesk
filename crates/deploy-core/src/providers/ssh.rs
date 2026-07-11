@@ -287,6 +287,9 @@ pub async fn check_connection(profile: &SshProfile) -> Result<ProviderCheck> {
             ok: false,
             summary: "SSH 私钥文件不存在".to_string(),
             details: vec!["重新选择本机私钥文件".to_string()],
+            code: Some("AD-SSH-101".to_string()),
+            next_steps: vec!["返回服务器连接步骤，重新选择或生成 SSH 私钥".to_string()],
+            retryable: true,
         });
     }
     let identity = match probe_host_identity(profile).await {
@@ -322,6 +325,9 @@ pub async fn check_connection(profile: &SshProfile) -> Result<ProviderCheck> {
                 "已验证服务器身份 {}，未执行远程写操作",
                 identity.fingerprint
             )],
+            code: None,
+            next_steps: Vec::new(),
+            retryable: false,
         });
     }
     Ok(failed_check(
@@ -461,6 +467,9 @@ fn host_key_gate(profile: &SshProfile, observed: &str) -> Option<ProviderCheck> 
             ok: false,
             summary: "请确认这台服务器的身份指纹".to_string(),
             details: vec![observed.to_string()],
+            code: None,
+            next_steps: Vec::new(),
+            retryable: true,
         }),
         Some(expected) if expected != observed => Some(ProviderCheck {
             provider: "ssh-host-key-mismatch".to_string(),
@@ -470,6 +479,9 @@ fn host_key_gate(profile: &SshProfile, observed: &str) -> Option<ProviderCheck> 
                 format!("已保存：{expected}"),
                 format!("本次发现：{observed}"),
             ],
+            code: Some("AD-SSH-103".to_string()),
+            next_steps: vec!["确认服务器是否重装或更换；核实无误后重新建立信任".to_string()],
+            retryable: false,
         }),
         Some(_) => None,
     }
@@ -545,6 +557,9 @@ fn failed_check(provider: &str, summary: String, message: &str) -> ProviderCheck
                 .unwrap_or("SSH 验证失败")
                 .to_string(),
         ],
+        code: Some("AD-SSH-102".to_string()),
+        next_steps: vec!["检查服务器地址、安全组、登录用户和 SSH 私钥后重试".to_string()],
+        retryable: true,
     }
 }
 

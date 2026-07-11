@@ -35,6 +35,13 @@ pub fn check_engine() -> Result<ProviderCheck> {
         } else {
             vec![redact_text(&String::from_utf8_lossy(&output.stderr))]
         },
+        code: (!output.status.success()).then(|| "AD-LOC-101".to_string()),
+        next_steps: if output.status.success() {
+            Vec::new()
+        } else {
+            vec!["启动 Docker Desktop 或 Docker Engine 后重新检查".to_string()]
+        },
+        retryable: !output.status.success(),
     })
 }
 
@@ -67,5 +74,12 @@ pub fn validate_compose(compose_file: &Path, env_file: Option<&Path>) -> Result<
         } else {
             vec![redact_text(&String::from_utf8_lossy(&output.stderr))]
         },
+        code: (!output.status.success()).then(|| "AD-LOC-102".to_string()),
+        next_steps: if output.status.success() {
+            Vec::new()
+        } else {
+            vec!["检查 Compose 文件和环境配置后重新验证".to_string()]
+        },
+        retryable: !output.status.success(),
     })
 }

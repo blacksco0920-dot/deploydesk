@@ -87,6 +87,9 @@ jobs:
       - name: 官网构建
         run: pnpm --filter @abcdeploy/site build
 
+      - name: 验证安装包发布清单
+        run: node --test scripts/build-release-manifest.test.mjs
+
       - name: 官网容器构建
         if: runner.os == 'Linux'
         run: docker build -f apps/site/Dockerfile -t abcdeploy-site:ci .

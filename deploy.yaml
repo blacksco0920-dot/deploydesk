@@ -58,10 +58,7 @@ environments:
     branch: null
     auto_deploy: false
     approval_required: true
-    domains:
-    - service: site
-      host: abcdeploy.finagent.cloud
-      path: /
+    domains: []
     database: null
     redis_namespace: null
     secrets_ref: https://cnb.cool/blacksco0920/finagent-secrets/-/blob/main/envs.yml

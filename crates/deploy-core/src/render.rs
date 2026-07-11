@@ -9,6 +9,8 @@ use crate::model::{
     EnvironmentConfig, EnvironmentName, ProductionMode, ProjectManifest, RegistryConfig,
     ServiceConfig, ServiceKind, SourceProvider,
 };
+use crate::providers::registry::RegistryProvider;
+use crate::providers::{PipelineProviderAdapter, pipeline::CnbPipelineProvider};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedFile {
@@ -93,6 +95,11 @@ pub fn render_project_files(manifest: &ProjectManifest) -> Result<Vec<GeneratedF
     files.push(GeneratedFile {
         path: ".cnb.yml".to_string(),
         content: render_cnb_pipeline(manifest)?,
+    });
+    let pipeline = CnbPipelineProvider;
+    files.push(GeneratedFile {
+        path: pipeline.deployment_config_path().to_string(),
+        content: render_cnb_deployments()?,
     });
     if manifest.source.provider == SourceProvider::Github {
         files.push(GeneratedFile {
@@ -187,9 +194,6 @@ fn render_env_example(
         "# 由 ABCDeploy 生成，仅包含变量名和非敏感默认值。".to_string(),
         format!("DEPLOYDESK_ENV={}", name.as_str()),
     ];
-    for service in &manifest.services {
-        lines.push(format!("{}=", image_variable(service)));
-    }
     if let Some(database) = &environment.database {
         lines.push(format!("DATABASE_NAME={}", database.name));
         lines.push(format!("DATABASE_USER={}", database.user));
@@ -222,7 +226,7 @@ fn render_env_example(
 fn render_secret_example(
     manifest: &ProjectManifest,
     name: EnvironmentName,
-    environment: &EnvironmentConfig,
+    _environment: &EnvironmentConfig,
 ) -> Result<String> {
     let prefix = name.as_str().to_ascii_uppercase();
     let mut values = BTreeMap::<String, String>::from([
@@ -231,25 +235,13 @@ fn render_secret_example(
         (format!("{prefix}_SERVER_USER"), String::new()),
         (format!("{prefix}_SERVER_SSH_KEY"), String::new()),
         (format!("{prefix}_SERVER_KNOWN_HOSTS"), String::new()),
+        (format!("{prefix}_RUNTIME_ENV_FILE"), String::new()),
     ]);
-    if environment.database.is_some() {
-        values.insert(format!("{prefix}_DATABASE_URL"), String::new());
-    }
-    if environment.redis_namespace.is_some() {
-        values.insert(format!("{prefix}_REDIS_URL"), String::new());
-    }
-    for variable in manifest
-        .services
-        .iter()
-        .flat_map(|service| &service.runtime_env)
-    {
-        values
-            .entry(format!("{prefix}_{}", variable.name))
-            .or_insert_with(|| variable.default.clone().unwrap_or_default());
-    }
-    if matches!(manifest.providers.registry, RegistryConfig::Tcr { .. }) {
-        values.insert("TCR_USERNAME".to_string(), String::new());
-        values.insert("TCR_PASSWORD".to_string(), String::new());
+    if !matches!(manifest.providers.registry, RegistryConfig::Cnb { .. }) {
+        let provider = RegistryProvider::new(&manifest.providers.registry);
+        let (username, password) = provider.credential_names();
+        values.insert(username.to_string(), String::new());
+        values.insert(password.to_string(), String::new());
     }
     let mut content = serde_yaml_ng::to_string(&values).map_err(|source| DeployError::Yaml {
         path: format!("generated/{}/secret.example.yml", name.as_str()).into(),
@@ -259,7 +251,7 @@ fn render_secret_example(
         0,
         concat!(
             "# 仅包含字段名和空占位符。请在 CNB 密钥仓库 Web 页面填写，勿提交真实值。\n",
-            "# SSH 私钥可在 Web 编辑器中改用 YAML 的 | 多行格式。\n",
+            "# SSH 私钥和 RUNTIME_ENV_FILE 请在 Web 编辑器中使用 YAML 的 | 多行格式。\n",
             "# SERVER_KNOWN_HOSTS 应填写已人工核对指纹后的 known_hosts 完整行。\n",
         ),
     );
@@ -311,6 +303,7 @@ fn render_caddy(
 }
 
 fn render_cnb_pipeline(manifest: &ProjectManifest) -> Result<String> {
+    let provider = CnbPipelineProvider;
     let release = release_pipeline(manifest)?;
 
     let mut root = Map::new();
@@ -319,10 +312,18 @@ fn render_cnb_pipeline(manifest: &ProjectManifest) -> Result<String> {
         json!({ "push": [release.clone()] }),
     );
     let mut api_triggers = Map::new();
-    api_triggers.insert("api_trigger_staging".to_string(), json!([release]));
+    api_triggers.insert(provider.staging_event().to_string(), json!([release]));
+    api_triggers.insert(
+        provider.native_staging_event().to_string(),
+        json!([native_staging_pipeline(manifest)?]),
+    );
     if manifest.release.production_mode == ProductionMode::Approval {
         api_triggers.insert(
-            "api_trigger_production".to_string(),
+            provider.production_event().to_string(),
+            json!([production_pipeline(manifest)?]),
+        );
+        api_triggers.insert(
+            provider.native_production_event().to_string(),
             json!([production_pipeline(manifest)?]),
         );
     }
@@ -335,6 +336,42 @@ fn render_cnb_pipeline(manifest: &ProjectManifest) -> Result<String> {
     content.insert_str(
         0,
         "# 由 ABCDeploy 生成。流水线只引用密钥，不在仓库保存密钥值。\n",
+    );
+    Ok(content)
+}
+
+fn render_cnb_deployments() -> Result<String> {
+    let document = json!({
+        "environments": [
+            {
+                "name": "staging",
+                "description": "重新部署这次已经验证的测试版本",
+                "title": "重新部署测试环境",
+                "env": { "DEPLOYDESK_ENV": "staging" },
+                "permissions": { "roles": ["owner", "master", "developer"] }
+            },
+            {
+                "name": "production",
+                "description": "把测试通过的同一镜像摘要发布到正式环境",
+                "title": "发布正式环境",
+                "env": { "DEPLOYDESK_ENV": "production" },
+                "permissions": { "roles": ["owner", "master"] },
+                "require": [
+                    {
+                        "approver": { "roles": ["owner", "master"] },
+                        "title": "确认本次正式发布"
+                    }
+                ]
+            }
+        ]
+    });
+    let mut content = serde_yaml_ng::to_string(&document).map_err(|source| DeployError::Yaml {
+        path: ".cnb/tag_deploy.yml".into(),
+        source,
+    })?;
+    content.insert_str(
+        0,
+        "# 由 ABCDeploy 生成。候选 Tag 只会在测试环境健康后创建。\n",
     );
     Ok(content)
 }
@@ -353,6 +390,10 @@ fn release_pipeline(manifest: &ProjectManifest) -> Result<Value> {
         "name": "标记已验证镜像摘要",
         "script": [promote_script(manifest)]
     }));
+    stages.push(json!({
+        "name": "创建可在手机发布的候选版本",
+        "script": [candidate_tag_script(manifest)]
+    }));
 
     let mut imports = vec![secret_import(manifest, EnvironmentName::Staging)];
     if manifest.release.production_mode == ProductionMode::Automatic {
@@ -369,6 +410,28 @@ fn release_pipeline(manifest: &ProjectManifest) -> Result<Value> {
 
     Ok(pipeline_definition(
         "deploydesk-release-candidate",
+        &imports,
+        EnvironmentName::Staging,
+        &stages,
+    ))
+}
+
+fn native_staging_pipeline(manifest: &ProjectManifest) -> Result<Value> {
+    let stages = vec![
+        system_tools_stage(),
+        registry_login_stage(manifest),
+        json!({
+            "name": "重新部署已验证的测试版本",
+            "script": [deploy_script(
+                manifest,
+                EnvironmentName::Staging,
+                ReleaseChannel::Verified,
+            )?]
+        }),
+    ];
+    let imports = [secret_import(manifest, EnvironmentName::Staging)];
+    Ok(pipeline_definition(
+        "deploydesk-staging-redeploy",
         &imports,
         EnvironmentName::Staging,
         &stages,
@@ -459,15 +522,19 @@ fn registry_login_script(manifest: &ProjectManifest) -> String {
             "printf '%s' \"$CNB_TOKEN\" | docker login docker.cnb.cool --username \"${CNB_USERNAME:-cnb}\" --password-stdin"
         )
         .to_string(),
-        RegistryConfig::Tcr { registry, .. } => format!(
-            "test -n \"$TCR_USERNAME\"\ntest -n \"$TCR_PASSWORD\"\nprintf '%s' \"$TCR_PASSWORD\" | docker login {} --username \"$TCR_USERNAME\" --password-stdin",
-            shell_quote(registry)
-        ),
+        RegistryConfig::Tcr { .. } | RegistryConfig::Oci { .. } => {
+            let provider = RegistryProvider::new(&manifest.providers.registry);
+            let (username, password) = provider.credential_names();
+            format!(
+                "test -n \"${{{username}:-}}\"\ntest -n \"${{{password}:-}}\"\nprintf '%s' \"${{{password}}}\" | docker login {} --username \"${{{username}}}\" --password-stdin",
+                shell_quote(provider.push_registry())
+            )
+        }
     }
 }
 
 fn build_script(manifest: &ProjectManifest, service: &ServiceConfig) -> String {
-    let repository = image_repository(manifest, &service.image);
+    let repository = image_push_repository(manifest, &service.image);
     let mut build_arguments = String::new();
     for (key, value) in &service.build_args {
         write!(
@@ -500,7 +567,7 @@ fn promote_script(manifest: &ProjectManifest) -> String {
         "VERIFIED_TAG=\"verified-${IMAGE_TAG}\"".to_string(),
     ];
     for service in &manifest.services {
-        let repository = image_repository(manifest, &service.image);
+        let repository = image_push_repository(manifest, &service.image);
         lines.push(format!("IMAGE_REPOSITORY={}", shell_quote(&repository)));
         lines.push(format!(
             "IMAGE_DIGEST=\"{}\"",
@@ -521,6 +588,25 @@ fn promote_script(manifest: &ProjectManifest) -> String {
         lines.push("test \"$VERIFIED_DIGEST\" = \"$IMAGE_DIGEST\"".to_string());
     }
     lines.join("\n")
+}
+
+fn candidate_tag_script(manifest: &ProjectManifest) -> String {
+    let tag = manifest
+        .release
+        .candidate_tag_template
+        .replace("{commit}", "${CNB_COMMIT}");
+    [
+        "set -eu".to_string(),
+        format!("CANDIDATE_TAG=\"{tag}\""),
+        "case \"$CANDIDATE_TAG\" in ''|*[!A-Za-z0-9._-]*) echo '候选版本标签无效' >&2; exit 1 ;; esac".to_string(),
+        "test -n \"${CNB_TOKEN:-}\"".to_string(),
+        "AUTH_HEADER=\"Authorization: Basic $(printf 'cnb:%s' \"$CNB_TOKEN\" | base64 | tr -d '\\n')\"".to_string(),
+        "REMOTE_SHA=\"$(git -c http.extraHeader=\"$AUTH_HEADER\" ls-remote \"$CNB_REPO_URL_HTTPS\" \"refs/tags/$CANDIDATE_TAG\" | awk 'NR == 1 { print $1 }')\"".to_string(),
+        "if [ -n \"$REMOTE_SHA\" ]; then test \"$REMOTE_SHA\" = \"$CNB_COMMIT\"; else git tag -f \"$CANDIDATE_TAG\" \"$CNB_COMMIT\"; git -c http.extraHeader=\"$AUTH_HEADER\" push \"$CNB_REPO_URL_HTTPS\" \"refs/tags/$CANDIDATE_TAG\"; fi".to_string(),
+        "unset AUTH_HEADER".to_string(),
+        "printf '已验证候选版本：%s\\n' \"$CANDIDATE_TAG\"".to_string(),
+    ]
+    .join("\n")
 }
 
 fn deploy_script(
@@ -556,11 +642,16 @@ fn deploy_script(
 
     for service in &manifest.services {
         let variable = image_variable(service);
-        let repository_variable = format!("{variable}_REPOSITORY");
+        let repository_variable = format!("{variable}_PUSH_REPOSITORY");
+        let pull_repository_variable = format!("{variable}_PULL_REPOSITORY");
         let digest_variable = format!("{variable}_DIGEST");
         lines.push(format!(
             "{repository_variable}={}",
-            shell_quote(&image_repository(manifest, &service.image))
+            shell_quote(&image_push_repository(manifest, &service.image))
+        ));
+        lines.push(format!(
+            "{pull_repository_variable}={}",
+            shell_quote(&image_pull_repository(manifest, &service.image))
         ));
         let image_reference = format!("\"${{{repository_variable}}}:${{RELEASE_TAG}}\"");
         lines.push(format!(
@@ -572,7 +663,7 @@ fn deploy_script(
             service.id
         ));
         lines.push(format!(
-            "{variable}=\"${{{repository_variable}}}@${{{digest_variable}}}\""
+            "{variable}=\"${{{pull_repository_variable}}}@${{{digest_variable}}}\""
         ));
     }
 
@@ -731,31 +822,45 @@ fn runtime_env_script(
                 source,
             },
         )?;
+    let runtime_file_source = format!("{prefix}_RUNTIME_ENV_FILE");
 
     Ok([
         "node <<'DEPLOYDESK_NODE'".to_string(),
         "const fs = require(\"node:fs\");".to_string(),
         format!("const variables = {specs_json};"),
         format!("const outputPath = {output_path};"),
-        format!("const lines = [{environment_line}];"),
-        "const missing = [];".to_string(),
-        "for (const variable of variables) {".to_string(),
-        "  const configured = Object.prototype.hasOwnProperty.call(process.env, variable.source);"
-            .to_string(),
-        "  const value = configured ? process.env[variable.source] : (variable.default ?? \"\");"
-            .to_string(),
-        "  if (variable.required && !value) missing.push(variable.source);".to_string(),
-        "  if (/\\r|\\n/.test(value)) {".to_string(),
-        "    console.error(`密钥仓库字段 ${variable.source} 不支持换行值`);".to_string(),
+        format!("const runtimeFileSource = {runtime_file_source:?};"),
+        "const runtimeFile = process.env[runtimeFileSource];".to_string(),
+        "if (runtimeFile) {".to_string(),
+        "  if (runtimeFile.includes(\"\\0\")) {".to_string(),
+        "    console.error(`密钥仓库字段 ${runtimeFileSource} 包含无效字符`);".to_string(),
         "    process.exit(1);".to_string(),
         "  }".to_string(),
-        "  lines.push(`${variable.name}=${JSON.stringify(value)}`);".to_string(),
+        "  const content = runtimeFile.endsWith(\"\\n\") ? runtimeFile : `${runtimeFile}\\n`;"
+            .to_string(),
+        "  fs.writeFileSync(outputPath, content, { mode: 0o600 });".to_string(),
+        "} else {".to_string(),
+        format!("  const lines = [{environment_line}];"),
+        "  const missing = [];".to_string(),
+        "  for (const variable of variables) {".to_string(),
+        "    const configured = Object.prototype.hasOwnProperty.call(process.env, variable.source);"
+            .to_string(),
+        "    const value = configured ? process.env[variable.source] : (variable.default ?? \"\");"
+            .to_string(),
+        "    if (variable.required && !value) missing.push(variable.source);".to_string(),
+        "    if (/\\r|\\n/.test(value)) {".to_string(),
+        "      console.error(`密钥仓库字段 ${variable.source} 不支持换行值`);".to_string(),
+        "      process.exit(1);".to_string(),
+        "    }".to_string(),
+        "    lines.push(`${variable.name}=${JSON.stringify(value)}`);".to_string(),
+        "  }".to_string(),
+        "  if (missing.length) {".to_string(),
+        "    console.error(`缺少密钥仓库字段：${missing.join(\", \")}`);".to_string(),
+        "    process.exit(1);".to_string(),
+        "  }".to_string(),
+        "  fs.writeFileSync(outputPath, `${lines.join(\"\\n\")}\\n`, { mode: 0o600 });"
+            .to_string(),
         "}".to_string(),
-        "if (missing.length) {".to_string(),
-        "  console.error(`缺少密钥仓库字段：${missing.join(\", \")}`);".to_string(),
-        "  process.exit(1);".to_string(),
-        "}".to_string(),
-        "fs.writeFileSync(outputPath, `${lines.join(\"\\n\")}\\n`, { mode: 0o600 });".to_string(),
         "DEPLOYDESK_NODE".to_string(),
     ]
     .join("\n"))
@@ -768,13 +873,15 @@ fn remote_registry_login(manifest: &ProjectManifest) -> String {
             "printf '%s' \"$CNB_TOKEN\" | {ssh} {}",
             shell_quote("docker login docker.cnb.cool --username cnb --password-stdin")
         ),
-        RegistryConfig::Tcr { registry, .. } => {
+        RegistryConfig::Tcr { .. } | RegistryConfig::Oci { .. } => {
+            let provider = RegistryProvider::new(&manifest.providers.registry);
+            let (username, password) = provider.credential_names();
             let command = format!(
                 "IFS= read -r registry_user; test -n \"$registry_user\"; docker login {} --username \"$registry_user\" --password-stdin",
-                shell_quote(registry)
+                shell_quote(provider.pull_registry())
             );
             format!(
-                "{{ printf '%s\\n' \"$TCR_USERNAME\"; printf '%s' \"$TCR_PASSWORD\"; }} | {ssh} {}",
+                "{{ printf '%s\\n' \"${{{username}}}\"; printf '%s' \"${{{password}}}\"; }} | {ssh} {}",
                 shell_quote(&command)
             )
         }
@@ -792,6 +899,9 @@ fn remote_deploy_script(
     let prune_from = manifest.release.keep_releases.saturating_add(1);
     format!(
         r#"set -eu
+mkdir -p "$HOME/.deploydesk/locks"
+exec 9>"$HOME/.deploydesk/locks/server-deploy.lock"
+flock -w 900 9 || {{ echo '同一服务器已有部署任务，等待超时' >&2; exit 75; }}
 cd {remote_directory}
 backup_file() {{
   if [ -f "$1" ]; then cp "$1" "$1.previous"; else rm -f "$1.previous"; fi
@@ -825,13 +935,29 @@ mkdir -p .history "$HOME/.deploydesk/caddy/sites"
 cp .release.env ".history/$release_id.env"
 old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +{prune_from} || true)"
 if [ -n "$old_releases" ]; then printf '%s\n' "$old_releases" | xargs rm -f; fi
-cp Caddyfile "$HOME/.deploydesk/caddy/sites/{site_name}"
-if docker inspect deploydesk-caddy >/dev/null 2>&1; then
-  docker network connect {network} deploydesk-caddy 2>/dev/null || true
-  docker exec deploydesk-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
-  docker exec deploydesk-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+CADDY_CONTAINER="$(cat "$HOME/.deploydesk/caddy/container-name" 2>/dev/null || printf 'deploydesk-caddy')"
+CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '%s' "$HOME/.deploydesk/caddy/sites')"
+case "$CADDY_CONTAINER" in ''|*[!A-Za-z0-9_.-]*) echo 'AD-SRV-205：Caddy 容器记录无效' >&2; exit 1 ;; esac
+case "$CADDY_SITE_DIRECTORY" in /*) ;; *) echo 'AD-SRV-205：Caddy 路由目录记录无效' >&2; exit 1 ;; esac
+test -d "$CADDY_SITE_DIRECTORY" && test -w "$CADDY_SITE_DIRECTORY" || {{ echo 'AD-SRV-205：Caddy 路由目录不可写' >&2; exit 1; }}
+SITE_FILE="$CADDY_SITE_DIRECTORY/{site_name}"
+if [ -f "$SITE_FILE" ]; then cp "$SITE_FILE" "$SITE_FILE.previous"; else rm -f "$SITE_FILE.previous"; fi
+cp Caddyfile "$SITE_FILE"
+if docker inspect "$CADDY_CONTAINER" >/dev/null 2>&1; then
+  docker network connect {network} "$CADDY_CONTAINER" 2>/dev/null || true
+  if ! docker exec "$CADDY_CONTAINER" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile; then
+    if [ -f "$SITE_FILE.previous" ]; then cp "$SITE_FILE.previous" "$SITE_FILE"; else rm -f "$SITE_FILE"; fi
+    echo 'AD-SRV-206：新路由与现有 Caddy 配置冲突，已恢复原路由' >&2
+    exit 1
+  fi
+  if ! docker exec "$CADDY_CONTAINER" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile; then
+    if [ -f "$SITE_FILE.previous" ]; then cp "$SITE_FILE.previous" "$SITE_FILE"; else rm -f "$SITE_FILE"; fi
+    docker exec "$CADDY_CONTAINER" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 || true
+    echo 'AD-SRV-207：Caddy 重载失败，已恢复原路由' >&2
+    exit 1
+  fi
 else
-  echo 'ROUTE_PENDING: 应用已健康运行，服务器尚未初始化 ABCDeploy Caddy。'
+  echo 'ROUTE_PENDING: AD-SRV-203：应用已健康运行，但统一 Caddy 当前未运行。'
 fi"#,
         remote_directory = shell_quote(remote_directory),
         compose = compose,
@@ -863,16 +989,12 @@ fn image_tag_expression(manifest: &ProjectManifest) -> String {
         .replace("{commit}", "${CNB_COMMIT}")
 }
 
-fn image_repository(manifest: &ProjectManifest, image: &str) -> String {
-    match &manifest.providers.registry {
-        RegistryConfig::Cnb { repository } => {
-            format!("docker.cnb.cool/{repository}/{image}")
-        }
-        RegistryConfig::Tcr {
-            registry,
-            namespace,
-        } => format!("{registry}/{namespace}/{image}"),
-    }
+fn image_push_repository(manifest: &ProjectManifest, image: &str) -> String {
+    RegistryProvider::new(&manifest.providers.registry).push_repository(image)
+}
+
+fn image_pull_repository(manifest: &ProjectManifest, image: &str) -> String {
+    RegistryProvider::new(&manifest.providers.registry).pull_repository(image)
 }
 
 fn service_alias(
@@ -943,6 +1065,7 @@ fn image_variable(service: &ServiceConfig) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -983,8 +1106,12 @@ mod tests {
         assert_eq!(main_pipeline.matches("构建并上传").count(), 1);
         assert!(pipeline.content.contains("api_trigger_staging"));
         assert!(pipeline.content.contains("api_trigger_production"));
+        assert!(pipeline.content.contains("tag_deploy.staging"));
+        assert!(pipeline.content.contains("tag_deploy.production"));
         assert!(pipeline.content.contains("在测试环境验证生产候选"));
         assert!(pipeline.content.contains("标记已验证镜像摘要"));
+        assert!(pipeline.content.contains("创建可在手机发布的候选版本"));
+        assert!(pipeline.content.contains("deploydesk-${CNB_COMMIT}"));
         assert!(pipeline.content.contains("verified-${IMAGE_TAG}"));
         assert!(pipeline.content.contains("awk '$1 == \"Digest:\""));
         assert!(pipeline.content.contains("StrictHostKeyChecking=yes"));
@@ -1008,7 +1135,21 @@ mod tests {
                 .content
                 .contains("STAGING_SERVER_KNOWN_HOSTS")
         );
-        assert!(secret_example.content.contains("STAGING_DATABASE_URL"));
+        assert!(secret_example.content.contains("STAGING_RUNTIME_ENV_FILE"));
+        assert!(!secret_example.content.contains("STAGING_DATABASE_URL"));
+        assert!(pipeline.content.contains("STAGING_RUNTIME_ENV_FILE"));
+        assert!(pipeline.content.contains("caddy/container-name"));
+        assert!(pipeline.content.contains("caddy/site-directory"));
+        assert!(pipeline.content.contains("AD-SRV-206"));
+
+        let deployment = files
+            .iter()
+            .find(|file| file.path == ".cnb/tag_deploy.yml")
+            .expect("CNB native deployment config");
+        assert!(deployment.content.contains("name: staging"));
+        assert!(deployment.content.contains("name: production"));
+        assert!(deployment.content.contains("同一镜像摘要"));
+        assert!(deployment.content.contains("approver:"));
     }
 
     #[test]
@@ -1024,6 +1165,49 @@ mod tests {
         assert!(pipeline.contains("env.production.yml"));
         assert!(pipeline.contains("RELEASE_TAG=\"verified-${IMAGE_TAG}\""));
         assert!(!pipeline.contains("api_trigger_production"));
+    }
+
+    #[test]
+    fn whole_runtime_file_reaches_deployment_without_field_parsing() {
+        let tools_available = ["bash", "node"].into_iter().all(|tool| {
+            Command::new(tool)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        });
+        if !tools_available {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("runtime directory");
+        fs::create_dir_all(directory.path().join(".deploydesk/runtime/staging"))
+            .expect("create runtime path");
+        let manifest = create_default_manifest(&inspection_fixture());
+        let script = runtime_env_script(
+            &manifest,
+            EnvironmentName::Staging,
+            ".deploydesk/runtime/staging",
+        )
+        .expect("render runtime script");
+        let runtime_file = "# 原始注释\nUNKNOWN_DETAIL=a=b#c\nEMPTY=\n";
+        let status = Command::new("bash")
+            .current_dir(directory.path())
+            .arg("-c")
+            .arg(script)
+            .env("STAGING_RUNTIME_ENV_FILE", runtime_file)
+            .status()
+            .expect("run generated script");
+
+        assert!(status.success());
+        let deployed = fs::read_to_string(
+            directory
+                .path()
+                .join(".deploydesk/runtime/staging/.runtime.env"),
+        )
+        .expect("read deployed runtime file");
+        assert_eq!(deployed, runtime_file);
     }
 
     #[test]

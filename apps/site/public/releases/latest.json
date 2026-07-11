@@ -1,0 +1,11 @@
+{
+  "version": "v0.2.0-preview.1",
+  "channel": "preview",
+  "releasePage": "https://abcdeploy.finagent.cloud/#download",
+  "assets": {
+    "mac-arm": { "available": false, "url": "", "sha256": "" },
+    "mac-intel": { "available": false, "url": "", "sha256": "" },
+    "windows": { "available": false, "url": "", "sha256": "" },
+    "linux": { "available": false, "url": "", "sha256": "" }
+  }
+}

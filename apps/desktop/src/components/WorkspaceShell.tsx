@@ -1,10 +1,10 @@
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Activity,
   ArrowUpRight,
   Boxes,
   CheckCircle2,
   Cloud,
-  Code2,
   FolderOpen,
   History,
   Home,
@@ -17,12 +17,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { useState } from "react";
-import type {
-  DeploymentRun,
-  SystemPreflight,
-  WorkspacePreview,
-} from "../types";
-import { Brand } from "./Brand";
+import type { DeploymentRun, WorkspacePreview } from "../types";
 import { Button } from "./ui/button";
 import {
   Dialog,
@@ -52,11 +47,9 @@ const navigation = [
 
 interface WorkspaceShellProps {
   path: string;
-  preflight: SystemPreflight | null;
   workspace: WorkspacePreview;
   onDeploy: () => void;
   onForget: () => void;
-  onHome: () => void;
   onPromote: (run: DeploymentRun) => void;
   onRollback: (environment: DeploymentRun["environment"]) => void;
   onRefresh: () => void;
@@ -65,11 +58,9 @@ interface WorkspaceShellProps {
 
 export function WorkspaceShell({
   path,
-  preflight,
   workspace,
   onDeploy,
   onForget,
-  onHome,
   onPromote,
   onRollback,
   onRefresh,
@@ -80,146 +71,88 @@ export function WorkspaceShell({
   const [rollbackTarget, setRollbackTarget] = useState<
     DeploymentRun["environment"] | null
   >(null);
+  const [promoteTarget, setPromoteTarget] = useState<DeploymentRun | null>(
+    null,
+  );
 
   return (
     <TooltipProvider delayDuration={350}>
-      <div className="grid h-full min-h-0 grid-cols-[220px_minmax(0,1fr)] bg-[var(--background)] max-[780px]:grid-cols-[64px_minmax(0,1fr)]">
-        <aside className="flex min-h-0 flex-col border-r border-[var(--border)] bg-[var(--surface)] px-3 py-3">
-          <div className="flex h-10 items-center px-1 max-[780px]:justify-center">
-            <div className="max-[780px]:hidden">
-              <Brand />
-            </div>
-            <div className="hidden max-[780px]:block">
-              <Brand compact />
-            </div>
-          </div>
-
-          <button
-            className="mt-4 flex min-h-12 min-w-0 items-center gap-3 rounded-md px-2 text-left outline-none hover:bg-[var(--muted)] focus-visible:ring-2 focus-visible:ring-[var(--focus)] max-[780px]:justify-center"
-            onClick={onHome}
-            type="button"
+      <div className="grid h-full min-h-0 min-w-0 grid-rows-[58px_minmax(0,1fr)] bg-[var(--background)]">
+        <header
+          className="flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-5"
+          data-tauri-drag-region
+        >
+          <nav
+            aria-label="项目工作台"
+            className="flex min-w-0 items-center gap-1"
           >
-            <span className="grid size-8 shrink-0 place-items-center rounded-md bg-[var(--accent-soft)] text-[var(--accent)]">
-              <Code2 className="size-4" />
-            </span>
-            <span className="min-w-0 max-[780px]:hidden">
-              <strong className="block truncate text-xs font-medium">
-                {workspace.inspection.project_name}
-              </strong>
-              <span className="mt-0.5 block truncate text-[10px] text-[var(--muted-foreground)]">
-                切换项目
-              </span>
-            </span>
-          </button>
-
-          <nav className="mt-4 space-y-1" aria-label="项目导航">
             {navigation.map((item) => {
               const Icon = item.icon;
               return (
-                <Tooltip key={item.id}>
-                  <TooltipTrigger asChild>
-                    <button
-                      aria-current={active === item.id ? "page" : undefined}
-                      className={`flex h-9 w-full items-center gap-3 rounded-md px-3 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-[var(--focus)] max-[780px]:justify-center max-[780px]:px-0 ${
-                        active === item.id
-                          ? "bg-[var(--muted)] font-medium text-[var(--foreground)]"
-                          : "text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
-                      }`}
-                      onClick={() => setActive(item.id)}
-                      type="button"
-                    >
-                      <Icon className="size-4 shrink-0" />
-                      <span className="max-[780px]:hidden">{item.label}</span>
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent
-                    className="hidden max-[780px]:block"
-                    side="right"
-                  >
-                    {item.label}
-                  </TooltipContent>
-                </Tooltip>
+                <button
+                  aria-current={active === item.id ? "page" : undefined}
+                  className={`flex h-8 items-center gap-2 rounded-md px-3 text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-[var(--focus)] ${
+                    active === item.id
+                      ? "bg-[var(--muted)] font-medium text-[var(--foreground)]"
+                      : "text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
+                  }`}
+                  key={item.id}
+                  onClick={() => setActive(item.id)}
+                  type="button"
+                >
+                  <Icon className="size-3.5" />
+                  {item.label}
+                </button>
               );
             })}
           </nav>
-
-          <div className="mt-auto flex items-center gap-2 rounded-md px-2 py-2 max-[780px]:justify-center">
-            <span
-              className={`size-2 shrink-0 rounded-full ${
-                preflight?.ready_for_cloud_deploy
-                  ? "bg-[var(--success)]"
-                  : "bg-[var(--warning)]"
-              }`}
-            />
-            <span className="truncate text-[11px] text-[var(--muted-foreground)] max-[780px]:hidden">
-              {preflight?.ready_for_cloud_deploy
-                ? "本机能力正常"
-                : "本机能力待处理"}
-            </span>
+          <div className="flex items-center gap-1">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  aria-label="重新识别项目"
+                  onClick={onRefresh}
+                  size="icon"
+                  variant="ghost"
+                >
+                  <RefreshCw />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>重新识别项目</TooltipContent>
+            </Tooltip>
+            <Button onClick={onDeploy} size="sm">
+              <Rocket />
+              部署测试
+            </Button>
           </div>
-        </aside>
+        </header>
 
-        <div className="grid min-h-0 min-w-0 grid-rows-[54px_minmax(0,1fr)]">
-          <header
-            className="flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-5"
-            data-tauri-drag-region
-          >
-            <div className="min-w-0">
-              <strong className="block truncate text-sm font-medium">
-                {navigation.find((item) => item.id === active)?.label}
-              </strong>
-              <span className="block truncate text-[10px] text-[var(--subtle-foreground)]">
-                {workspace.inspection.project_name}
-              </span>
-            </div>
-            <div className="flex items-center gap-1">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    aria-label="重新识别项目"
-                    onClick={onRefresh}
-                    size="icon"
-                    variant="ghost"
-                  >
-                    <RefreshCw />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>重新识别项目</TooltipContent>
-              </Tooltip>
-              <Button onClick={onDeploy} size="sm">
-                <Rocket />
-                部署测试
-              </Button>
-            </div>
-          </header>
-
-          <main className="min-h-0 overflow-auto">
-            <div className="mx-auto w-full max-w-[980px] px-6 py-8">
-              {active === "project" ? (
-                <ProjectView
-                  onPromote={onPromote}
-                  onRollback={setRollbackTarget}
-                  runs={runs}
-                  workspace={workspace}
-                />
-              ) : null}
-              {active === "deployments" ? (
-                <DeploymentsView runs={runs} workspace={workspace} />
-              ) : null}
-              {active === "environments" ? (
-                <EnvironmentsView runs={runs} workspace={workspace} />
-              ) : null}
-              {active === "resources" ? <ResourcesView /> : null}
-              {active === "settings" ? (
-                <SettingsView
-                  path={path}
-                  onForget={() => setConfirmForget(true)}
-                  onRefresh={onRefresh}
-                />
-              ) : null}
-            </div>
-          </main>
-        </div>
+        <main className="min-h-0 overflow-auto">
+          <div className="mx-auto w-full max-w-[980px] px-6 py-8">
+            {active === "project" ? (
+              <ProjectView
+                onPromote={setPromoteTarget}
+                onRollback={setRollbackTarget}
+                runs={runs}
+                workspace={workspace}
+              />
+            ) : null}
+            {active === "deployments" ? (
+              <DeploymentsView runs={runs} workspace={workspace} />
+            ) : null}
+            {active === "environments" ? (
+              <EnvironmentsView runs={runs} workspace={workspace} />
+            ) : null}
+            {active === "resources" ? <ResourcesView /> : null}
+            {active === "settings" ? (
+              <SettingsView
+                path={path}
+                onForget={() => setConfirmForget(true)}
+                onRefresh={onRefresh}
+              />
+            ) : null}
+          </div>
+        </main>
       </div>
 
       <Dialog onOpenChange={setConfirmForget} open={confirmForget}>
@@ -272,7 +205,70 @@ export function WorkspaceShell({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <Dialog
+        onOpenChange={(open) => !open && setPromoteTarget(null)}
+        open={Boolean(promoteTarget)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>发布到正式环境？</DialogTitle>
+            <DialogDescription>
+              将使用测试通过的同一组镜像摘要，生产环境仍使用自己的域名、配置和数据库。此操作不会重新构建程序。
+            </DialogDescription>
+          </DialogHeader>
+          {promoteTarget ? (
+            <div className="overflow-hidden rounded-md border border-[var(--border)] text-xs">
+              <ConfirmRow
+                label="候选版本"
+                value={
+                  promoteTarget.candidateTag ??
+                  promoteTarget.commitSha?.slice(0, 12) ??
+                  "待核对"
+                }
+              />
+              <ConfirmRow
+                label="镜像摘要"
+                value={`${promoteTarget.artifacts.length} 个服务已逐项记录`}
+              />
+              <ConfirmRow label="目标" value="生产环境" />
+            </div>
+          ) : null}
+          <DialogFooter>
+            {promoteTarget?.actionUrl ? (
+              <Button
+                onClick={() => openUrl(promoteTarget.actionUrl ?? "")}
+                variant="ghost"
+              >
+                <ArrowUpRight />
+                打开 CNB 发布页
+              </Button>
+            ) : null}
+            <Button onClick={() => setPromoteTarget(null)} variant="secondary">
+              取消
+            </Button>
+            <Button
+              onClick={() => {
+                if (promoteTarget) onPromote(promoteTarget);
+                setPromoteTarget(null);
+              }}
+            >
+              <Rocket />
+              确认发布正式
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </TooltipProvider>
+  );
+}
+
+function ConfirmRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="grid grid-cols-[88px_1fr] gap-3 border-b border-[var(--border)] px-3 py-2.5 last:border-b-0">
+      <span className="text-[var(--muted-foreground)]">{label}</span>
+      <strong className="min-w-0 truncate font-medium">{value}</strong>
+    </div>
   );
 }
 
@@ -295,6 +291,12 @@ function ProjectView({
   const productionHistory = runs.filter(
     (run) => run.environment === "production" && run.status === "success",
   ).length;
+  const productionHasCandidate = Boolean(
+    staging &&
+    production &&
+    (production.sourceRunId === staging.id ||
+      sameArtifactDigests(production, staging)),
+  );
   return (
     <div>
       <div className="mb-8 flex items-start justify-between gap-5">
@@ -346,7 +348,8 @@ function ProjectView({
           action={
             staging?.status === "success" &&
             staging.commitSha &&
-            production?.status !== "success" ? (
+            staging.artifacts.length > 0 &&
+            !productionHasCandidate ? (
               <Button
                 onClick={() => onPromote(staging)}
                 size="sm"
@@ -405,6 +408,20 @@ function ProjectView({
   );
 }
 
+function sameArtifactDigests(left: DeploymentRun, right: DeploymentRun) {
+  return (
+    left.artifacts.length > 0 &&
+    left.artifacts.length === right.artifacts.length &&
+    left.artifacts.every((artifact) =>
+      right.artifacts.some(
+        (candidate) =>
+          candidate.service === artifact.service &&
+          candidate.digest === artifact.digest,
+      ),
+    )
+  );
+}
+
 function DeploymentsView({
   runs,
   workspace,
@@ -445,6 +462,7 @@ function DeploymentsView({
                     {run.environment === "production" ? "生产发布" : "测试部署"}
                   </strong>
                   <span className="block truncate text-xs text-[var(--muted-foreground)]">
+                    {run.issueCode ? `${run.issueCode} · ` : ""}
                     {run.message}
                   </span>
                 </span>

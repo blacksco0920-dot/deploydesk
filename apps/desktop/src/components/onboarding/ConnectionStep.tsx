@@ -9,6 +9,7 @@ import {
   Fingerprint,
   KeyRound,
   LoaderCircle,
+  PackageCheck,
   Server,
   Settings2,
   ShieldCheck,
@@ -19,8 +20,12 @@ import {
   connectCnb,
   discoverSshIdentities,
   generateSshIdentity,
+  getAppSetting,
   getCnbAccount,
+  getSecretStatus,
   selectPrivateKey,
+  setAppSetting,
+  storeSecret,
 } from "../../api";
 import type {
   CnbAccount,
@@ -44,6 +49,9 @@ import { Switch } from "../ui/switch";
 
 interface ConnectionState {
   cnb: boolean;
+  registry: boolean;
+  registryMode: "tcr" | "cnb";
+  registryNamespace: string;
   server: boolean;
   serverForm: ServerForm;
 }
@@ -77,6 +85,13 @@ export function ConnectionStep({
   const [token, setToken] = useState("");
   const [rememberToken, setRememberToken] = useState(true);
   const [connectingCnb, setConnectingCnb] = useState(false);
+  const [registryDialog, setRegistryDialog] = useState(false);
+  const [registryReady, setRegistryReady] = useState(false);
+  const [registryMode, setRegistryMode] = useState<"tcr" | "cnb">("tcr");
+  const [registryNamespace, setRegistryNamespace] = useState("");
+  const [registryUsername, setRegistryUsername] = useState("");
+  const [registryPassword, setRegistryPassword] = useState("");
+  const [savingRegistry, setSavingRegistry] = useState(false);
   const [identities, setIdentities] = useState<SshIdentity[]>([]);
   const [identityDialog, setIdentityDialog] = useState(false);
   const [generated, setGenerated] = useState<GeneratedSshIdentity | null>(null);
@@ -89,10 +104,24 @@ export function ConnectionStep({
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
-    Promise.all([getCnbAccount(), discoverSshIdentities()])
-      .then(([account, found]) => {
+    Promise.all([
+      getCnbAccount(),
+      discoverSshIdentities(),
+      getSecretStatus("registry.tcr.username"),
+      getSecretStatus("registry.tcr.password"),
+      getAppSetting("registry.tcr.namespace"),
+      getAppSetting("registry.mode"),
+    ])
+      .then(([account, found, username, password, namespace, storedMode]) => {
         setCnb(account);
         setIdentities(found);
+        const mode = storedMode === "cnb" ? "cnb" : "tcr";
+        setRegistryMode(mode);
+        setRegistryNamespace(namespace ?? "");
+        setRegistryReady(
+          mode === "cnb" ||
+            Boolean(username.stored && password.stored && namespace),
+        );
         const preferred =
           found.find((identity) => identity.managed) ?? found[0] ?? null;
         if (preferred) {
@@ -115,10 +144,21 @@ export function ConnectionStep({
   useEffect(() => {
     onStateChange({
       cnb: cnb.connected,
+      registry: registryReady,
+      registryMode,
+      registryNamespace,
       server: serverCheck?.ok ?? false,
       serverForm: server,
     });
-  }, [cnb.connected, onStateChange, server, serverCheck?.ok]);
+  }, [
+    cnb.connected,
+    onStateChange,
+    registryMode,
+    registryNamespace,
+    registryReady,
+    server,
+    serverCheck?.ok,
+  ]);
 
   const selectedIdentity = useMemo(
     () => identities.find((identity) => identity.path === server.keyPath),
@@ -155,6 +195,44 @@ export function ConnectionStep({
     } catch (error) {
       onError(toMessage(error));
     }
+  }
+
+  async function saveRegistry() {
+    const namespace = registryNamespace.trim();
+    if (!/^[a-z0-9][a-z0-9-]{1,62}$/.test(namespace)) {
+      onError("镜像命名空间只能使用小写字母、数字和连字符");
+      return;
+    }
+    if (!registryUsername.trim() || !registryPassword) {
+      onError("请填写腾讯云镜像仓库用户名和访问密码");
+      return;
+    }
+    setSavingRegistry(true);
+    try {
+      await Promise.all([
+        storeSecret("registry.tcr.username", registryUsername.trim()),
+        storeSecret("registry.tcr.password", registryPassword),
+        setAppSetting("registry.tcr.namespace", namespace),
+        setAppSetting("registry.mode", "tcr"),
+      ]);
+      setRegistryMode("tcr");
+      setRegistryNamespace(namespace);
+      setRegistryUsername("");
+      setRegistryPassword("");
+      setRegistryReady(true);
+      setRegistryDialog(false);
+    } catch (error) {
+      onError(toMessage(error));
+    } finally {
+      setSavingRegistry(false);
+    }
+  }
+
+  async function useCnbRegistry() {
+    await setAppSetting("registry.mode", "cnb");
+    setRegistryMode("cnb");
+    setRegistryReady(true);
+    setRegistryDialog(false);
   }
 
   async function handleManualIdentity() {
@@ -241,6 +319,30 @@ export function ConnectionStep({
             {cnb.connected ? "重新授权" : "连接"}
           </Button>
         </ConnectionRow>
+
+        <div className="border-t border-[var(--border)]">
+          <ConnectionRow
+            description={
+              registryReady
+                ? registryMode === "tcr"
+                  ? `腾讯云国内镜像加速 · ${registryNamespace}`
+                  : "暂用 CNB 制品库，后续可以切换国内镜像加速"
+                : "推荐使用腾讯云 TCR，减少服务器首次拉取等待"
+            }
+            icon={PackageCheck}
+            loading={false}
+            ok={registryReady}
+            title="镜像传输"
+          >
+            <Button
+              onClick={() => setRegistryDialog(true)}
+              size="sm"
+              variant="secondary"
+            >
+              {registryReady ? "调整" : "配置"}
+            </Button>
+          </ConnectionRow>
+        </div>
 
         <div className="border-t border-[var(--border)]">
           <ConnectionRow
@@ -390,6 +492,15 @@ export function ConnectionStep({
               打开 CNB 访问令牌页面
               <ExternalLink />
             </Button>
+            <div className="border-l-2 border-[var(--accent)] pl-3 text-xs leading-5 text-[var(--muted-foreground)]">
+              <strong className="block font-medium text-[var(--foreground)]">
+                创建时这样选
+              </strong>
+              <span className="block">
+                名称填“ABCDeploy”，设置到期时间，并勾选
+                repo-code:rw、repo-manage:rw、repo-cnb-trigger:rw、group-resource:rw。
+              </span>
+            </div>
             <div className="space-y-1.5">
               <Label htmlFor="cnb-token">访问令牌</Label>
               <Input
@@ -433,6 +544,80 @@ export function ConnectionStep({
                 <ShieldCheck />
               )}
               验证并连接
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog onOpenChange={setRegistryDialog} open={registryDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>启用国内镜像加速</DialogTitle>
+            <DialogDescription>
+              CNB
+              构建完成后先把镜像上传腾讯云，服务器再从国内仓库拉取。这个设置以后可供所有项目复用。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <Button
+              className="w-full justify-between"
+              onClick={() =>
+                openExternal(
+                  "https://console.cloud.tencent.com/tcr/repository",
+                  onError,
+                )
+              }
+              variant="secondary"
+            >
+              打开腾讯云镜像仓库
+              <ExternalLink />
+            </Button>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="space-y-1.5">
+                <span className="text-xs font-medium">用户名</span>
+                <Input
+                  autoComplete="off"
+                  onChange={(event) => setRegistryUsername(event.target.value)}
+                  placeholder="腾讯云账号 ID"
+                  value={registryUsername}
+                />
+              </label>
+              <label className="space-y-1.5">
+                <span className="text-xs font-medium">访问密码</span>
+                <Input
+                  autoComplete="new-password"
+                  onChange={(event) => setRegistryPassword(event.target.value)}
+                  placeholder="镜像仓库访问密码"
+                  type="password"
+                  value={registryPassword}
+                />
+              </label>
+              <label className="space-y-1.5 sm:col-span-2">
+                <span className="text-xs font-medium">命名空间</span>
+                <Input
+                  autoComplete="off"
+                  onChange={(event) => setRegistryNamespace(event.target.value)}
+                  placeholder="例如 myteam"
+                  value={registryNamespace}
+                />
+              </label>
+            </div>
+            <p className="m-0 text-xs leading-5 text-[var(--muted-foreground)]">
+              地址默认使用
+              ccr.ccs.tencentyun.com。凭据保存在系统密钥库，不会写入项目或日志。
+            </p>
+          </div>
+          <DialogFooter className="justify-between">
+            <Button onClick={useCnbRegistry} variant="ghost">
+              暂时使用 CNB 制品库
+            </Button>
+            <Button disabled={savingRegistry} onClick={saveRegistry}>
+              {savingRegistry ? (
+                <LoaderCircle className="animate-spin-slow" />
+              ) : (
+                <ShieldCheck />
+              )}
+              保存镜像加速
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -73,7 +73,24 @@ describe("ABCDeploy beginner flow", () => {
         screen.getByRole("heading", { name: "只补充系统无法知道的信息" }),
       ).toBeInTheDocument(),
     );
-    fireEvent.click(screen.getByRole("button", { name: /查看部署计划/ }));
+    const reviewButton = screen.getByRole("button", {
+      name: /查看部署计划/,
+    });
+    expect(reviewButton).toBeDisabled();
+    const saveStaging = screen.getByRole("button", {
+      name: "保存测试配置",
+    });
+    await waitFor(() => expect(saveStaging).toBeEnabled());
+    fireEvent.click(saveStaging);
+    await waitFor(() =>
+      expect(
+        screen.getByText("已保存 1/2 份，请分别确认测试和生产配置"),
+      ).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "生产环境" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存生产配置" }));
+    await waitFor(() => expect(reviewButton).toBeEnabled());
+    fireEvent.click(reviewButton);
 
     await waitFor(() =>
       expect(

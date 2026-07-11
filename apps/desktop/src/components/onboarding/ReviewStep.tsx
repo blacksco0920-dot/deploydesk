@@ -1,6 +1,6 @@
 import {
   AlertTriangle,
-  Check,
+  ArrowLeft,
   ChevronRight,
   FileCode2,
   LoaderCircle,
@@ -9,16 +9,24 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { useMemo, useState } from "react";
-import type { WorkspacePreview } from "../../types";
+import type { UserFacingIssue, WorkspacePreview } from "../../types";
 import { Button } from "../ui/button";
 
 interface ReviewStepProps {
   applying: boolean;
+  issue: UserFacingIssue | null;
   onApply: () => Promise<void>;
+  onBackToConnections: () => void;
   workspace: WorkspacePreview;
 }
 
-export function ReviewStep({ applying, onApply, workspace }: ReviewStepProps) {
+export function ReviewStep({
+  applying,
+  issue,
+  onApply,
+  onBackToConnections,
+  workspace,
+}: ReviewStepProps) {
   const [confirmed, setConfirmed] = useState(false);
   const changed = useMemo(
     () =>
@@ -40,22 +48,26 @@ export function ReviewStep({ applying, onApply, workspace }: ReviewStepProps) {
         <SummaryRow
           description={`新增或更新 ${changed.length} 个部署文件，原文件自动备份`}
           icon={FileCode2}
+          status="即将执行"
           title="写入项目部署配置"
         />
         <SummaryRow
           description="检查 Docker、共享网络和 Caddy，不接管无关服务"
           icon={Server}
+          status="即将执行"
           title="准备目标服务器"
         />
         <SummaryRow
           description={`构建 ${workspace.inspection.services.length} 个服务并等待健康检查`}
           icon={Rocket}
+          status="即将执行"
           title="启动测试环境"
         />
         <SummaryRow
           description="生产环境保持不变，需要你以后单独确认发布"
           icon={ShieldCheck}
           last
+          status="保持不变"
           title="不自动发布生产"
         />
       </section>
@@ -72,6 +84,53 @@ export function ReviewStep({ applying, onApply, workspace }: ReviewStepProps) {
             </div>
           ))}
         </div>
+      ) : null}
+
+      {issue ? (
+        <section
+          className="mt-4 border-l-2 border-[var(--warning)] bg-[var(--warning-soft)] px-4 py-3.5"
+          role="alert"
+        >
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="mt-0.5 size-5 shrink-0 text-[var(--warning)]" />
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <strong className="text-sm font-semibold">{issue.title}</strong>
+                <code className="text-[11px] font-semibold text-[var(--warning)]">
+                  错误码 {issue.code}
+                </code>
+              </div>
+              <p className="mb-0 mt-1 text-xs leading-5 text-[var(--foreground)]">
+                {issue.message}
+              </p>
+              <strong className="mt-3 block text-xs font-semibold">
+                接下来这样处理
+              </strong>
+              <ol className="mb-0 mt-1 space-y-1 pl-5 text-xs leading-5 text-[var(--muted-foreground)]">
+                {issue.nextSteps.map((step) => (
+                  <li key={step}>{step}</li>
+                ))}
+              </ol>
+              {issue.technicalDetails.length ? (
+                <details className="mt-2 text-[11px] text-[var(--muted-foreground)]">
+                  <summary className="cursor-pointer">技术详情</summary>
+                  <pre className="mb-0 mt-1 max-h-28 overflow-auto whitespace-pre-wrap font-mono leading-5">
+                    {issue.technicalDetails.join("\n")}
+                  </pre>
+                </details>
+              ) : null}
+              <Button
+                className="mt-3"
+                onClick={onBackToConnections}
+                size="sm"
+                variant="secondary"
+              >
+                <ArrowLeft />
+                返回检查服务器
+              </Button>
+            </div>
+          </div>
+        </section>
       ) : null}
 
       <details className="group mt-5 text-sm">
@@ -129,7 +188,11 @@ export function ReviewStep({ applying, onApply, workspace }: ReviewStepProps) {
           ) : (
             <Rocket />
           )}
-          {applying ? "正在准备首次部署" : "开始部署测试"}
+          {applying
+            ? "正在准备首次部署"
+            : issue
+              ? "重新检查并继续"
+              : "开始部署测试"}
         </Button>
       </div>
     </div>
@@ -140,11 +203,13 @@ function SummaryRow({
   description,
   icon: Icon,
   last = false,
+  status,
   title,
 }: {
   description: string;
   icon: typeof Rocket;
   last?: boolean;
+  status: string;
   title: string;
 }) {
   return (
@@ -162,7 +227,9 @@ function SummaryRow({
           {description}
         </span>
       </span>
-      <Check className="size-4 shrink-0 text-[var(--success)]" />
+      <span className="shrink-0 text-[11px] text-[var(--muted-foreground)]">
+        {status}
+      </span>
     </div>
   );
 }

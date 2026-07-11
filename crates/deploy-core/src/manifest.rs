@@ -135,6 +135,32 @@ pub fn validate_manifest(manifest: &ProjectManifest) -> ManifestValidation {
                 );
             }
         }
+        crate::model::RegistryConfig::Oci {
+            provider,
+            push_registry,
+            pull_registry,
+            namespace,
+            username_variable,
+            password_variable,
+        } => {
+            let pull_valid = pull_registry
+                .as_ref()
+                .is_none_or(|value| hostname.is_match(value));
+            if provider.trim().is_empty()
+                || !hostname.is_match(push_registry)
+                || !pull_valid
+                || !slug.is_match(namespace)
+                || !env_name.is_match(username_variable)
+                || !env_name.is_match(password_variable)
+            {
+                error(
+                    &mut issues,
+                    "invalid_oci_registry",
+                    "providers.registry",
+                    "兼容镜像仓库需要有效的推送地址、拉取地址、命名空间和凭据变量名",
+                );
+            }
+        }
     }
     if manifest.services.is_empty() {
         error(
@@ -308,6 +334,14 @@ pub fn validate_manifest(manifest: &ProjectManifest) -> ManifestValidation {
             "mutable_image_tag",
             "release.image_tag_template",
             "镜像标签必须包含 {commit}，不能使用 latest 作为发布依据",
+        );
+    }
+    if !image_tag.is_match(&manifest.release.candidate_tag_template) {
+        error(
+            &mut issues,
+            "invalid_candidate_tag",
+            "release.candidate_tag_template",
+            "候选版本标签必须包含 {commit}，并且只能使用安全的 Tag 字符",
         );
     }
     if manifest.release.keep_releases < 2 {

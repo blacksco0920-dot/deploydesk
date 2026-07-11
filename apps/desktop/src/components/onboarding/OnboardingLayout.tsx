@@ -77,7 +77,7 @@ export function OnboardingLayout({
           </Tooltip>
         </header>
 
-        <main className="min-h-0 overflow-auto">
+        <main className="min-h-0 overflow-auto" key={step}>
           <div className="mx-auto w-full max-w-[760px] px-6 py-10 sm:py-12">
             <div className="mb-7 flex items-center gap-3 text-xs text-[var(--muted-foreground)]">
               <span>

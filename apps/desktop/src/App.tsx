@@ -5,10 +5,13 @@ import { Toaster, toast } from "sonner";
 import { parseDocument } from "yaml";
 import {
   applyManifest,
+  bindProjectServer,
   bootstrapServerCaddy,
   enableCnbAutoTrigger,
   forgetProject,
   getPreflight,
+  getAppSetting,
+  listActiveDeploymentRuns,
   listRecentProjects,
   listDeploymentRuns,
   listServers,
@@ -20,10 +23,13 @@ import {
   resumeStagingDeployment,
   rollbackEnvironment,
   saveProjectStep,
+  setAppSetting,
   selectProjectDirectory,
   startStagingDeployment,
+  syncExternalDeployments,
   syncProjectToCnb,
 } from "./api";
+import { AppShell } from "./components/AppShell";
 import { ProjectHome } from "./components/ProjectHome";
 import { WorkspaceShell } from "./components/WorkspaceShell";
 import { ConnectionStep } from "./components/onboarding/ConnectionStep";
@@ -35,12 +41,14 @@ import { RecommendationStep } from "./components/onboarding/RecommendationStep";
 import { RequirementsStep } from "./components/onboarding/RequirementsStep";
 import { ReviewStep } from "./components/onboarding/ReviewStep";
 import { Button } from "./components/ui/button";
+import { issueFromProvider, issueFromUnknown } from "./lib/errors";
 import type {
   OnboardingStep,
   DeploymentRun,
   RecentProject,
   ServerForm,
   SystemPreflight,
+  UserFacingIssue,
   WorkspacePreview,
 } from "./types";
 
@@ -65,18 +73,45 @@ function App() {
   const [saving, setSaving] = useState(false);
   const [applying, setApplying] = useState(false);
   const [connectionsReady, setConnectionsReady] = useState(false);
+  const [requirementsReady, setRequirementsReady] = useState(false);
+  const [registryChoice, setRegistryChoice] = useState<{
+    mode: "tcr" | "cnb";
+    namespace: string;
+  }>({ mode: "tcr", namespace: "" });
   const [lastServer, setLastServer] = useState<ServerForm | undefined>();
   const [deploymentRuns, setDeploymentRuns] = useState<DeploymentRun[]>([]);
   const [currentRun, setCurrentRun] = useState<DeploymentRun | null>(null);
+  const [deploymentIssue, setDeploymentIssue] =
+    useState<UserFacingIssue | null>(null);
 
   const reportError = useCallback((message: string) => {
     toast.error(message, { duration: 7000 });
   }, []);
 
+  const reportDeploymentIssue = useCallback((issue: UserFacingIssue) => {
+    setDeploymentIssue(issue);
+    toast.error(`${issue.code} · ${issue.title}`, {
+      description: issue.message,
+      duration: 9000,
+    });
+  }, []);
+
   const handleConnectionState = useCallback(
-    (state: { cnb: boolean; server: boolean; serverForm: ServerForm }) => {
-      setConnectionsReady(state.cnb && state.server);
+    (state: {
+      cnb: boolean;
+      registry: boolean;
+      registryMode: "tcr" | "cnb";
+      registryNamespace: string;
+      server: boolean;
+      serverForm: ServerForm;
+    }) => {
+      setConnectionsReady(state.cnb && state.registry && state.server);
+      setRegistryChoice({
+        mode: state.registryMode,
+        namespace: state.registryNamespace,
+      });
       setLastServer(state.serverForm);
+      if (state.server) setDeploymentIssue(null);
     },
     [],
   );
@@ -90,10 +125,16 @@ function App() {
   const loadProject = useCallback(
     async (path: string, resumeStep: OnboardingStep = "inspection") => {
       setLoading(true);
+      setDeploymentIssue(null);
+      setRequirementsReady(false);
       try {
         const result = await openProject(path);
         setWorkspace(result);
         setProjectPath(path);
+        await setAppSetting("active-project", path);
+        if (result.manifestExists) {
+          await syncExternalDeployments(path).catch(() => []);
+        }
         const runs = await listDeploymentRuns(path);
         setDeploymentRuns(runs);
         const resumable = runs.find((run) =>
@@ -116,8 +157,13 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    Promise.all([getPreflight(), listRecentProjects(), listServers()])
-      .then(async ([system, recent, servers]) => {
+    Promise.all([
+      getPreflight(),
+      listRecentProjects(),
+      listServers(),
+      getAppSetting("active-project"),
+    ])
+      .then(async ([system, recent, servers, activeProject]) => {
         if (!active) return;
         setPreflight(system);
         setProjects(recent);
@@ -132,8 +178,12 @@ function App() {
             hostFingerprint: reusableServer.hostFingerprint,
           });
         }
-        if (recent.length === 1 && recent[0].pathExists) {
-          await loadProject(recent[0].path, recent[0].currentStep);
+        const resumable =
+          recent.find(
+            (project) => project.path === activeProject && project.pathExists,
+          ) ?? (recent.length === 1 && recent[0].pathExists ? recent[0] : null);
+        if (resumable) {
+          await loadProject(resumable.path, resumable.currentStep);
         }
       })
       .catch((error) => reportError(toMessage(error)))
@@ -155,6 +205,7 @@ function App() {
       if (project.path === projectPath) {
         setWorkspace(null);
         setProjectPath("");
+        await setAppSetting("active-project", "");
         setScreen("home");
       }
       toast.success("已移除本机项目记录");
@@ -194,13 +245,28 @@ function App() {
   async function applyCurrentPlan() {
     if (!workspace || !projectPath) return;
     if (!lastServer?.host || !lastServer.hostFingerprint) {
-      reportError("目标服务器尚未完成身份验证，请返回连接步骤重新验证");
+      reportDeploymentIssue({
+        code: "AD-SSH-104",
+        title: "目标服务器尚未通过身份验证",
+        message: "ABCDeploy 还不能确认即将修改的是你选择的那台服务器。",
+        nextSteps: ["返回服务器连接步骤，重新验证地址和服务器指纹"],
+        technicalDetails: [],
+        retryable: true,
+      });
       return;
     }
+    setDeploymentIssue(null);
     setApplying(true);
     try {
       const serverSetup = await bootstrapServerCaddy(lastServer);
-      if (!serverSetup.ok) throw new Error(serverSetup.summary);
+      if (!serverSetup.ok) {
+        reportDeploymentIssue(issueFromProvider(serverSetup));
+        return;
+      }
+      await Promise.all([
+        bindProjectServer(projectPath, "staging", lastServer),
+        bindProjectServer(projectPath, "production", lastServer),
+      ]);
       await preparePipelineIdentity(projectPath, lastServer);
       const result = await applyManifest(projectPath, workspace.manifestYaml);
       const refreshed = await openProject(projectPath);
@@ -226,7 +292,7 @@ function App() {
         `服务器与部署配置已准备完成，共更新 ${result.writtenFiles.length} 个文件`,
       );
     } catch (error) {
-      reportError(toMessage(error));
+      reportDeploymentIssue(issueFromUnknown(error, "首次部署未能开始"));
     } finally {
       setApplying(false);
     }
@@ -246,30 +312,64 @@ function App() {
     }
   }, [currentRun, reportError]);
 
-  useEffect(() => {
-    if (
-      screen !== "onboarding" ||
-      step !== "deploying" ||
-      !currentRun ||
-      !["queued", "running"].includes(currentRun.status)
-    ) {
-      return undefined;
+  const refreshWorkspaceDeployments = useCallback(async () => {
+    const activeRuns = await listActiveDeploymentRuns();
+    if (!activeRuns.length) return;
+    const results = await Promise.allSettled(
+      activeRuns.map((run) => refreshDeployment(run.id)),
+    );
+    const updatedRuns = results.flatMap((result) =>
+      result.status === "fulfilled" ? [result.value] : [],
+    );
+    const visible = updatedRuns.filter(
+      (run) => run.projectPath === projectPath,
+    );
+    if (visible.length) {
+      setDeploymentRuns((current) => {
+        const updates = new Map(visible.map((run) => [run.id, run]));
+        return [
+          ...visible,
+          ...current.filter((run) => !updates.has(run.id)),
+        ].sort(
+          (left, right) =>
+            new Date(right.startedAt).getTime() -
+            new Date(left.startedAt).getTime(),
+        );
+      });
+      setCurrentRun(
+        (current) =>
+          updatedRuns.find((run) => run.id === current?.id) ?? current,
+      );
     }
+    await refreshProjects();
+  }, [projectPath, refreshProjects]);
+
+  useEffect(() => {
     const timer = window.setInterval(() => {
-      void refreshCurrentDeployment();
+      void refreshWorkspaceDeployments().catch(() => undefined);
     }, 8000);
     return () => window.clearInterval(timer);
-  }, [currentRun, refreshCurrentDeployment, screen, step]);
+  }, [refreshWorkspaceDeployments]);
 
   async function retryDeployment() {
     if (!projectPath) return;
     setApplying(true);
     try {
-      if (currentRun?.actionKind === "route-check") {
+      if (
+        currentRun?.actionKind === "route-check" ||
+        currentRun?.actionKind === "verify-release" ||
+        currentRun?.actionKind === "artifact-mismatch"
+      ) {
         await refreshCurrentDeployment();
         return;
       }
-      const run = await startStagingDeployment(projectPath);
+      const source =
+        currentRun?.environment === "production" && currentRun.sourceRunId
+          ? deploymentRuns.find((run) => run.id === currentRun.sourceRunId)
+          : null;
+      const run = source
+        ? await promoteProductionDeployment(source.id)
+        : await startStagingDeployment(projectPath);
       setCurrentRun(run);
       setDeploymentRuns((current) => [run, ...current]);
     } catch (error) {
@@ -384,10 +484,42 @@ function App() {
     if (index > 0) void goToStep(onboardingSteps[index - 1]);
   }
 
-  function nextStep() {
+  async function nextStep() {
     const index = onboardingSteps.indexOf(step);
     if (index >= 0 && index < onboardingSteps.length - 1) {
-      void goToStep(onboardingSteps[index + 1]);
+      try {
+        if (step === "connections" && workspace) {
+          const document = parseDocument(workspace.manifestYaml);
+          if (registryChoice.mode === "tcr") {
+            document.setIn(["providers", "registry"], {
+              kind: "tcr",
+              registry: "ccr.ccs.tencentyun.com",
+              namespace: registryChoice.namespace,
+            });
+          } else {
+            const repository = document.getIn([
+              "providers",
+              "build",
+              "repository",
+            ]);
+            document.setIn(["providers", "registry"], {
+              kind: "cnb",
+              repository:
+                typeof repository === "string"
+                  ? repository
+                  : `owner/${workspace.inspection.project_name}`,
+            });
+          }
+          const preview = await previewManifest(
+            projectPath,
+            document.toString({ lineWidth: 0 }),
+          );
+          setWorkspace(preview);
+        }
+        await goToStep(onboardingSteps[index + 1]);
+      } catch (error) {
+        reportError(toMessage(error));
+      }
     }
   }
 
@@ -400,8 +532,16 @@ function App() {
         </span>
       ) : (
         <Button
-          disabled={step === "connections" && !connectionsReady}
+          disabled={
+            (step === "connections" && !connectionsReady) ||
+            (step === "requirements" && !requirementsReady)
+          }
           onClick={nextStep}
+          title={
+            step === "requirements" && !requirementsReady
+              ? "请先保存测试和生产两份运行配置"
+              : undefined
+          }
         >
           {step === "inspection"
             ? "结果正确，继续"
@@ -440,6 +580,7 @@ function App() {
         {step === "requirements" ? (
           <RequirementsStep
             onError={reportError}
+            onReadinessChange={setRequirementsReady}
             onUpdate={updateManifest}
             saving={saving}
             workspace={workspace}
@@ -448,7 +589,9 @@ function App() {
         {step === "review" ? (
           <ReviewStep
             applying={applying}
+            issue={deploymentIssue}
             onApply={applyCurrentPlan}
+            onBackToConnections={() => goToStep("connections")}
             workspace={workspace}
           />
         ) : null}
@@ -479,10 +622,11 @@ function App() {
     );
   }
 
-  return (
-    <>
-      {screen === "home" ? (
+  function renderScreenContent() {
+    if (screen === "home") {
+      return (
         <ProjectHome
+          embedded={projects.length > 0}
           loading={loading}
           onDemo={() => loadProject("/demo/ecat-energy")}
           onForget={forgetRecent}
@@ -492,11 +636,11 @@ function App() {
           projects={projects}
           showDemo={!isTauri()}
         />
-      ) : null}
-
-      {screen === "onboarding" ? renderOnboarding() : null}
-
-      {screen === "workspace" && workspace ? (
+      );
+    }
+    if (screen === "onboarding") return renderOnboarding();
+    if (screen === "workspace" && workspace) {
+      return (
         <WorkspaceShell
           onDeploy={() => goToStep("review")}
           onForget={() => {
@@ -505,16 +649,39 @@ function App() {
             );
             if (current) void forgetRecent(current);
           }}
-          onHome={() => setScreen("home")}
           onPromote={promoteToProduction}
           onRollback={rollbackProjectEnvironment}
           onRefresh={() => loadProject(projectPath, "workspace")}
           path={projectPath}
-          preflight={preflight}
           runs={deploymentRuns}
           workspace={workspace}
         />
-      ) : null}
+      );
+    }
+    return null;
+  }
+
+  const content = renderScreenContent();
+
+  return (
+    <>
+      {projects.length ? (
+        <AppShell
+          activePath={screen === "home" ? "" : projectPath}
+          loading={loading}
+          onAddProject={selectProject}
+          onOpenProject={(project) =>
+            loadProject(project.path, project.currentStep)
+          }
+          onShowProjects={() => setScreen("home")}
+          preflight={preflight}
+          projects={projects}
+        >
+          {content}
+        </AppShell>
+      ) : (
+        content
+      )}
 
       {loading && screen !== "home" ? (
         <div className="fixed inset-0 z-[100] grid place-items-center bg-[var(--background)]/80 backdrop-blur-sm">

@@ -31,6 +31,10 @@ vi.mock("../../api", () => ({
   prepareCnbSecretBundle,
 }));
 
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: vi.fn(async () => undefined),
+}));
+
 describe("CloudSetupAction", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -69,7 +73,9 @@ describe("CloudSetupAction", () => {
     fireEvent.click(screen.getByRole("button", { name: "自动准备" }));
     await waitFor(() => expect(screen.getByText("已准备")).toBeInTheDocument());
 
-    const copyButtons = screen.getAllByRole("button", { name: "复制安全配置" });
+    const copyButtons = screen.getAllByRole("button", {
+      name: "复制并打开 CNB",
+    });
     fireEvent.click(copyButtons[0]);
     fireEvent.click(copyButtons[1]);
     await waitFor(() => expect(writeText).toHaveBeenCalledTimes(2));
@@ -102,6 +108,7 @@ function workspace(): WorkspacePreview {
       services: [],
       prisma_schemas: [],
       dockerfiles: [],
+      environment_files: [],
       environment_variables: [],
       diagnostics: [],
     },

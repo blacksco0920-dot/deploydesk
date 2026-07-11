@@ -1,6 +1,6 @@
 {
   "name": "abcdeploy",
-  "version": "0.1.0",
+  "version": "0.2.0-preview.1",
   "private": true,
   "packageManager": "pnpm@11.5.0",
   "scripts": {
@@ -9,7 +9,7 @@
     "desktop": "pnpm --filter @abcdeploy/desktop",
     "format": "cargo fmt --all && pnpm --filter @abcdeploy/desktop format",
     "lint": "cargo clippy --workspace --all-targets -- -D warnings && pnpm --filter @abcdeploy/desktop lint",
-    "test": "cargo test --workspace && pnpm --filter @abcdeploy/desktop test",
+    "test": "cargo test --workspace && pnpm --filter @abcdeploy/desktop test && node --test scripts/build-release-manifest.test.mjs",
     "site:build": "pnpm --filter @abcdeploy/site build",
     "site:dev": "pnpm --filter @abcdeploy/site dev",
     "tauri:build": "pnpm --filter @abcdeploy/desktop tauri build",

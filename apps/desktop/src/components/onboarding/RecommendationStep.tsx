@@ -4,6 +4,7 @@ import {
   CloudUpload,
   GitCommitHorizontal,
   Laptop,
+  PackageCheck,
   RotateCcw,
   Server,
   ShieldCheck,
@@ -44,6 +45,15 @@ export function RecommendationStep({
           description="main 的每次稳定更新只构建一个不可变镜像"
           icon={GitCommitHorizontal}
           title="代码只构建一次"
+        />
+        <PlanRow
+          description={
+            workspace.manifestYaml.includes("kind: tcr")
+              ? "镜像经腾讯云国内仓库传输，减少服务器首次拉取等待"
+              : "当前使用 CNB 制品库，后续可切换到就近 OCI 镜像仓库"
+          }
+          icon={PackageCheck}
+          title="镜像传输已选择推荐路径"
         />
         <PlanRow
           description={`自动启动 ${workspace.inspection.services.length} 个服务并完成健康检查`}

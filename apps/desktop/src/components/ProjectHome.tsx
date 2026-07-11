@@ -30,6 +30,7 @@ import {
 } from "./ui/tooltip";
 
 interface ProjectHomeProps {
+  embedded?: boolean;
   loading: boolean;
   preflight: SystemPreflight | null;
   projects: RecentProject[];
@@ -41,6 +42,7 @@ interface ProjectHomeProps {
 }
 
 export function ProjectHome({
+  embedded = false,
   loading,
   preflight,
   projects,
@@ -71,7 +73,11 @@ export function ProjectHome({
           className="flex h-14 shrink-0 items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-5"
           data-tauri-drag-region
         >
-          <Brand />
+          {embedded ? (
+            <strong className="text-sm font-medium">所有项目</strong>
+          ) : (
+            <Brand />
+          )}
           <Button disabled={loading} onClick={onSelect} size="sm">
             {loading ? (
               <LoaderCircle className="animate-spin-slow" />
@@ -83,7 +89,9 @@ export function ProjectHome({
         </header>
 
         <main className="min-h-0 flex-1 overflow-auto">
-          <div className="mx-auto w-full max-w-[900px] px-6 py-12">
+          <div
+            className={`mx-auto w-full max-w-[900px] px-6 ${embedded ? "py-8" : "py-12"}`}
+          >
             <div className="mb-9 flex items-end justify-between gap-6">
               <div>
                 <h1 className="m-0 text-[28px] font-semibold leading-tight">

@@ -89,6 +89,7 @@ pub fn inspect_project(root: &Path) -> Result<InspectionReport> {
     package_files.sort();
     dockerfiles.sort();
     prisma_schemas.sort();
+    env_files.sort();
 
     let root_package_path = root.join("package.json");
     let root_package = read_package(&root_package_path).ok();
@@ -212,6 +213,10 @@ pub fn inspect_project(root: &Path) -> Result<InspectionReport> {
         }
     }
 
+    let environment_files = env_files
+        .iter()
+        .map(|path| relative_string(&root, path))
+        .collect();
     let environment_variables = inspect_environment_files(&root, &env_files);
     Ok(InspectionReport {
         project_root: root.to_string_lossy().into_owned(),
@@ -222,6 +227,7 @@ pub fn inspect_project(root: &Path) -> Result<InspectionReport> {
         services,
         prisma_schemas,
         dockerfiles,
+        environment_files,
         environment_variables,
         diagnostics,
     })
@@ -419,7 +425,14 @@ fn should_visit(entry: &DirEntry) -> bool {
     let name = entry.file_name().to_string_lossy();
     !matches!(
         name.as_ref(),
-        ".git" | "node_modules" | "target" | "dist" | ".next" | ".turbo" | "coverage"
+        ".git"
+            | ".deploydesk"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | ".next"
+            | ".turbo"
+            | "coverage"
     )
 }
 
@@ -492,6 +505,7 @@ pub fn inspection_fixture() -> InspectionReport {
         }],
         prisma_schemas: vec!["apps/api/prisma/schema.prisma".to_string()],
         dockerfiles: vec!["apps/api/Dockerfile".to_string()],
+        environment_files: vec![".env.example".to_string()],
         environment_variables: vec![DetectedEnvironmentVariable {
             name: "DATABASE_URL".to_string(),
             secret: true,
@@ -548,12 +562,28 @@ mod tests {
             "DATABASE_URL=postgresql://example\nAPI_KEY=must-not-appear\n",
         )
         .expect("env");
+        fs::create_dir_all(directory.path().join(".deploydesk/generated/staging"))
+            .expect("generated directory");
+        fs::write(
+            directory
+                .path()
+                .join(".deploydesk/generated/staging/.env.example"),
+            "INTERNAL_GENERATED_VALUE=ignore-me\n",
+        )
+        .expect("generated env");
 
         let report = inspect_project(directory.path()).expect("inspection");
         assert!(report.monorepo);
         assert_eq!(report.services.len(), 1);
         assert_eq!(report.services[0].framework, Framework::NestJs);
         assert_eq!(report.prisma_schemas.len(), 1);
+        assert_eq!(report.environment_files, [".env.example"]);
+        assert!(
+            report
+                .environment_variables
+                .iter()
+                .all(|variable| variable.name != "INTERNAL_GENERATED_VALUE")
+        );
         assert!(
             report
                 .environment_variables

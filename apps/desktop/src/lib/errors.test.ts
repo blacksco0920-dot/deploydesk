@@ -1,0 +1,34 @@
+import { describe, expect, it } from "vitest";
+import { issueFromProvider, issueFromUnknown } from "./errors";
+
+describe("user-facing deployment errors", () => {
+  it("keeps provider error codes and recovery steps", () => {
+    const issue = issueFromProvider({
+      provider: "caddy",
+      ok: false,
+      summary: "已有 Caddy 尚未开放路由目录",
+      details: ["container=infra-caddy"],
+      code: "AD-SRV-202",
+      nextSteps: ["挂载 /etc/caddy/sites 后重试"],
+      retryable: true,
+    });
+
+    expect(issue.code).toBe("AD-SRV-202");
+    expect(issue.nextSteps).toEqual(["挂载 /etc/caddy/sites 后重试"]);
+    expect(issue.technicalDetails).toEqual(["container=infra-caddy"]);
+  });
+
+  it("recognizes coded failures returned by deployment scripts", () => {
+    const issue = issueFromUnknown("AD-SRV-206：新路由与现有配置冲突");
+    expect(issue.code).toBe("AD-SRV-206");
+    expect(issue.message).toBe("新路由与现有配置冲突");
+  });
+
+  it("turns release verification failures into one concrete next step", () => {
+    const issue = issueFromUnknown("AD-REL-201: 尚未读取到测试环境的镜像摘要");
+    expect(issue.code).toBe("AD-REL-201");
+    expect(issue.nextSteps).toEqual([
+      "重新验证目标服务器连接，然后刷新部署状态",
+    ]);
+  });
+});

@@ -118,6 +118,15 @@ export function CloudSetupAction({
       bundle.content = "";
       setDeployFingerprint(bundle.deployKeyFingerprint);
       setCopied((current) => ({ ...current, [environment]: true }));
+      try {
+        await openUrl(`https://cnb.cool/${secretRepository}`);
+      } catch {
+        window.open(
+          `https://cnb.cool/${secretRepository}`,
+          "_blank",
+          "noopener,noreferrer",
+        );
+      }
     } catch (error) {
       onError(toMessage(error));
     } finally {
@@ -135,10 +144,10 @@ export function CloudSetupAction({
       <span className="mb-4 grid size-10 place-items-center rounded-lg bg-[var(--warning-soft)] text-[var(--warning)]">
         <ShieldCheck className="size-5" />
       </span>
-      <h1 className="m-0 text-2xl font-semibold">完成一次性持续部署连接</h1>
+      <h1 className="m-0 text-2xl font-semibold">保存一次安全部署配置</h1>
       <p className="mb-8 mt-2 text-sm leading-6 text-[var(--muted-foreground)]">
         CNB
-        要求密钥文件在受审计的网页中创建。完成这一次后，测试和生产发布都会自动使用各自配置。
+        要求这一步在受审计网页完成。按顺序保存测试和正式配置后，后续项目部署不再重复准备服务器。
       </p>
 
       <section className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
@@ -174,10 +183,10 @@ export function CloudSetupAction({
             <FileKey2 className="mt-0.5 size-4 shrink-0 text-[var(--muted-foreground)]" />
             <div className="min-w-0 flex-1">
               <strong className="block text-sm font-medium">
-                创建 CNB 密钥仓库
+                准备安全配置仓库
               </strong>
               <span className="mt-0.5 block text-xs leading-5 text-[var(--muted-foreground)]">
-                仓库类型请选择“密钥仓库”，建议名称 {suggestedSecretName}
+                打开后选择“密钥仓库”，名称建议使用 {suggestedSecretName}
               </span>
             </div>
             <Button
@@ -186,7 +195,7 @@ export function CloudSetupAction({
               variant="secondary"
             >
               <ExternalLink />
-              打开创建页
+              去创建
             </Button>
           </div>
           <label className="mt-3 block space-y-1.5 pl-7">
@@ -214,7 +223,7 @@ export function CloudSetupAction({
               <div className="flex flex-wrap items-center gap-3 pl-7">
                 <span className="min-w-0 flex-1">
                   <strong className="block text-sm font-medium">
-                    {label}环境配置
+                    保存{label}环境配置
                   </strong>
                   <code className="mt-0.5 block text-[11px] text-[var(--muted-foreground)]">
                     {filename}
@@ -233,7 +242,7 @@ export function CloudSetupAction({
                   ) : (
                     <Copy />
                   )}
-                  {copied[environment] ? "已复制" : "复制安全配置"}
+                  {copied[environment] ? "已复制并打开" : "复制并打开 CNB"}
                 </Button>
                 <Button
                   disabled={!validRepository(secretRepository)}
@@ -260,7 +269,7 @@ export function CloudSetupAction({
                   }
                   type="checkbox"
                 />
-                已在 CNB 新建 {filename} 并粘贴保存
+                我已新建 {filename}，粘贴并保存
               </label>
             </div>
           );

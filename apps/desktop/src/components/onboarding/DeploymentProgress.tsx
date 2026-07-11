@@ -17,6 +17,7 @@ const stages = [
   { key: "publish-images", active: "publish", title: "上传不可变镜像" },
   { key: "prepare-server", active: "prepare-server", title: "准备目标服务器" },
   { key: "deploy", active: "deploy", title: "启动目标环境" },
+  { key: "verify-release", active: "verify-release", title: "核对镜像摘要" },
   { key: "healthcheck", active: "healthcheck", title: "运行健康检查" },
 ];
 
@@ -69,6 +70,20 @@ export function DeploymentProgress({
       <p className="mb-8 mt-2 text-sm leading-6 text-[var(--muted-foreground)]">
         {run.message}
       </p>
+
+      {failed ? (
+        <section className="mb-5 border-l-2 border-[var(--warning)] bg-[var(--warning-soft)] px-4 py-3">
+          <div className="flex items-center justify-between gap-3">
+            <strong className="text-sm font-medium">下一步</strong>
+            <code className="text-[11px] text-[var(--warning)]">
+              {run.issueCode ?? "AD-DEP-001"}
+            </code>
+          </div>
+          <p className="mb-0 mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
+            {recoveryHint(run)}
+          </p>
+        </section>
+      ) : null}
 
       <section className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
         {stages.map((stage, index) => {
@@ -140,6 +155,10 @@ export function DeploymentProgress({
             <p className="m-0">
               提交版本：{run.commitSha?.slice(0, 12) ?? "等待 CNB 返回"}
             </p>
+            <p className="m-0">
+              候选版本：{run.candidateTag ?? "测试通过后生成"}
+            </p>
+            <p className="m-0">镜像摘要：{run.artifacts.length} 项</p>
           </div>
         </details>
         <div className="flex items-center gap-2">
@@ -174,4 +193,20 @@ export function DeploymentProgress({
       ) : null}
     </div>
   );
+}
+
+function recoveryHint(run: DeploymentRun) {
+  if (run.issueCode === "AD-CNB-101")
+    return "重新连接 CNB 后刷新，不会重复初始化服务器。";
+  if (run.issueCode === "AD-CNB-103")
+    return "补充构建触发权限，或选择已有可用仓库后重试。";
+  if (run.issueCode === "AD-REL-201")
+    return "重新验证目标服务器连接，然后刷新以读取本次镜像摘要。";
+  if (run.issueCode === "AD-REL-301")
+    return "保持当前生产版本不变，重新部署测试并从新的已验证候选发布。";
+  if (run.issueCode === "AD-NET-201")
+    return "按提示修正 DNS 或 HTTPS 后重新检查，不需要重新构建镜像。";
+  if (run.issueCode === "AD-BLD-201")
+    return "查看失败阶段的关键日志，修复项目构建后重新部署测试。";
+  return "使用下方主操作重试；已经完成的幂等步骤会被复用。";
 }

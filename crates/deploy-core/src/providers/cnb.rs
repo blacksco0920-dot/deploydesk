@@ -21,6 +21,18 @@ pub struct CnbBuildStatus {
     pub pipeline_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CnbBuildRecord {
+    pub serial: String,
+    pub event: String,
+    pub status: String,
+    pub revision: Option<String>,
+    pub source_ref: Option<String>,
+    pub title: String,
+    pub created_at: Option<String>,
+}
+
 pub struct CnbClient {
     client: reqwest::Client,
     api_base: String,
@@ -308,6 +320,50 @@ pub fn summarize_build_status(value: &Value) -> CnbBuildStatus {
     }
 }
 
+#[must_use]
+pub fn build_records(value: &Value) -> Vec<CnbBuildRecord> {
+    value
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|record| {
+            let serial = record.get("sn").and_then(value_as_string)?;
+            let event = record
+                .get("event")
+                .and_then(value_as_string)
+                .unwrap_or_default();
+            let status = record
+                .get("status")
+                .and_then(value_as_string)
+                .unwrap_or_else(|| "unknown".to_string());
+            let revision = record
+                .get("sha")
+                .and_then(Value::as_str)
+                .filter(|value| valid_revision(value))
+                .map(ToString::to_string);
+            Some(CnbBuildRecord {
+                serial,
+                event,
+                status,
+                revision,
+                source_ref: record
+                    .get("sourceRef")
+                    .and_then(value_as_string)
+                    .filter(|value| !value.trim().is_empty()),
+                title: record
+                    .get("title")
+                    .and_then(value_as_string)
+                    .unwrap_or_default(),
+                created_at: record
+                    .get("createTime")
+                    .and_then(value_as_string)
+                    .filter(|value| !value.trim().is_empty()),
+            })
+        })
+        .collect()
+}
+
 fn value_as_string(value: &Value) -> Option<String> {
     value
         .as_str()
@@ -383,6 +439,27 @@ mod tests {
             Some(revision)
         );
         assert!(build_revision(&json!({"sha": "../../main"})).is_none());
+    }
+
+    #[test]
+    fn extracts_only_safe_build_history_fields() {
+        let records = build_records(&json!({
+            "data": [{
+                "sn": "cnb-123",
+                "event": "tag_deploy.production",
+                "status": "success",
+                "sha": "0123456789abcdef0123456789abcdef01234567",
+                "sourceRef": "deploydesk-0123456789abcdef",
+                "title": "发布正式环境",
+                "createTime": "2026-07-11T00:00:00Z",
+                "token": "must-not-be-copied"
+            }]
+        }));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event, "tag_deploy.production");
+        assert_eq!(records[0].serial, "cnb-123");
+        let serialized = serde_json::to_string(&records).expect("serialize records");
+        assert!(!serialized.contains("must-not-be-copied"));
     }
 
     #[tokio::test]

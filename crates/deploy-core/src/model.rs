@@ -74,8 +74,10 @@ pub struct SourceConfig {
 #[serde(rename_all = "snake_case")]
 pub enum SourceProvider {
     #[default]
-    Github,
     Cnb,
+    Github,
+    Gitee,
+    Gitlab,
     Local,
 }
 
@@ -280,6 +282,14 @@ pub struct ProviderConfig {
     pub build: BuildProviderConfig,
     pub registry: RegistryConfig,
     #[serde(default)]
+    pub runtime: RuntimeProviderConfig,
+    #[serde(default)]
+    pub secrets: SecretProviderConfig,
+    #[serde(default)]
+    pub approval: ApprovalProviderConfig,
+    #[serde(default)]
+    pub dns: DnsProviderConfig,
+    #[serde(default)]
     pub reverse_proxy: ReverseProxyProvider,
 }
 
@@ -300,8 +310,62 @@ pub enum BuildProviderKind {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RegistryConfig {
-    Cnb { repository: String },
-    Tcr { registry: String, namespace: String },
+    Cnb {
+        repository: String,
+    },
+    Tcr {
+        registry: String,
+        namespace: String,
+    },
+    Oci {
+        provider: String,
+        push_registry: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pull_registry: Option<String>,
+        namespace: String,
+        #[serde(default = "default_registry_username_variable")]
+        username_variable: String,
+        #[serde(default = "default_registry_password_variable")]
+        password_variable: String,
+    },
+}
+
+fn default_registry_username_variable() -> String {
+    "REGISTRY_USERNAME".to_string()
+}
+
+fn default_registry_password_variable() -> String {
+    "REGISTRY_PASSWORD".to_string()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeProviderConfig {
+    #[default]
+    SshDockerCompose,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretProviderConfig {
+    #[default]
+    CnbSecretRepository,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalProviderConfig {
+    #[default]
+    CnbDeployment,
+    Desktop,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsProviderConfig {
+    #[default]
+    Manual,
+    TencentCloud,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -315,6 +379,8 @@ pub enum ReverseProxyProvider {
 pub struct ReleasePolicy {
     #[serde(default = "default_tag_template")]
     pub image_tag_template: String,
+    #[serde(default = "default_candidate_tag_template")]
+    pub candidate_tag_template: String,
     #[serde(default)]
     pub production_mode: ProductionMode,
     #[serde(default = "default_keep_releases")]
@@ -329,6 +395,7 @@ impl Default for ReleasePolicy {
     fn default() -> Self {
         Self {
             image_tag_template: default_tag_template(),
+            candidate_tag_template: default_candidate_tag_template(),
             production_mode: ProductionMode::Approval,
             keep_releases: default_keep_releases(),
             auto_rollback: true,
@@ -339,6 +406,10 @@ impl Default for ReleasePolicy {
 
 fn default_tag_template() -> String {
     "sha-{commit}".to_string()
+}
+
+fn default_candidate_tag_template() -> String {
+    "deploydesk-{commit}".to_string()
 }
 
 const fn default_keep_releases() -> u16 {
@@ -367,6 +438,8 @@ pub struct InspectionReport {
     pub services: Vec<DetectedService>,
     pub prisma_schemas: Vec<String>,
     pub dockerfiles: Vec<String>,
+    #[serde(default)]
+    pub environment_files: Vec<String>,
     pub environment_variables: Vec<DetectedEnvironmentVariable>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -560,6 +633,12 @@ pub struct ProviderCheck {
     pub summary: String,
     #[serde(default)]
     pub details: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, rename = "nextSteps", skip_serializing_if = "Vec::is_empty")]
+    pub next_steps: Vec<String>,
+    #[serde(default)]
+    pub retryable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

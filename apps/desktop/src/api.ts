@@ -15,6 +15,8 @@ import type {
   ServerForm,
   ServerResource,
   SecretStatus,
+  RuntimeConfigFile,
+  RuntimeConfigStatus,
   RuntimeSecretStatus,
   SourceSyncResult,
   GeneratedSshIdentity,
@@ -89,6 +91,24 @@ export async function openProject(path: string): Promise<WorkspacePreview> {
 export async function listRecentProjects(): Promise<RecentProject[]> {
   if (!isTauri()) return readDemoProjects();
   return invoke<RecentProject[]>("list_recent_projects");
+}
+
+export async function getAppSetting(key: string): Promise<string | null> {
+  if (!isTauri()) {
+    return (
+      localStorage.getItem(`abcdeploy.setting.${key}`) ??
+      (key === "registry.tcr.namespace" ? "demo" : null)
+    );
+  }
+  return invoke<string | null>("get_app_setting", { key });
+}
+
+export async function setAppSetting(key: string, value: string): Promise<void> {
+  if (!isTauri()) {
+    localStorage.setItem(`abcdeploy.setting.${key}`, value);
+    return;
+  }
+  return invoke("set_app_setting", { key, value });
 }
 
 export async function saveProjectStep(
@@ -185,6 +205,26 @@ export async function listServers(): Promise<ServerResource[]> {
   return invoke<ServerResource[]>("list_servers");
 }
 
+export async function bindProjectServer(
+  path: string,
+  environment: "staging" | "production",
+  server: ServerForm,
+): Promise<ServerResource> {
+  if (!isTauri()) {
+    return {
+      ...server,
+      id: `demo-${server.user}@${server.host}:${server.port}`,
+      keyPathExists: true,
+      lastCheckedAt: new Date().toISOString(),
+    };
+  }
+  return invoke<ServerResource>("bind_project_server", {
+    path,
+    environment,
+    server,
+  });
+}
+
 export async function startStagingDeployment(
   path: string,
 ): Promise<DeploymentRun> {
@@ -229,6 +269,7 @@ export async function promoteProductionDeployment(
       ...demoRun(source.projectPath, "production"),
       commitSha: source.commitSha,
       sourceRunId,
+      candidateTag: source.candidateTag,
     };
     writeDemoRun(run);
     return run;
@@ -276,6 +317,22 @@ export async function listDeploymentRuns(
   if (!isTauri())
     return readDemoRuns().filter((run) => run.projectPath === path);
   return invoke<DeploymentRun[]>("list_deployment_runs", { path });
+}
+
+export async function listActiveDeploymentRuns(): Promise<DeploymentRun[]> {
+  if (!isTauri()) {
+    return readDemoRuns().filter((run) =>
+      ["queued", "running"].includes(run.status),
+    );
+  }
+  return invoke<DeploymentRun[]>("list_active_deployment_runs");
+}
+
+export async function syncExternalDeployments(
+  path: string,
+): Promise<DeploymentRun[]> {
+  if (!isTauri()) return [];
+  return invoke<DeploymentRun[]>("sync_external_deployments", { path });
 }
 
 export async function bootstrapServerCaddy(
@@ -366,6 +423,44 @@ export async function generateRuntimeSecret(
   });
 }
 
+export async function loadRuntimeConfig(
+  path: string,
+  environment: RuntimeConfigFile["environment"],
+): Promise<RuntimeConfigFile> {
+  if (!isTauri()) {
+    const templateContent = demoRuntimeTemplate(environment);
+    const content = readDemoRuntimeConfig(path, environment);
+    return {
+      environment,
+      filename: `.env.${environment}`,
+      sourceFiles: [".env.example"],
+      content: content ?? templateContent,
+      templateContent,
+      stored: content !== null,
+    };
+  }
+  return invoke<RuntimeConfigFile>("load_runtime_config", {
+    path,
+    environment,
+  });
+}
+
+export async function storeRuntimeConfig(
+  path: string,
+  environment: RuntimeConfigFile["environment"],
+  content: string,
+): Promise<RuntimeConfigStatus> {
+  if (!isTauri()) {
+    writeDemoRuntimeConfig(path, environment, content);
+    return { environment, filename: `.env.${environment}`, stored: true };
+  }
+  return invoke<RuntimeConfigStatus>("store_runtime_config", {
+    path,
+    environment,
+    content,
+  });
+}
+
 export async function prepareCnbSecretBundle(
   path: string,
   environment: RuntimeSecretStatus["environment"],
@@ -373,12 +468,23 @@ export async function prepareCnbSecretBundle(
   server: ServerForm,
 ): Promise<CnbSecretBundle> {
   if (!isTauri()) {
+    const runtimeConfig = readDemoRuntimeConfig(path, environment);
+    const prefix = environment.toUpperCase();
+    const runtimeLines = (runtimeConfig ?? "")
+      .split("\n")
+      .map((line) => `  ${line}`);
     return {
       environment,
       filename: `env.${environment}.yml`,
       fileUrl: `https://cnb.cool/${secretRepository}/-/blob/main/env.${environment}.yml`,
-      content: `# ABCDeploy demo\n${environment.toUpperCase()}_SERVER_HOST: ${server.host}\n`,
-      missingVariables: [],
+      content: [
+        "# ABCDeploy demo",
+        `${prefix}_SERVER_HOST: ${server.host}`,
+        `${prefix}_RUNTIME_ENV_FILE: |-`,
+        ...runtimeLines,
+        "",
+      ].join("\n"),
+      missingVariables: runtimeConfig ? [] : ["RUNTIME_ENV_FILE"],
       deployKeyFingerprint: "SHA256:DemoDeployIdentity",
     };
   }
@@ -488,7 +594,9 @@ export async function syncProjectToCnb(
 }
 
 export async function getSecretStatus(key: string): Promise<SecretStatus> {
-  if (!isTauri()) return { key, stored: false };
+  if (!isTauri()) {
+    return { key, stored: key.startsWith("registry.tcr.") };
+  }
   return invoke<SecretStatus>("secret_status", { key });
 }
 
@@ -545,6 +653,7 @@ const demoPreflight: SystemPreflight = {
 const DEMO_PROJECTS_KEY = "abcdeploy.demo.projects";
 const DEMO_RUNS_KEY = "abcdeploy.demo.runs";
 const DEMO_SECRETS_KEY = "abcdeploy.demo.secrets";
+const DEMO_RUNTIME_CONFIGS_KEY = "abcdeploy.demo.runtime-configs";
 
 function demoSecretId(path: string, environment: string, variable: string) {
   return `${path}:${environment}:${variable}`;
@@ -568,10 +677,67 @@ function writeDemoSecret(path: string, environment: string, variable: string) {
   );
 }
 
+function demoRuntimeTemplate(environment: string) {
+  return [
+    "# 项目运行配置",
+    `DEPLOYDESK_ENV=${environment}`,
+    "DATABASE_URL=",
+    "JWT_SECRET=",
+    "MINIMAX_API_KEY=",
+    "MINIMAX_BASE_URL=https://api.minimax.chat/v1",
+    "VITE_API_BASE_URL=",
+    "",
+  ].join("\n");
+}
+
+function readDemoRuntimeConfig(path: string, environment: string) {
+  try {
+    const values = JSON.parse(
+      localStorage.getItem(DEMO_RUNTIME_CONFIGS_KEY) ?? "{}",
+    ) as Record<string, string>;
+    return values[demoSecretId(path, environment, "runtime-file")] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function writeDemoRuntimeConfig(
+  path: string,
+  environment: string,
+  content: string,
+) {
+  const values = JSON.parse(
+    localStorage.getItem(DEMO_RUNTIME_CONFIGS_KEY) ?? "{}",
+  ) as Record<string, string>;
+  values[demoSecretId(path, environment, "runtime-file")] = content;
+  localStorage.setItem(DEMO_RUNTIME_CONFIGS_KEY, JSON.stringify(values));
+}
+
 function readDemoProjects(): RecentProject[] {
   try {
     const raw = localStorage.getItem(DEMO_PROJECTS_KEY);
-    return raw ? (JSON.parse(raw) as RecentProject[]) : [];
+    if (!raw) return [];
+    const runs = readDemoRuns();
+    return (JSON.parse(raw) as RecentProject[]).map((project) => {
+      const projectRuns = runs
+        .filter((run) => run.projectPath === project.path)
+        .sort(
+          (left, right) =>
+            new Date(right.updatedAt).getTime() -
+            new Date(left.updatedAt).getTime(),
+        );
+      const latest = projectRuns[0];
+      return {
+        ...project,
+        latestStatus: latest?.status ?? project.latestStatus ?? null,
+        latestEnvironment:
+          latest?.environment ?? project.latestEnvironment ?? null,
+        latestMessage: latest?.message ?? project.latestMessage ?? null,
+        activeRunCount: projectRuns.filter((run) =>
+          ["queued", "running"].includes(run.status),
+        ).length,
+      };
+    });
   } catch {
     return [];
   }
@@ -589,6 +755,10 @@ function rememberDemoProject(path: string, workspace: WorkspacePreview) {
     serviceCount: workspace.inspection.services.length,
     lastOpenedAt: new Date().toISOString(),
     pathExists: true,
+    latestStatus: previous?.latestStatus ?? null,
+    latestEnvironment: previous?.latestEnvironment ?? null,
+    latestMessage: previous?.latestMessage ?? null,
+    activeRunCount: previous?.activeRunCount ?? 0,
   };
   localStorage.setItem(
     DEMO_PROJECTS_KEY,
@@ -614,8 +784,18 @@ function demoRun(
     buildSerial: `demo-${Date.now()}`,
     commitSha: "0123456789abcdef0123456789abcdef01234567",
     sourceRunId: null,
+    candidateTag: "deploydesk-0123456789abcdef0123456789abcdef01234567",
+    artifacts: [
+      {
+        service: "api",
+        image: "ccr.example.com/demo/ecat-api",
+        digest:
+          "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      },
+    ],
     actionKind: null,
-    actionUrl: null,
+    actionUrl: "https://cnb.cool/owner/ecat-energy/-/tags",
+    issueCode: null,
     repository: "owner/ecat-energy",
     branch: "main",
     message:
@@ -631,7 +811,14 @@ function demoRun(
 function readDemoRuns(): DeploymentRun[] {
   try {
     const raw = localStorage.getItem(DEMO_RUNS_KEY);
-    return raw ? (JSON.parse(raw) as DeploymentRun[]) : [];
+    return raw
+      ? (JSON.parse(raw) as DeploymentRun[]).map((run) => ({
+          ...run,
+          candidateTag: run.candidateTag ?? null,
+          artifacts: run.artifacts ?? [],
+          issueCode: run.issueCode ?? null,
+        }))
+      : [];
   } catch {
     return [];
   }
@@ -639,10 +826,23 @@ function readDemoRuns(): DeploymentRun[] {
 
 function writeDemoRun(run: DeploymentRun) {
   const runs = readDemoRuns();
-  localStorage.setItem(
-    DEMO_RUNS_KEY,
-    JSON.stringify([run, ...runs.filter((item) => item.id !== run.id)]),
-  );
+  const nextRuns = [run, ...runs.filter((item) => item.id !== run.id)];
+  localStorage.setItem(DEMO_RUNS_KEY, JSON.stringify(nextRuns));
+  const projects = readDemoProjects().map((project) => {
+    if (project.path !== run.projectPath) return project;
+    return {
+      ...project,
+      latestStatus: run.status,
+      latestEnvironment: run.environment,
+      latestMessage: run.message,
+      activeRunCount: nextRuns.filter(
+        (item) =>
+          item.projectPath === project.path &&
+          ["queued", "running"].includes(item.status),
+      ).length,
+    };
+  });
+  localStorage.setItem(DEMO_PROJECTS_KEY, JSON.stringify(projects));
 }
 
 function demoWorkspace(path: string): WorkspacePreview {
@@ -750,6 +950,7 @@ release:
         "apps/admin/Dockerfile",
         "apps/miniapp/Dockerfile",
       ],
+      environment_files: [".env.example"],
       environment_variables: [
         { name: "DATABASE_URL", secret: true, source: ".env.example" },
         { name: "JWT_SECRET", secret: true, source: ".env.example" },

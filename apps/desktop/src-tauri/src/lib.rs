@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -16,10 +17,13 @@ use deploy_core::plan::serialize_manifest;
 use deploy_core::preflight::system_preflight;
 use deploy_core::providers::{
     caddy,
-    cnb::{CnbClient, build_revision, build_serial, summarize_build_status},
-    docker, ssh,
+    cnb::{CnbClient, build_records, build_revision, build_serial, summarize_build_status},
+    docker,
+    registry::RegistryProvider,
+    ssh,
 };
 use deploy_core::redact::redact_text;
+use deploy_core::render::render_project_files;
 use deploy_core::{
     MANIFEST_FILE, apply_plan, build_plan, create_default_manifest, inspect_project, load_manifest,
     parse_manifest,
@@ -36,7 +40,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod workspace;
 
-use workspace::{DeploymentRun, RecentProject, ServerResource, WorkspaceState};
+use workspace::{DeploymentArtifact, DeploymentRun, RecentProject, ServerResource, WorkspaceState};
 
 const KEYRING_SERVICE: &str = "cloud.finagent.abcdeploy";
 const LEGACY_KEYRING_SERVICE: &str = "com.deploydesk.desktop";
@@ -117,6 +121,25 @@ struct PipelineIdentityResult {
 struct RuntimeSecretStatus {
     environment: String,
     variable: String,
+    stored: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeConfigFile {
+    environment: String,
+    filename: String,
+    source_files: Vec<String>,
+    content: String,
+    template_content: String,
+    stored: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeConfigStatus {
+    environment: String,
+    filename: String,
     stored: bool,
 }
 
@@ -272,6 +295,36 @@ fn list_servers(state: State<'_, WorkspaceState>) -> Result<Vec<ServerResource>,
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
+fn bind_project_server(
+    path: String,
+    environment: String,
+    server: ServerConnectionInput,
+    state: State<'_, WorkspaceState>,
+) -> Result<ServerResource, String> {
+    state.bind_project_server(Path::new(&path), &environment, &server.profile())
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri injects managed state by value.
+fn get_app_setting(
+    key: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<Option<String>, String> {
+    state.setting(&key)
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri injects managed state by value.
+fn set_app_setting(
+    key: String,
+    value: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<(), String> {
+    state.set_setting(&key, &value)
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
 async fn start_staging_deployment(
     path: String,
     state: State<'_, WorkspaceState>,
@@ -293,6 +346,7 @@ async fn start_staging_deployment(
     if cloud_setup_required(&manifest) {
         run.status = "needs_action".to_string();
         run.current_stage = "cloud-setup".to_string();
+        run.issue_code = Some("AD-CNB-201".to_string());
         run.action_kind = Some("cloud-setup".to_string());
         run.action_url = Some("https://cnb.cool/new/repos".to_string());
         run.message = "还差一次 CNB 保护配置；完成后会从这里继续，不会重复准备服务器".to_string();
@@ -358,6 +412,11 @@ async fn promote_production_deployment(
     let revision = source.commit_sha.clone().ok_or_else(|| {
         "这次测试部署缺少完整版本标识，不能安全发布生产，请重新部署测试".to_string()
     })?;
+    if source.artifacts.is_empty() {
+        return Err(
+            "AD-REL-201: 尚未读取到测试环境的镜像摘要，请刷新部署状态或重新验证服务器".to_string(),
+        );
+    }
     let mut run = state.create_deployment_run(
         Path::new(&source.project_path),
         &source.project_name,
@@ -367,6 +426,7 @@ async fn promote_production_deployment(
     )?;
     run.commit_sha = Some(revision.clone());
     run.source_run_id = Some(source.id);
+    run.candidate_tag = source.candidate_tag;
     state.save_deployment_run(&run)?;
     Ok(trigger_cnb_run(run, "api_trigger_production", Some(&revision), &state).await)
 }
@@ -379,10 +439,16 @@ async fn refresh_deployment(
 ) -> Result<DeploymentRun, String> {
     let mut run = state.deployment_run(&run_id)?;
     if matches!(run.status.as_str(), "success" | "failed" | "cancelled") {
+        if run.status == "success" && run.artifacts.is_empty() {
+            finalize_successful_deployment(&mut run, &state).await;
+            run.updated_at = Utc::now().to_rfc3339();
+            state.save_deployment_run(&run)?;
+        }
         return Ok(run);
     }
     let Some(serial) = run.build_serial.clone() else {
         run.status = "needs_action".to_string();
+        run.issue_code = Some("AD-CNB-202".to_string());
         run.message = "CNB 已接受请求，但没有返回构建编号；请检查最近构建记录".to_string();
         run.updated_at = Utc::now().to_rfc3339();
         state.save_deployment_run(&run)?;
@@ -392,6 +458,7 @@ async fn refresh_deployment(
         Ok(value) => Zeroizing::new(value),
         Err(error) => {
             run.status = "needs_action".to_string();
+            run.issue_code = Some("AD-CNB-101".to_string());
             run.message = if error == "missing" {
                 "CNB 登录已失效，请重新连接后继续".to_string()
             } else {
@@ -420,8 +487,16 @@ async fn refresh_deployment(
             } else {
                 "failed".to_string()
             };
+            run.issue_code = Some(if message.contains("权限不足") {
+                "AD-CNB-103".to_string()
+            } else {
+                "AD-CNB-204".to_string()
+            });
             run.message = message;
         }
+    }
+    if run.status == "success" {
+        finalize_successful_deployment(&mut run, &state).await;
     }
     run.updated_at = Utc::now().to_rfc3339();
     state.save_deployment_run(&run)?;
@@ -431,6 +506,152 @@ async fn refresh_deployment(
     Ok(run)
 }
 
+async fn finalize_successful_deployment(run: &mut DeploymentRun, state: &WorkspaceState) {
+    let manifest_path = Path::new(&run.project_path).join(MANIFEST_FILE);
+    let manifest = match load_manifest(&manifest_path) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            run.status = "needs_action".to_string();
+            run.current_stage = "healthcheck".to_string();
+            run.issue_code = Some("AD-REL-101".to_string());
+            run.message = format!("应用已部署，但无法核对发布记录：{}", public_error(error));
+            return;
+        }
+    };
+    if let Some(revision) = &run.commit_sha {
+        let candidate = manifest
+            .release
+            .candidate_tag_template
+            .replace("{commit}", revision);
+        run.candidate_tag = Some(candidate);
+        run.action_url = Some(format!("https://cnb.cool/{}/-/tags", run.repository));
+    }
+    match capture_deployment_artifacts(run, &manifest, state).await {
+        Ok(artifacts) => run.artifacts = artifacts,
+        Err(message) => {
+            run.status = "needs_action".to_string();
+            run.current_stage = "verify-release".to_string();
+            run.action_kind = Some("verify-release".to_string());
+            run.issue_code = Some("AD-REL-201".to_string());
+            run.message = message;
+            return;
+        }
+    }
+    if run.environment == "production" {
+        let Some(source_id) = run.source_run_id.as_deref() else {
+            run.status = "needs_action".to_string();
+            run.current_stage = "verify-release".to_string();
+            run.action_kind = Some("artifact-mismatch".to_string());
+            run.issue_code = Some("AD-REL-301".to_string());
+            run.message = "生产发布缺少测试来源记录，已停止把它标记为可验证版本".to_string();
+            return;
+        };
+        match state.deployment_run(source_id) {
+            Ok(source) if same_artifact_digests(&source.artifacts, &run.artifacts) => {}
+            Ok(_) => {
+                run.status = "needs_action".to_string();
+                run.current_stage = "verify-release".to_string();
+                run.action_kind = Some("artifact-mismatch".to_string());
+                run.issue_code = Some("AD-REL-301".to_string());
+                run.message =
+                    "生产环境镜像摘要与测试通过版本不一致，已停止确认本次发布".to_string();
+                return;
+            }
+            Err(error) => {
+                run.status = "needs_action".to_string();
+                run.current_stage = "verify-release".to_string();
+                run.action_kind = Some("artifact-mismatch".to_string());
+                run.issue_code = Some("AD-REL-301".to_string());
+                run.message = format!("无法读取测试来源记录：{error}");
+                return;
+            }
+        }
+    }
+    run.issue_code = None;
+    verify_public_routes(run).await;
+}
+
+async fn capture_deployment_artifacts(
+    run: &DeploymentRun,
+    manifest: &deploy_core::model::ProjectManifest,
+    state: &WorkspaceState,
+) -> Result<Vec<DeploymentArtifact>, String> {
+    let server = state
+        .server_for_project(Path::new(&run.project_path), &run.environment)?
+        .ok_or_else(|| {
+            "服务器部署已完成，但本机还没有这个环境的连接记录；请重新验证服务器后刷新".to_string()
+        })?;
+    if !server.key_path_exists {
+        return Err("服务器连接使用的 SSH 私钥已移动，请重新选择安全凭据".to_string());
+    }
+    let profile = ssh::SshProfile {
+        name: server.name,
+        host: server.host,
+        user: server.user,
+        port: server.port,
+        key_path: PathBuf::from(server.key_path),
+        host_fingerprint: server.host_fingerprint,
+    };
+    let remote_directory = format!(
+        ".deploydesk/apps/{}/{}",
+        manifest.project.name, run.environment
+    );
+    let command = format!(
+        "set -eu; cd \"$HOME\"/{}; test -f .release.env; cat .release.env",
+        shell_quote(&remote_directory)
+    );
+    let output = ssh::execute(&profile, &command, None, Duration::from_secs(30))
+        .await
+        .map_err(public_error)?;
+    if output.exit_status != Some(0) {
+        return Err("服务器上没有找到本次不可变镜像记录，请检查部署日志后重试".to_string());
+    }
+    parse_deployment_artifacts(&output.stdout, manifest)
+}
+
+fn parse_deployment_artifacts(
+    release_env: &str,
+    manifest: &deploy_core::model::ProjectManifest,
+) -> Result<Vec<DeploymentArtifact>, String> {
+    let mut artifacts = Vec::with_capacity(manifest.services.len());
+    for service in &manifest.services {
+        let key = format!(
+            "DEPLOYDESK_{}_IMAGE=",
+            service.id.replace('-', "_").to_ascii_uppercase()
+        );
+        let value = release_env
+            .lines()
+            .find_map(|line| line.strip_prefix(&key))
+            .ok_or_else(|| format!("服务器发布记录缺少服务 {} 的镜像摘要", service.id))?;
+        let (image, digest_hex) = value
+            .rsplit_once("@sha256:")
+            .ok_or_else(|| format!("服务 {} 的镜像不是不可变摘要", service.id))?;
+        if image.is_empty()
+            || image.chars().any(char::is_whitespace)
+            || digest_hex.len() != 64
+            || !digest_hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(format!("服务 {} 的镜像摘要格式不正确", service.id));
+        }
+        artifacts.push(DeploymentArtifact {
+            service: service.id.clone(),
+            image: image.to_string(),
+            digest: format!("sha256:{digest_hex}"),
+        });
+    }
+    artifacts.sort_by(|left, right| left.service.cmp(&right.service));
+    Ok(artifacts)
+}
+
+fn same_artifact_digests(left: &[DeploymentArtifact], right: &[DeploymentArtifact]) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|artifact| {
+            right.iter().any(|candidate| {
+                candidate.service == artifact.service && candidate.digest == artifact.digest
+            })
+        })
+}
+
 async fn verify_public_routes(run: &mut DeploymentRun) {
     let manifest = match load_manifest(Path::new(&run.project_path).join(MANIFEST_FILE).as_path()) {
         Ok(manifest) => manifest,
@@ -438,6 +659,7 @@ async fn verify_public_routes(run: &mut DeploymentRun) {
             run.status = "needs_action".to_string();
             run.current_stage = "healthcheck".to_string();
             run.action_kind = Some("route-check".to_string());
+            run.issue_code = Some("AD-NET-201".to_string());
             run.message = format!(
                 "应用已部署，但无法读取公网路由配置：{}",
                 public_error(error)
@@ -465,6 +687,7 @@ fn apply_public_route_checks(run: &mut DeploymentRun, checks: &[PublicRouteCheck
         run.current_stage = "healthcheck".to_string();
         run.action_kind = Some("route-check".to_string());
         run.action_url = None;
+        run.issue_code = Some("AD-NET-201".to_string());
         run.completed_steps.retain(|step| step != "healthcheck");
         run.message.clone_from(&failure.message);
         return;
@@ -477,7 +700,7 @@ fn apply_public_route_checks(run: &mut DeploymentRun, checks: &[PublicRouteCheck
         };
     }
     run.action_kind = None;
-    run.action_url = None;
+    run.issue_code = None;
 }
 
 #[tauri::command]
@@ -487,6 +710,161 @@ fn list_deployment_runs(
     state: State<'_, WorkspaceState>,
 ) -> Result<Vec<DeploymentRun>, String> {
     state.list_deployment_runs(Path::new(&path))
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri injects managed state by value.
+fn list_active_deployment_runs(
+    state: State<'_, WorkspaceState>,
+) -> Result<Vec<DeploymentRun>, String> {
+    state.list_active_deployment_runs()
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
+async fn sync_external_deployments(
+    path: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<Vec<DeploymentRun>, String> {
+    let root = PathBuf::from(&path);
+    let manifest = load_manifest(&root.join(MANIFEST_FILE)).map_err(public_error)?;
+    let token = Zeroizing::new(resolve_cnb_token(String::new())?);
+    let client = CnbClient::new(token.as_str()).map_err(public_error)?;
+    let payload = client
+        .recent_builds(&manifest.providers.build.repository, 30)
+        .await
+        .map_err(public_error)?;
+    let mut imported = Vec::new();
+    for record in build_records(&payload) {
+        let environment = match record.event.as_str() {
+            "tag_deploy.staging" => "staging",
+            "tag_deploy.production" => "production",
+            _ => continue,
+        };
+        if state
+            .deployment_run_by_serial(&manifest.providers.build.repository, &record.serial)?
+            .is_some()
+        {
+            continue;
+        }
+        let mut run = state.create_deployment_run(
+            &root,
+            &manifest.project.name,
+            environment,
+            &manifest.providers.build.repository,
+            &manifest.source.release_branch,
+        )?;
+        run.build_serial = Some(record.serial);
+        run.commit_sha = record.revision.clone();
+        run.candidate_tag = record
+            .source_ref
+            .as_deref()
+            .and_then(safe_candidate_tag)
+            .map(ToString::to_string)
+            .or_else(|| {
+                record.revision.as_ref().map(|revision| {
+                    manifest
+                        .release
+                        .candidate_tag_template
+                        .replace("{commit}", revision)
+                })
+            });
+        if environment == "production" {
+            run.source_run_id = if let Some(revision) = record.revision.as_deref() {
+                state
+                    .successful_staging_run_by_revision(&root, revision)?
+                    .map(|source| source.id)
+            } else {
+                None
+            };
+        }
+        run.started_at = record
+            .created_at
+            .filter(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
+            .unwrap_or_else(|| Utc::now().to_rfc3339());
+        run.updated_at.clone_from(&run.started_at);
+        apply_history_status(&mut run, &record.status);
+        run.message = if run.status == "success" {
+            if environment == "production" {
+                "已同步手机端完成的正式发布".to_string()
+            } else {
+                "已同步 CNB 完成的测试部署".to_string()
+            }
+        } else if run.status == "running" || run.status == "queued" {
+            format!(
+                "已同步 CNB 页面触发的{}任务",
+                if environment == "production" {
+                    "正式发布"
+                } else {
+                    "测试部署"
+                }
+            )
+        } else {
+            format!(
+                "CNB 页面触发的{}任务未完成",
+                if environment == "production" {
+                    "正式发布"
+                } else {
+                    "测试部署"
+                }
+            )
+        };
+        if run.status == "success" {
+            finalize_successful_deployment(&mut run, &state).await;
+            if run.status == "success" && environment == "production" {
+                run.message = "已同步手机端完成的正式发布，并核对同一镜像摘要".to_string();
+            }
+        }
+        state.save_deployment_run(&run)?;
+        imported.push(run);
+    }
+    imported.sort_by(|left, right| right.started_at.cmp(&left.started_at));
+    Ok(imported)
+}
+
+fn safe_candidate_tag(value: &str) -> Option<&str> {
+    let value = value
+        .trim()
+        .strip_prefix("refs/tags/")
+        .unwrap_or(value.trim());
+    (!value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
+    .then_some(value)
+}
+
+fn apply_history_status(run: &mut DeploymentRun, status: &str) {
+    match status {
+        "success" => {
+            run.status = "success".to_string();
+            run.current_stage = "complete".to_string();
+            run.issue_code = None;
+            run.completed_steps = vec![
+                "write-config".to_string(),
+                "verify-build".to_string(),
+                "publish-images".to_string(),
+                "prepare-server".to_string(),
+                "deploy".to_string(),
+                "verify-release".to_string(),
+                "healthcheck".to_string(),
+            ];
+        }
+        "error" | "failed" => {
+            run.status = "failed".to_string();
+            run.current_stage = "deploy".to_string();
+            run.issue_code = Some("AD-DEP-201".to_string());
+        }
+        "waiting" | "pending" | "queued" => {
+            run.status = "queued".to_string();
+            run.current_stage = "prepare".to_string();
+        }
+        _ => {
+            run.status = "running".to_string();
+            run.current_stage = "deploy".to_string();
+        }
+    }
 }
 
 async fn trigger_cnb_run(
@@ -536,6 +914,7 @@ async fn trigger_cnb_run(
             run.current_stage = "build".to_string();
             run.action_kind = None;
             run.action_url = None;
+            run.issue_code = None;
             run.message = "CNB 已开始构建，关闭应用后也可以继续查看".to_string();
         }
         Err(message) => {
@@ -544,6 +923,13 @@ async fn trigger_cnb_run(
             } else {
                 "failed".to_string()
             };
+            run.issue_code = Some(if message.contains("权限不足") {
+                "AD-CNB-103".to_string()
+            } else if message.contains("重新连接") {
+                "AD-CNB-101".to_string()
+            } else {
+                "AD-CNB-203".to_string()
+            });
             run.message = message;
         }
     }
@@ -565,6 +951,7 @@ fn update_run_from_cnb(run: &mut DeploymentRun, payload: &serde_json::Value) {
             run.current_stage = "complete".to_string();
             run.action_kind = None;
             run.action_url = None;
+            run.issue_code = None;
             run.message = if run.environment == "production" {
                 "生产环境已按测试通过的同一镜像摘要发布".to_string()
             } else {
@@ -582,6 +969,7 @@ fn update_run_from_cnb(run: &mut DeploymentRun, payload: &serde_json::Value) {
         "error" | "failed" => {
             run.status = "failed".to_string();
             run.current_stage = stage_key(current.as_deref());
+            run.issue_code = Some("AD-BLD-201".to_string());
             run.message = current.map_or_else(
                 || "CNB 构建失败，请查看经过脱敏的技术日志".to_string(),
                 |stage| format!("{stage}未完成，可以从这个阶段重试"),
@@ -589,10 +977,12 @@ fn update_run_from_cnb(run: &mut DeploymentRun, payload: &serde_json::Value) {
         }
         "waiting" | "pending" | "queued" => {
             run.status = "queued".to_string();
+            run.issue_code = None;
             run.message = "CNB 正在分配构建资源".to_string();
         }
         _ => {
             run.status = "running".to_string();
+            run.issue_code = None;
             run.current_stage = stage_key(current.as_deref());
             run.message = current.map_or_else(
                 || "CNB 正在执行部署流程".to_string(),
@@ -804,6 +1194,56 @@ fn generate_runtime_secret(
 }
 
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
+fn load_runtime_config(path: String, environment: String) -> Result<RuntimeConfigFile, String> {
+    let environment_name = parse_deploy_environment(&environment)?;
+    let root = PathBuf::from(path);
+    let (template_content, source_files) = runtime_config_template(&root, environment_name)?;
+    let key = runtime_config_key(&root, &environment)?;
+    let (content, stored) = match read_keyring_secret(&key) {
+        Ok(value) if !value.is_empty() => (value, true),
+        Ok(mut value) => {
+            value.zeroize();
+            (template_content.clone(), false)
+        }
+        Err(error) if error == "missing" => (template_content.clone(), false),
+        Err(error) => return Err(error),
+    };
+    Ok(RuntimeConfigFile {
+        filename: runtime_config_filename(&environment),
+        environment,
+        source_files,
+        content,
+        template_content,
+        stored,
+    })
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
+fn store_runtime_config(
+    path: String,
+    environment: String,
+    mut content: String,
+) -> Result<RuntimeConfigStatus, String> {
+    if content.trim().is_empty() {
+        return Err("运行配置文件不能为空".to_string());
+    }
+    if content.contains('\0') {
+        return Err("运行配置文件包含无效字符".to_string());
+    }
+    let key = runtime_config_key(Path::new(&path), &environment)?;
+    let result = write_keyring_secret(&key, &content);
+    content.zeroize();
+    result?;
+    Ok(RuntimeConfigStatus {
+        filename: runtime_config_filename(&environment),
+        environment,
+        stored: true,
+    })
+}
+
+#[tauri::command]
 async fn prepare_cnb_secret_bundle(
     path: String,
     environment: String,
@@ -846,47 +1286,70 @@ async fn prepare_cnb_secret_bundle(
         ),
     ]);
     let mut missing_variables = Vec::new();
-    let mut variables = BTreeMap::new();
-    for variable in manifest
-        .services
-        .iter()
-        .flat_map(|service| &service.runtime_env)
-    {
-        variables
-            .entry(variable.name.clone())
-            .or_insert_with(|| variable.default.clone());
-    }
-    let environment_config = manifest.environments.get(environment_name);
-    if environment_config.database.is_some() {
-        variables.entry("DATABASE_URL".to_string()).or_insert(None);
-    }
-    if environment_config.redis_namespace.is_some() {
-        variables.entry("REDIS_URL".to_string()).or_insert(None);
-    }
-    for (variable, default) in variables {
-        let key = runtime_secret_key(&root, &environment, &variable)?;
-        let value = match read_keyring_secret(&key) {
-            Ok(value) if !value.is_empty() => Some(value),
-            Ok(mut value) => {
-                value.zeroize();
-                None
+    let runtime_file_key = runtime_config_key(&root, &environment)?;
+    let has_runtime_file = match read_keyring_secret(&runtime_file_key) {
+        Ok(value) if !value.is_empty() => {
+            values.insert(format!("{prefix}_RUNTIME_ENV_FILE"), value);
+            true
+        }
+        Ok(mut value) => {
+            value.zeroize();
+            false
+        }
+        Err(error) if error == "missing" => false,
+        Err(error) => return Err(error),
+    };
+    if !has_runtime_file {
+        // Compatibility for projects configured before whole-file runtime settings.
+        let mut variables = BTreeMap::new();
+        for variable in manifest
+            .services
+            .iter()
+            .flat_map(|service| &service.runtime_env)
+        {
+            variables
+                .entry(variable.name.clone())
+                .or_insert_with(|| variable.default.clone());
+        }
+        let environment_config = manifest.environments.get(environment_name);
+        if environment_config.database.is_some() {
+            variables.entry("DATABASE_URL".to_string()).or_insert(None);
+        }
+        if environment_config.redis_namespace.is_some() {
+            variables.entry("REDIS_URL".to_string()).or_insert(None);
+        }
+        for (variable, default) in variables {
+            let key = runtime_secret_key(&root, &environment, &variable)?;
+            let value = match read_keyring_secret(&key) {
+                Ok(value) if !value.is_empty() => Some(value),
+                Ok(mut value) => {
+                    value.zeroize();
+                    None
+                }
+                Err(error) if error == "missing" => default,
+                Err(error) => return Err(error),
+            };
+            if let Some(value) = value {
+                values.insert(format!("{prefix}_{variable}"), value);
+            } else {
+                values.insert(format!("{prefix}_{variable}"), String::new());
+                missing_variables.push(variable);
             }
-            Err(error) if error == "missing" => default,
-            Err(error) => return Err(error),
-        };
-        if let Some(value) = value {
-            values.insert(format!("{prefix}_{variable}"), value);
-        } else {
-            values.insert(format!("{prefix}_{variable}"), String::new());
-            missing_variables.push(variable);
         }
     }
-    if matches!(manifest.providers.registry, RegistryConfig::Tcr { .. }) {
+    if !matches!(manifest.providers.registry, RegistryConfig::Cnb { .. }) {
+        let provider = RegistryProvider::new(&manifest.providers.registry);
+        let (username, password) = provider.credential_names();
+        let key_prefix = if matches!(manifest.providers.registry, RegistryConfig::Tcr { .. }) {
+            "registry.tcr"
+        } else {
+            "registry.oci"
+        };
         for (field, key) in [
-            ("TCR_USERNAME", "registry.tcr.username"),
-            ("TCR_PASSWORD", "registry.tcr.password"),
+            (username, format!("{key_prefix}.username")),
+            (password, format!("{key_prefix}.password")),
         ] {
-            match read_keyring_secret(key) {
+            match read_keyring_secret(&key) {
                 Ok(value) if !value.is_empty() => {
                     values.insert(field.to_string(), value);
                 }
@@ -1169,6 +1632,9 @@ async fn enable_cnb_auto_trigger(repository: String) -> Result<ProviderCheck, St
         ok: true,
         summary: "CNB 自动构建已开启".to_string(),
         details: vec!["发布分支的新提交会自动进入测试环境".to_string()],
+        code: None,
+        next_steps: Vec::new(),
+        retryable: false,
     })
 }
 
@@ -1341,6 +1807,79 @@ fn runtime_secret_key(root: &Path, environment: &str, variable: &str) -> Result<
     ))
 }
 
+fn runtime_config_key(root: &Path, environment: &str) -> Result<String, String> {
+    parse_deploy_environment(environment)?;
+    Ok(format!(
+        "runtime-file.{}.{}",
+        &project_storage_id(root)[..24],
+        environment
+    ))
+}
+
+fn runtime_config_filename(environment: &str) -> String {
+    format!(".env.{environment}")
+}
+
+fn runtime_config_template(
+    root: &Path,
+    environment: EnvironmentName,
+) -> Result<(String, Vec<String>), String> {
+    let inspection = inspect_project(root).map_err(public_error)?;
+    let canonical_root = PathBuf::from(&inspection.project_root);
+    let mut sections = Vec::new();
+    for relative in &inspection.environment_files {
+        let path = canonical_root.join(relative);
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| format!("无法读取配置模板 {relative}：{error}"))?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(format!("配置模板不在项目目录内：{relative}"));
+        }
+        let content = fs::read_to_string(&canonical)
+            .map_err(|error| format!("无法读取配置模板 {relative}：{error}"))?;
+        sections.push((relative.clone(), content));
+    }
+
+    if sections.is_empty() {
+        let manifest_path = canonical_root.join(MANIFEST_FILE);
+        let manifest = if manifest_path.exists() {
+            load_manifest(&manifest_path).map_err(public_error)?
+        } else {
+            create_default_manifest(&inspection)
+        };
+        let generated_path = format!(
+            ".deploydesk/generated/{}/.env.example",
+            environment.as_str()
+        );
+        let generated = render_project_files(&manifest)
+            .map_err(public_error)?
+            .into_iter()
+            .find(|file| file.path == generated_path)
+            .ok_or_else(|| "无法生成运行配置模板".to_string())?;
+        return Ok((generated.content, Vec::new()));
+    }
+
+    let source_files = sections
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    if sections.len() == 1 {
+        return Ok((sections.remove(0).1, source_files));
+    }
+
+    let mut content = String::new();
+    for (index, (path, section)) in sections.into_iter().enumerate() {
+        if index > 0 {
+            content.push('\n');
+        }
+        writeln!(&mut content, "# ===== 来源文件：{path} =====")
+            .expect("writing to a String is infallible");
+        content.push_str(section.trim_end_matches(['\r', '\n']));
+        content.push('\n');
+    }
+    Ok((content, source_files))
+}
+
 fn project_storage_id(root: &Path) -> String {
     let normalized = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut digest = Sha256::new();
@@ -1427,7 +1966,7 @@ fn deployment_owned_paths(root: &Path) -> Vec<String> {
 fn is_deployment_owned_path(path: &str) -> bool {
     matches!(
         path,
-        "deploy.yaml" | ".cnb.yml" | ".github/workflows/sync-cnb.yml"
+        "deploy.yaml" | ".cnb.yml" | ".cnb/tag_deploy.yml" | ".github/workflows/sync-cnb.yml"
     ) || path.starts_with(".deploydesk/generated/")
 }
 
@@ -1534,11 +2073,16 @@ pub fn run() {
             save_project_step,
             forget_project,
             list_servers,
+            bind_project_server,
+            get_app_setting,
+            set_app_setting,
             start_staging_deployment,
             resume_staging_deployment,
             promote_production_deployment,
             refresh_deployment,
             list_deployment_runs,
+            list_active_deployment_runs,
+            sync_external_deployments,
             preview_manifest,
             apply_manifest,
             check_docker,
@@ -1550,6 +2094,8 @@ pub fn run() {
             runtime_secret_status,
             store_runtime_secret,
             generate_runtime_secret,
+            load_runtime_config,
+            store_runtime_config,
             prepare_cnb_secret_bundle,
             rollback_environment,
             secret_status,
@@ -1568,15 +2114,16 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{fmt::Write as _, fs, path::Path};
 
     use serde_json::json;
     use tempfile::tempdir;
 
     use super::{
         DeploymentRun, apply_public_route_checks, cloud_setup_required, is_deployment_owned_path,
-        rollback_script, runtime_secret_key, stage_key, update_run_from_cnb, validate_git_branch,
-        validate_repository_slug,
+        parse_deployment_artifacts, rollback_script, runtime_config_key, runtime_config_template,
+        runtime_secret_key, same_artifact_digests, stage_key, update_run_from_cnb,
+        validate_git_branch, validate_repository_slug,
     };
     use deploy_core::model::PublicRouteCheck;
 
@@ -1591,8 +2138,11 @@ mod tests {
             build_serial: Some("42".to_string()),
             commit_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
             source_run_id: None,
+            candidate_tag: None,
+            artifacts: Vec::new(),
             action_kind: None,
             action_url: None,
+            issue_code: None,
             repository: "owner/sample".to_string(),
             branch: "main".to_string(),
             message: String::new(),
@@ -1630,6 +2180,57 @@ mod tests {
     }
 
     #[test]
+    fn reads_and_compares_immutable_artifacts_from_server_release_records() {
+        let manifest = deploy_core::parse_manifest(
+            r"
+version: 1
+project: { name: sample }
+source: { provider: cnb, repository: team/sample, release_branch: main }
+services:
+  - id: api
+    kind: api
+    image: sample-api
+    context: .
+    dockerfile: Dockerfile
+    container_port: 3000
+    healthcheck: { path: /health }
+environments:
+  development:
+    target: { kind: local, namespace: sample-development }
+  staging:
+    target: { kind: server, server: default, namespace: sample-staging }
+  production:
+    target: { kind: server, server: default, namespace: sample-production }
+providers:
+  build: { kind: cnb, repository: team/sample }
+  registry: { kind: tcr, registry: registry.example.com, namespace: team }
+",
+            Path::new("deploy.yaml"),
+        )
+        .expect("manifest fixture");
+        let mut release = String::new();
+        for (index, service) in manifest.services.iter().enumerate() {
+            let variable = service.id.replace('-', "_").to_ascii_uppercase();
+            writeln!(
+                release,
+                "DEPLOYDESK_{variable}_IMAGE=registry.example.com/team/{}@sha256:{:064x}",
+                service.image,
+                index + 1
+            )
+            .expect("write fixture");
+        }
+        let artifacts =
+            parse_deployment_artifacts(&release, &manifest).expect("parse release artifacts");
+        assert_eq!(artifacts.len(), manifest.services.len());
+        assert!(same_artifact_digests(&artifacts, &artifacts));
+
+        let mut changed = artifacts.clone();
+        changed[0].digest = format!("sha256:{:064x}", 99);
+        assert!(!same_artifact_digests(&artifacts, &changed));
+        assert!(parse_deployment_artifacts("DEPLOYDESK_API_IMAGE=latest", &manifest).is_err());
+    }
+
+    #[test]
     fn runtime_values_are_partitioned_without_exposing_names_or_paths() {
         let first = tempdir().expect("temp project");
         let second = tempdir().expect("second temp project");
@@ -1646,6 +2247,24 @@ mod tests {
         assert!(!staging.contains(&first.path().to_string_lossy().to_string()));
         assert!(runtime_secret_key(first.path(), "development", "JWT_SECRET").is_err());
         assert!(runtime_secret_key(first.path(), "staging", "unsafe-name").is_err());
+    }
+
+    #[test]
+    fn runtime_config_preserves_the_project_template_verbatim() {
+        let project = tempdir().expect("temp project");
+        let template = "# 第三方服务\nUNKNOWN_SETTING=keep-me\nEMPTY=\n";
+        fs::write(project.path().join(".env.example"), template).expect("write template");
+
+        let (content, sources) =
+            runtime_config_template(project.path(), deploy_core::model::EnvironmentName::Staging)
+                .expect("load runtime template");
+
+        assert_eq!(content, template);
+        assert_eq!(sources, [".env.example"]);
+        let staging = runtime_config_key(project.path(), "staging").expect("staging key");
+        let production = runtime_config_key(project.path(), "production").expect("production key");
+        assert_ne!(staging, production);
+        assert!(!staging.contains(&project.path().to_string_lossy().to_string()));
     }
 
     #[test]
@@ -1681,6 +2300,7 @@ mod tests {
         for path in [
             "deploy.yaml",
             ".cnb.yml",
+            ".cnb/tag_deploy.yml",
             ".github/workflows/sync-cnb.yml",
             ".deploydesk/generated/staging/Caddyfile",
         ] {
