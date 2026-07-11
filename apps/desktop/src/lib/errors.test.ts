@@ -55,4 +55,15 @@ describe("user-facing deployment errors", () => {
     expect(issue.title).toBe("项目改动还没有提交");
     expect(issue.nextSteps[0]).toContain("部署上次已提交版本");
   });
+
+  it("separates clipboard and browser failures", () => {
+    const clipboard = issueFromUnknown("AD-SYS-101：无法写入系统剪贴板");
+    const browser = issueFromUnknown(
+      "AD-SYS-102：配置已经复制但浏览器没有打开",
+    );
+
+    expect(clipboard.title).toBe("配置没有复制成功");
+    expect(browser.title).toBe("系统浏览器没有打开");
+    expect(browser.nextSteps[0]).toContain("手动打开");
+  });
 });

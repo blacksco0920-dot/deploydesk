@@ -2322,6 +2322,7 @@ fn cnb_public_error(error: DeployError) -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let data_directory = app.path().app_data_dir()?;
             let state = WorkspaceState::open(&data_directory.join("workspace.sqlite3"))

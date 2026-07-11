@@ -38,6 +38,9 @@ export function issueFromUnknown(
 function nextStepsForCode(code?: string): string[] {
   if (code === "AD-GIT-101")
     return ["回到编程工具提交这些改动，或明确选择部署上次已提交版本"];
+  if (code === "AD-SYS-101") return ["重新点击复制；仍失败时重新启动客户端"];
+  if (code === "AD-SYS-102")
+    return ["配置已经复制，请在浏览器中手动打开 cnb.cool"];
   if (code === "AD-CNB-101") return ["重新连接 CNB，然后回到当前任务刷新状态"];
   if (code === "AD-CNB-102") return ["检查网络能否访问 cnb.cool，然后重新尝试"];
   if (code === "AD-CNB-103")
@@ -61,6 +64,8 @@ function nextStepsForCode(code?: string): string[] {
 
 function titleForCode(code?: string): string | undefined {
   if (code === "AD-GIT-101") return "项目改动还没有提交";
+  if (code === "AD-SYS-101") return "配置没有复制成功";
+  if (code === "AD-SYS-102") return "系统浏览器没有打开";
   return undefined;
 }
 

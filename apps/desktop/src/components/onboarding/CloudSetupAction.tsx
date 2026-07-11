@@ -1,3 +1,4 @@
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Building2,
@@ -141,23 +142,33 @@ export function CloudSetupAction({
         onError(`还缺 ${bundle.missingVariables.join("、")} 的环境配置`);
         return;
       }
-      await navigator.clipboard.writeText(bundle.content);
+      try {
+        await writeText(bundle.content);
+      } catch {
+        throw new Error(
+          "AD-SYS-101：无法写入系统剪贴板，请检查客户端权限后重试",
+        );
+      }
       bundle.content = "";
       setDeployFingerprint(bundle.deployKeyFingerprint);
       setCopied((current) => ({ ...current, [environment]: true }));
-      try {
-        await openUrl(`https://cnb.cool/${secretRepository}`);
-      } catch {
-        window.open(
-          `https://cnb.cool/${secretRepository}`,
-          "_blank",
-          "noopener,noreferrer",
-        );
-      }
+      await openCnbPage(`https://cnb.cool/${secretRepository}`);
     } catch (error) {
       onError(toMessage(error));
     } finally {
       setCopying(null);
+    }
+  }
+
+  async function openCnbPage(url: string) {
+    try {
+      await openUrl(url);
+      return true;
+    } catch {
+      onError(
+        "AD-SYS-102：配置已经复制，但无法打开系统浏览器，请手动访问 cnb.cool 后继续",
+      );
+      return false;
     }
   }
 
@@ -244,7 +255,7 @@ export function CloudSetupAction({
           <div className="flex items-center justify-between gap-3 border-t border-[var(--border)] bg-[var(--warning-soft)] px-4 py-3 text-xs text-[var(--warning)]">
             <span>当前账号没有可用组织，CNB 仓库必须保存在组织中。</span>
             <Button
-              onClick={() => openUrl("https://cnb.cool")}
+              onClick={() => void openCnbPage("https://cnb.cool")}
               size="sm"
               variant="secondary"
             >
@@ -266,7 +277,7 @@ export function CloudSetupAction({
               </span>
             </div>
             <Button
-              onClick={() => openUrl("https://cnb.cool/new/repos")}
+              onClick={() => void openCnbPage("https://cnb.cool/new/repos")}
               size="sm"
               variant="secondary"
             >
@@ -318,12 +329,12 @@ export function CloudSetupAction({
                   ) : (
                     <Copy />
                   )}
-                  {copied[environment] ? "已复制并打开" : "复制并打开 CNB"}
+                  {copied[environment] ? "已复制" : "复制并打开 CNB"}
                 </Button>
                 <Button
                   disabled={!validRepository(secretRepository)}
                   onClick={() =>
-                    openUrl(`https://cnb.cool/${secretRepository}`)
+                    void openCnbPage(`https://cnb.cool/${secretRepository}`)
                   }
                   size="icon"
                   title="打开密钥仓库"

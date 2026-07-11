@@ -3,25 +3,31 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { WorkspacePreview } from "../../types";
 import { CloudSetupAction } from "./CloudSetupAction";
 
-const writeText = vi.fn(async () => undefined);
-const { ensureCnbRepository, getCnbAccount, prepareCnbSecretBundle } =
-  vi.hoisted(() => ({
-    ensureCnbRepository: vi.fn(async () => ({
-      repository: "demo/sample",
-      created: true,
-    })),
-    getCnbAccount: vi.fn(),
-    prepareCnbSecretBundle: vi.fn(
-      async (_path: string, environment: "staging" | "production") => ({
-        environment,
-        filename: `env.${environment}.yml`,
-        fileUrl: `https://cnb.cool/demo/sample-secrets/-/blob/main/env.${environment}.yml`,
-        content: "PRIVATE_DEPLOY_KEY: test-only-sensitive-value",
-        missingVariables: [],
-        deployKeyFingerprint: "SHA256:test-deploy-key",
-      }),
-    ),
-  }));
+const {
+  ensureCnbRepository,
+  getCnbAccount,
+  openUrl,
+  prepareCnbSecretBundle,
+  writeText,
+} = vi.hoisted(() => ({
+  ensureCnbRepository: vi.fn(async () => ({
+    repository: "demo/sample",
+    created: true,
+  })),
+  getCnbAccount: vi.fn(),
+  openUrl: vi.fn(async () => undefined),
+  prepareCnbSecretBundle: vi.fn(
+    async (_path: string, environment: "staging" | "production") => ({
+      environment,
+      filename: `env.${environment}.yml`,
+      fileUrl: `https://cnb.cool/demo/sample-secrets/-/blob/main/env.${environment}.yml`,
+      content: "PRIVATE_DEPLOY_KEY: test-only-sensitive-value",
+      missingVariables: [],
+      deployKeyFingerprint: "SHA256:test-deploy-key",
+    }),
+  ),
+  writeText: vi.fn(async () => undefined),
+}));
 
 vi.mock("../../api", () => ({
   ensureCnbRepository,
@@ -30,7 +36,11 @@ vi.mock("../../api", () => ({
 }));
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
-  openUrl: vi.fn(async () => undefined),
+  openUrl,
+}));
+
+vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({
+  writeText,
 }));
 
 describe("CloudSetupAction", () => {
@@ -53,10 +63,6 @@ describe("CloudSetupAction", () => {
     ensureCnbRepository.mockResolvedValue({
       repository: "demo/sample",
       created: true,
-    });
-    Object.defineProperty(navigator, "clipboard", {
-      configurable: true,
-      value: { writeText },
     });
   });
 
@@ -173,6 +179,39 @@ describe("CloudSetupAction", () => {
     );
     expect(screen.getByRole("button", { name: "自动准备" })).toBeDisabled();
     expect(screen.getByText(/CNB 仓库必须保存在组织中/)).toBeInTheDocument();
+  });
+
+  it("keeps copied configuration usable when the browser cannot open", async () => {
+    openUrl.mockRejectedValueOnce(new Error("platform denied"));
+    const onError = vi.fn();
+    renderCloudSetup(onError);
+
+    const copyButton = (
+      await screen.findAllByRole("button", { name: "复制并打开 CNB" })
+    )[0];
+    fireEvent.click(copyButton);
+
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+    expect(await screen.findByRole("button", { name: "已复制" })).toBeEnabled();
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining("AD-SYS-102"));
+  });
+
+  it("reports a dedicated error when system clipboard access fails", async () => {
+    writeText.mockRejectedValueOnce(new Error("clipboard denied"));
+    const onError = vi.fn();
+    renderCloudSetup(onError);
+
+    const copyButton = (
+      await screen.findAllByRole("button", { name: "复制并打开 CNB" })
+    )[0];
+    fireEvent.click(copyButton);
+
+    await waitFor(() =>
+      expect(onError).toHaveBeenCalledWith(
+        expect.stringContaining("AD-SYS-101"),
+      ),
+    );
+    expect(copyButton).toBeEnabled();
   });
 });
 
