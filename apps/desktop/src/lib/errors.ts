@@ -61,6 +61,18 @@ function nextStepsForCode(code?: string): string[] {
   if (code === "AD-REL-201")
     return ["重新验证目标服务器连接，然后刷新部署状态"];
   if (code === "AD-REL-301") return ["重新部署测试环境，再发布新的已验证候选"];
+  if (code === "AD-CTR-201")
+    return [
+      "查看提示的服务启动日志；修复端口、依赖或健康检查后重新部署测试",
+    ];
+  if (code === "AD-CFG-201")
+    return ["按提示在 CNB 密钥仓库补齐字段，保存后从当前步骤重试"];
+  if (code === "AD-SSH-201")
+    return ["返回资源页重新验证服务器，并更新测试环境的 SSH 凭据"];
+  if (code === "AD-SRV-208")
+    return ["清理目标服务器磁盘空间，确认 Docker 可用后从当前步骤重试"];
+  if (code === "AD-IMG-201")
+    return ["重新检查镜像仓库账号和拉取权限，然后从当前步骤重试"];
   if (code === "AD-NET-201")
     return ["修正 DNS 或 HTTPS 后重新检查，无需重新构建"];
   return ["确认当前页面的检查项，处理后重新尝试"];
@@ -72,6 +84,11 @@ function titleForCode(code?: string): string | undefined {
   if (code === "AD-SYS-101") return "配置没有复制成功";
   if (code === "AD-SYS-102") return "系统浏览器没有打开";
   if (code === "AD-CNB-103") return "CNB 权限还差一步";
+  if (code === "AD-CTR-201") return "服务没有正常启动";
+  if (code === "AD-CFG-201") return "测试环境配置还缺内容";
+  if (code === "AD-SSH-201") return "服务器登录凭据已失效";
+  if (code === "AD-SRV-208") return "服务器磁盘空间不足";
+  if (code === "AD-IMG-201") return "容器镜像无法读取";
   return undefined;
 }
 

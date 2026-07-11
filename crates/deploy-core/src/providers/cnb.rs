@@ -12,6 +12,7 @@ use crate::error::{DeployError, Result};
 use crate::redact::redact_text;
 
 const DEFAULT_API_BASE: &str = "https://api.cnb.cool";
+const MAX_RUNNER_LOG_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct CnbBuildStatus {
@@ -226,6 +227,34 @@ impl CnbClient {
             None,
         )
         .await
+    }
+
+    pub async fn runner_log(&self, repository: &str, pipeline_id: &str) -> Result<String> {
+        let repository = encode_segment(repository);
+        let pipeline_id = encode_segment(pipeline_id);
+        let response = self
+            .client
+            .get(format!(
+                "{}/{repository}/-/build/runner/download/log/{pipeline_id}",
+                self.api_base
+            ))
+            .bearer_auth(&self.token)
+            .header("Accept", "text/plain")
+            .send()
+            .await?;
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        if !status.is_success() {
+            return Err(DeployError::CnbApi {
+                status: status.as_u16(),
+                message: permission_hint(
+                    status.as_u16(),
+                    &redact_text(&String::from_utf8_lossy(&bytes)),
+                ),
+            });
+        }
+        let start = bytes.len().saturating_sub(MAX_RUNNER_LOG_BYTES);
+        Ok(String::from_utf8_lossy(&bytes[start..]).into_owned())
     }
 
     async fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {

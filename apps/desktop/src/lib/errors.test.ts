@@ -85,4 +85,13 @@ describe("user-facing deployment errors", () => {
     expect(issue.title).toBe("CNB 权限还差一步");
     expect(issue.nextSteps[0]).toContain("自动构建");
   });
+
+  it("turns an unhealthy container into a concrete recovery step", () => {
+    const issue = issueFromUnknown(
+      "AD-CTR-201：服务容器 finagent-staging-h5-1 启动后未通过健康检查",
+    );
+
+    expect(issue.title).toBe("服务没有正常启动");
+    expect(issue.nextSteps[0]).toContain("服务启动日志");
+  });
 });

@@ -501,6 +501,12 @@ async fn refresh_deployment(
                 run.commit_sha = Some(revision);
             }
             update_run_from_cnb(&mut run, &payload);
+            if run.status == "failed"
+                && let Some(pipeline_id) = summarize_build_status(&payload).pipeline_ids.first()
+                && let Ok(log) = client.runner_log(&run.repository, pipeline_id).await
+            {
+                apply_runner_log_diagnostic(&mut run, &log);
+            }
             if run.status == "success" {
                 verify_public_routes(&mut run).await;
             }
@@ -1121,6 +1127,80 @@ fn update_run_from_cnb(run: &mut DeploymentRun, payload: &serde_json::Value) {
             );
         }
     }
+}
+
+fn apply_runner_log_diagnostic(run: &mut DeploymentRun, log: &str) {
+    for line in log.lines().rev() {
+        if let Some((_, remainder)) = line.split_once("container ")
+            && let Some((container, _)) = remainder.split_once(" is unhealthy")
+            && safe_runtime_identifier(container)
+        {
+            run.current_stage = "healthcheck".to_string();
+            run.issue_code = Some("AD-CTR-201".to_string());
+            run.message = format!("服务容器 {container} 启动后未通过健康检查");
+            return;
+        }
+        if let Some((_, missing)) = line.split_once("缺少密钥仓库字段：") {
+            let fields = missing.trim();
+            if !fields.is_empty()
+                && fields.len() <= 512
+                && fields.bytes().all(|byte| {
+                    byte.is_ascii_uppercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'_' | b',' | b' ' | b'-')
+                })
+            {
+                run.current_stage = "prepare".to_string();
+                run.issue_code = Some("AD-CFG-201".to_string());
+                run.message = format!("测试环境配置还缺少：{fields}");
+                return;
+            }
+        }
+        let normalized = line.to_ascii_lowercase();
+        if normalized.contains("permission denied (publickey") {
+            run.current_stage = "prepare-server".to_string();
+            run.issue_code = Some("AD-SSH-201".to_string());
+            run.message = "CNB 无法使用已保存的 SSH 凭据登录目标服务器".to_string();
+            return;
+        }
+        if normalized.contains("no space left on device") {
+            run.current_stage = "prepare-server".to_string();
+            run.issue_code = Some("AD-SRV-208".to_string());
+            run.message = "目标服务器磁盘空间不足，测试环境没有继续更新".to_string();
+            return;
+        }
+        if normalized.contains("pull access denied")
+            || normalized.contains("unauthorized: authentication required")
+        {
+            run.current_stage = "publish".to_string();
+            run.issue_code = Some("AD-IMG-201".to_string());
+            run.message = "目标环境无法读取本次构建的容器镜像".to_string();
+            return;
+        }
+        for code in ["AD-SRV-205", "AD-SRV-206", "AD-SRV-207"] {
+            if let Some(index) = line.find(code) {
+                let message = line[index + code.len()..]
+                    .trim_start_matches(['：', ':', ' '])
+                    .trim();
+                run.current_stage = "prepare-server".to_string();
+                run.issue_code = Some(code.to_string());
+                run.message = if message.is_empty() {
+                    "统一 Caddy 路由没有安全更新".to_string()
+                } else {
+                    message.to_string()
+                };
+                return;
+            }
+        }
+    }
+}
+
+fn safe_runtime_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn stage_key(stage: Option<&str>) -> String {
@@ -2536,13 +2616,13 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DeploymentRun, apply_public_route_checks, cache_secret, cached_secret,
-        cloud_setup_required, cnb_account_from_responses, cnb_public_error, deployment_owned_paths,
-        evict_cached_secret, existing_cnb_repository, git_failure, is_deployment_internal_path,
-        is_deployment_owned_path, parse_deployment_artifacts, rollback_script, runtime_config_key,
-        runtime_config_template, runtime_secret_key, same_artifact_digests, stage_key,
-        staging_build_serial_for_revision, update_run_from_cnb, validate_git_branch,
-        validate_repository_slug,
+        DeploymentRun, apply_public_route_checks, apply_runner_log_diagnostic, cache_secret,
+        cached_secret, cloud_setup_required, cnb_account_from_responses, cnb_public_error,
+        deployment_owned_paths, evict_cached_secret, existing_cnb_repository, git_failure,
+        is_deployment_internal_path, is_deployment_owned_path, parse_deployment_artifacts,
+        rollback_script, runtime_config_key, runtime_config_template, runtime_secret_key,
+        same_artifact_digests, stage_key, staging_build_serial_for_revision, update_run_from_cnb,
+        validate_git_branch, validate_repository_slug,
     };
     use deploy_core::error::DeployError;
     use deploy_core::model::PublicRouteCheck;
@@ -2610,6 +2690,34 @@ mod tests {
         assert_eq!(deployment.status, "running");
         assert_eq!(deployment.current_stage, "build");
         assert_eq!(deployment.message, "正在执行：构建并上传 api");
+    }
+
+    #[test]
+    fn turns_runner_logs_into_actionable_safe_error_codes() {
+        let mut deployment = run();
+        apply_runner_log_diagnostic(
+            &mut deployment,
+            "[00:05:19] container finagent-staging-h5-1 is unhealthy\n",
+        );
+        assert_eq!(deployment.issue_code.as_deref(), Some("AD-CTR-201"));
+        assert_eq!(deployment.current_stage, "healthcheck");
+        assert!(deployment.message.contains("finagent-staging-h5-1"));
+
+        let mut missing_config = run();
+        apply_runner_log_diagnostic(
+            &mut missing_config,
+            "缺少密钥仓库字段：STAGING_DATABASE_URL, STAGING_REDIS_URL\n",
+        );
+        assert_eq!(missing_config.issue_code.as_deref(), Some("AD-CFG-201"));
+        assert!(missing_config.message.contains("STAGING_DATABASE_URL"));
+
+        let mut unsafe_name = run();
+        apply_runner_log_diagnostic(
+            &mut unsafe_name,
+            "container token=must-not-appear is unhealthy\n",
+        );
+        assert_eq!(unsafe_name.issue_code, None);
+        assert!(!unsafe_name.message.contains("must-not-appear"));
     }
 
     #[test]
