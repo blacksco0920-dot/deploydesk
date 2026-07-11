@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   ChevronRight,
   Clock3,
+  LayoutDashboard,
   LoaderCircle,
   RefreshCw,
   Rocket,
@@ -162,6 +163,12 @@ export function DeploymentProgress({
           </div>
         </details>
         <div className="flex items-center gap-2">
+          {failed ? (
+            <Button onClick={onWorkspace} variant="ghost">
+              <LayoutDashboard />
+              返回项目工作台
+            </Button>
+          ) : null}
           {failed ? (
             <Button onClick={onRetry} variant="secondary">
               <RefreshCw />
