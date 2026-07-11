@@ -20,7 +20,7 @@ if (releaseFiles.length === 0) {
   throw new Error(`No installer assets found for ${version}`);
 }
 const definitions = {
-  "mac-arm": [/aarch64.*\.dmg$/i, /aarch64.*\.app\.tar\.gz$/i],
+  "mac-arm": [/aarch64.*\.dmg$/i],
   "mac-intel": [/x64.*\.dmg$/i, /x86_64.*\.dmg$/i],
   windows: [/x64.*setup.*\.exe$/i, /x64.*\.msi$/i],
   linux: [/amd64.*\.AppImage$/i, /amd64.*\.deb$/i],
@@ -28,9 +28,11 @@ const definitions = {
 
 const assets = {};
 for (const [key, patterns] of Object.entries(definitions)) {
-  const file = releaseFiles.find((candidate) =>
-    patterns.some((pattern) => pattern.test(path.basename(candidate))),
-  );
+  const file = patterns
+    .map((pattern) =>
+      releaseFiles.find((candidate) => pattern.test(path.basename(candidate))),
+    )
+    .find(Boolean);
   assets[key] = file
     ? {
         available: true,

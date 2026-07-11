@@ -25,6 +25,13 @@ test("builds a same-origin release manifest without selecting stale assets", asy
       "current-mac",
     );
     await writeFile(
+      path.join(
+        directory,
+        "ABCDeploy_0.2.0-preview.1_aarch64.app.tar.gz",
+      ),
+      "internal-updater-archive",
+    );
+    await writeFile(
       path.join(directory, "ABCDeploy_0.2.0-preview.1_x64-setup.exe"),
       "current-windows",
     );
@@ -45,6 +52,10 @@ test("builds a same-origin release manifest without selecting stale assets", asy
     assert.equal(manifest.assets.windows.available, true);
     assert.equal(manifest.assets.linux.available, false);
     assert.equal(manifest.assets["mac-arm"].sha256.length, 64);
+    assert.equal(
+      manifest.assets["mac-arm"].name,
+      "ABCDeploy_0.2.0-preview.1_aarch64.dmg",
+    );
     assert.doesNotMatch(manifest.assets["mac-arm"].name, /0\.1\.1/);
     assert.doesNotMatch(manifest.assets["mac-arm"].name, /preview\.10/);
   } finally {
