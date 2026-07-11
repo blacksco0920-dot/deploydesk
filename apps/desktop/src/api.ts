@@ -525,14 +525,33 @@ export async function connectCnb(
   persist: boolean,
 ): Promise<CnbAccount> {
   if (!isTauri()) {
-    return { connected: true, displayName: "示例用户", username: "demo" };
+    return {
+      connected: true,
+      displayName: "示例用户",
+      username: "cnb.demo-user",
+      defaultNamespace: "demo",
+      namespaces: [
+        {
+          path: "demo",
+          displayName: "示例组织",
+          accessRole: "Owner",
+          canCreateRepository: true,
+        },
+      ],
+    };
   }
   return invoke("connect_cnb", { token, persist });
 }
 
 export async function getCnbAccount(): Promise<CnbAccount> {
   if (!isTauri()) {
-    return { connected: false, displayName: "尚未连接", username: "" };
+    return {
+      connected: false,
+      displayName: "尚未连接",
+      username: "",
+      defaultNamespace: "",
+      namespaces: [],
+    };
   }
   return invoke<CnbAccount>("get_cnb_account");
 }

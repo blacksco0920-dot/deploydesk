@@ -89,6 +89,11 @@ impl CnbClient {
         self.request(Method::GET, "/user", None).await
     }
 
+    pub async fn user_groups(&self) -> Result<Value> {
+        self.request(Method::GET, "/user/groups?page=1&page_size=100", None)
+            .await
+    }
+
     pub async fn repositories(&self, slug: &str) -> Result<Value> {
         let slug = encode_segment(slug);
         self.request(Method::GET, &format!("/{slug}/-/repos"), None)
@@ -486,6 +491,48 @@ mod tests {
             .await
             .expect_err("unsafe name must fail");
         assert!(error.to_string().contains("仓库名格式不正确"));
+    }
+
+    #[tokio::test]
+    async fn lists_current_users_organizations_with_the_documented_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set timeout");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let count = stream.read(&mut chunk).expect("read request");
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if request_is_complete(&request) {
+                    break;
+                }
+            }
+
+            let response_body = r#"[{"path":"team","access_role":"Owner"}]"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            String::from_utf8(request).expect("request is UTF-8")
+        });
+
+        let client =
+            CnbClient::with_api_base("test-token", format!("http://{address}")).expect("client");
+        let groups = client.user_groups().await.expect("list organizations");
+        assert_eq!(groups[0]["path"], "team");
+
+        let request = server.join().expect("test server thread");
+        assert!(request.starts_with("GET /user/groups?page=1&page_size=100 HTTP/1.1"));
     }
 
     #[tokio::test]

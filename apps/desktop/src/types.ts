@@ -171,6 +171,13 @@ export interface CnbProjectSetup {
   created: boolean;
 }
 
+export interface CnbNamespace {
+  path: string;
+  displayName: string;
+  accessRole: string;
+  canCreateRepository: boolean;
+}
+
 export interface SourceSyncResult {
   repository: string;
   branch: string;
@@ -182,6 +189,8 @@ export interface CnbAccount {
   connected: boolean;
   displayName: string;
   username: string;
+  defaultNamespace: string;
+  namespaces: CnbNamespace[];
 }
 
 export interface SecretStatus {

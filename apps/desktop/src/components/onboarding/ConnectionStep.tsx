@@ -79,6 +79,8 @@ export function ConnectionStep({
     connected: false,
     displayName: "尚未连接",
     username: "",
+    defaultNamespace: "",
+    namespaces: [],
   });
   const [checkingCnb, setCheckingCnb] = useState(true);
   const [cnbDialog, setCnbDialog] = useState(false);

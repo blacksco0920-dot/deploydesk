@@ -1,5 +1,6 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
+  Building2,
   Check,
   Cloud,
   Copy,
@@ -15,7 +16,7 @@ import {
   getCnbAccount,
   prepareCnbSecretBundle,
 } from "../../api";
-import type { ServerForm, WorkspacePreview } from "../../types";
+import type { CnbNamespace, ServerForm, WorkspacePreview } from "../../types";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 
@@ -44,7 +45,8 @@ export function CloudSetupAction({
   workspace,
 }: CloudSetupActionProps) {
   const projectName = workspace.inspection.project_name;
-  const [username, setUsername] = useState("");
+  const [repositoryNamespace, setRepositoryNamespace] = useState("");
+  const [namespaces, setNamespaces] = useState<CnbNamespace[]>([]);
   const [secretRepository, setSecretRepository] = useState("");
   const [codeRepository, setCodeRepository] = useState("");
   const [codeReady, setCodeReady] = useState(false);
@@ -70,22 +72,38 @@ export function CloudSetupAction({
   useEffect(() => {
     getCnbAccount()
       .then((account) => {
-        if (!account.connected || !account.username) {
-          throw new Error("CNB 登录状态已失效，请返回连接步骤重新授权");
+        if (!account.connected) {
+          throw new Error(
+            "AD-CNB-101：CNB 登录状态已失效，请返回连接步骤重新授权",
+          );
         }
-        setUsername(account.username);
-        setCodeRepository(`${account.username}/${projectName}`);
-        setSecretRepository(`${account.username}/${suggestedSecretName}`);
+        setNamespaces(account.namespaces);
+        if (!account.defaultNamespace) {
+          throw new Error(
+            "AD-CNB-104：当前 CNB 账号还没有可用组织，请先创建或加入组织",
+          );
+        }
+        setRepositoryNamespace(account.defaultNamespace);
+        setCodeRepository(`${account.defaultNamespace}/${projectName}`);
+        setSecretRepository(
+          `${account.defaultNamespace}/${suggestedSecretName}`,
+        );
       })
       .catch((error) => onError(toMessage(error)))
       .finally(() => setLoadingAccount(false));
   }, [onError, projectName, suggestedSecretName]);
 
   async function prepareCodeRepository() {
-    if (!username) return;
+    if (!repositoryNamespace) {
+      onError("AD-CNB-104：当前 CNB 账号还没有可用组织，请先创建或加入组织");
+      return;
+    }
     setPreparingCode(true);
     try {
-      const result = await ensureCnbRepository(username, projectName);
+      const result = await ensureCnbRepository(
+        repositoryNamespace,
+        projectName,
+      );
       setCodeRepository(result.repository);
       setCodeReady(true);
     } catch (error) {
@@ -93,6 +111,15 @@ export function CloudSetupAction({
     } finally {
       setPreparingCode(false);
     }
+  }
+
+  function chooseNamespace(namespace: string) {
+    setRepositoryNamespace(namespace);
+    setCodeRepository(`${namespace}/${projectName}`);
+    setSecretRepository(`${namespace}/${suggestedSecretName}`);
+    setCodeReady(false);
+    setCopied({ staging: false, production: false });
+    setPasted({ staging: false, production: false });
   }
 
   async function copyEnvironment(environment: DeployEnvironment) {
@@ -151,32 +178,81 @@ export function CloudSetupAction({
       </p>
 
       <section className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
-        <SetupRow
-          description={
-            codeReady
-              ? `已使用 ${codeRepository}`
-              : "用于接收代码并构建不可变镜像"
+        {namespaces.length > 1 ? (
+          <label className="flex min-h-[68px] items-center gap-3 px-4">
+            <span className="grid size-8 shrink-0 place-items-center rounded-md bg-[var(--muted)] text-[var(--muted-foreground)]">
+              <Building2 className="size-4" />
+            </span>
+            <span className="min-w-0 flex-1">
+              <strong className="block text-sm font-medium">
+                保存到 CNB 组织
+              </strong>
+              <span className="mt-0.5 block text-xs text-[var(--muted-foreground)]">
+                代码仓库和安全配置会保存在这里
+              </span>
+            </span>
+            <select
+              aria-label="保存到 CNB 组织"
+              className="h-9 max-w-56 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 text-sm outline-none focus:border-[var(--accent)]"
+              onChange={(event) => chooseNamespace(event.target.value)}
+              value={repositoryNamespace}
+            >
+              {namespaces.map((namespace) => (
+                <option key={namespace.path} value={namespace.path}>
+                  {namespace.displayName === namespace.path
+                    ? namespace.path
+                    : `${namespace.displayName} (${namespace.path})`}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
+        <div
+          className={
+            namespaces.length > 1 ? "border-t border-[var(--border)]" : ""
           }
-          done={codeReady}
-          icon={Cloud}
-          title="准备私有构建仓库"
         >
-          <Button
-            disabled={loadingAccount || preparingCode}
-            onClick={prepareCodeRepository}
-            size="sm"
-            variant="secondary"
+          <SetupRow
+            description={
+              codeReady
+                ? `已使用 ${codeRepository}`
+                : "用于接收代码并构建不可变镜像"
+            }
+            done={codeReady}
+            icon={Cloud}
+            title="准备私有构建仓库"
           >
-            {preparingCode ? (
-              <LoaderCircle className="animate-spin-slow" />
-            ) : codeReady ? (
-              <Check />
-            ) : (
-              <Cloud />
-            )}
-            {codeReady ? "已准备" : "自动准备"}
-          </Button>
-        </SetupRow>
+            <Button
+              disabled={loadingAccount || preparingCode || !repositoryNamespace}
+              onClick={prepareCodeRepository}
+              size="sm"
+              variant="secondary"
+            >
+              {preparingCode ? (
+                <LoaderCircle className="animate-spin-slow" />
+              ) : codeReady ? (
+                <Check />
+              ) : (
+                <Cloud />
+              )}
+              {codeReady ? "已准备" : "自动准备"}
+            </Button>
+          </SetupRow>
+        </div>
+
+        {!loadingAccount && !repositoryNamespace ? (
+          <div className="flex items-center justify-between gap-3 border-t border-[var(--border)] bg-[var(--warning-soft)] px-4 py-3 text-xs text-[var(--warning)]">
+            <span>当前账号没有可用组织，CNB 仓库必须保存在组织中。</span>
+            <Button
+              onClick={() => openUrl("https://cnb.cool")}
+              size="sm"
+              variant="secondary"
+            >
+              <ExternalLink />
+              打开 CNB 创建组织
+            </Button>
+          </div>
+        ) : null}
 
         <div className="border-t border-[var(--border)] px-4 py-4">
           <div className="flex items-start gap-3">
@@ -348,7 +424,10 @@ function SetupRow({
 }
 
 function validRepository(value: string) {
-  return /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(value);
+  const parts = value.split("/");
+  return (
+    parts.length >= 2 && parts.every((part) => /^[A-Za-z0-9._-]+$/.test(part))
+  );
 }
 
 function toMessage(error: unknown) {

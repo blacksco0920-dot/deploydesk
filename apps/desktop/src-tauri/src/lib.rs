@@ -76,6 +76,17 @@ struct CnbAccount {
     connected: bool,
     display_name: String,
     username: String,
+    default_namespace: String,
+    namespaces: Vec<CnbNamespace>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CnbNamespace {
+    path: String,
+    display_name: String,
+    access_role: String,
+    can_create_repository: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1535,13 +1546,14 @@ fn delete_secret(key: String) -> Result<SecretStatus, String> {
 #[tauri::command]
 async fn connect_cnb(token: String, persist: bool) -> Result<CnbAccount, String> {
     let token = Zeroizing::new(token);
-    let client = CnbClient::new(token.as_str()).map_err(public_error)?;
-    let user = client.current_user().await.map_err(public_error)?;
+    let client = CnbClient::new(token.as_str()).map_err(cnb_public_error)?;
+    let user = client.current_user().await.map_err(cnb_public_error)?;
+    let groups = client.user_groups().await.map_err(cnb_public_error)?;
     if persist {
         let entry = Entry::new(KEYRING_SERVICE, "cnb-token").map_err(public_error)?;
         entry.set_password(token.as_str()).map_err(public_error)?;
     }
-    Ok(cnb_account_from_user(&user))
+    Ok(cnb_account_from_responses(&user, &groups))
 }
 
 #[tauri::command]
@@ -1553,16 +1565,19 @@ async fn get_cnb_account() -> Result<CnbAccount, String> {
                 connected: false,
                 display_name: "尚未连接".to_string(),
                 username: String::new(),
+                default_namespace: String::new(),
+                namespaces: Vec::new(),
             });
         }
         Err(error) => return Err(public_error(error)),
     };
-    let client = CnbClient::new(token.as_str()).map_err(public_error)?;
-    let user = client.current_user().await.map_err(public_error)?;
-    Ok(cnb_account_from_user(&user))
+    let client = CnbClient::new(token.as_str()).map_err(cnb_public_error)?;
+    let user = client.current_user().await.map_err(cnb_public_error)?;
+    let groups = client.user_groups().await.map_err(cnb_public_error)?;
+    Ok(cnb_account_from_responses(&user, &groups))
 }
 
-fn cnb_account_from_user(user: &serde_json::Value) -> CnbAccount {
+fn cnb_account_from_responses(user: &serde_json::Value, groups: &serde_json::Value) -> CnbAccount {
     let username = ["username", "slug", "login", "name"]
         .into_iter()
         .find_map(|key| user.get(key).and_then(serde_json::Value::as_str))
@@ -1573,11 +1588,113 @@ fn cnb_account_from_user(user: &serde_json::Value) -> CnbAccount {
         .find_map(|key| user.get(key).and_then(serde_json::Value::as_str))
         .unwrap_or(&username)
         .to_string();
+    let namespaces = cnb_namespaces(groups);
+    let default_namespace = namespaces
+        .first()
+        .map(|namespace| namespace.path.clone())
+        .unwrap_or_default();
     CnbAccount {
         connected: true,
         display_name,
         username,
+        default_namespace,
+        namespaces,
     }
+}
+
+fn cnb_namespaces(groups: &serde_json::Value) -> Vec<CnbNamespace> {
+    let mut namespaces = cnb_collection(groups)
+        .iter()
+        .filter_map(|group| {
+            let path = group.get("path")?.as_str()?.trim();
+            if !valid_cnb_namespace(path) {
+                return None;
+            }
+            let access_role = group
+                .get("access_role")
+                .or_else(|| group.get("accessRole"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let normalized_role = access_role.to_ascii_lowercase();
+            let can_create_repository = !group
+                .get("freeze")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                && matches!(
+                    normalized_role.as_str(),
+                    "owner" | "administrator" | "admin" | "master"
+                );
+            let display_name = ["remark", "name"]
+                .into_iter()
+                .filter_map(|key| group.get(key).and_then(serde_json::Value::as_str))
+                .map(str::trim)
+                .find(|value| !value.is_empty())
+                .unwrap_or(path)
+                .to_string();
+            Some(CnbNamespace {
+                path: path.to_string(),
+                display_name,
+                access_role,
+                can_create_repository,
+            })
+        })
+        .collect::<Vec<_>>();
+    namespaces.sort_by(|left, right| {
+        right
+            .can_create_repository
+            .cmp(&left.can_create_repository)
+            .then_with(|| {
+                left.path
+                    .to_ascii_lowercase()
+                    .cmp(&right.path.to_ascii_lowercase())
+            })
+    });
+    namespaces.dedup_by(|left, right| left.path.eq_ignore_ascii_case(&right.path));
+    namespaces
+}
+
+fn cnb_collection(value: &serde_json::Value) -> &[serde_json::Value] {
+    value
+        .as_array()
+        .or_else(|| value.get("data").and_then(serde_json::Value::as_array))
+        .or_else(|| {
+            value
+                .pointer("/data/list")
+                .and_then(serde_json::Value::as_array)
+        })
+        .or_else(|| {
+            value
+                .pointer("/data/items")
+                .and_then(serde_json::Value::as_array)
+        })
+        .map_or(&[], Vec::as_slice)
+}
+
+fn existing_cnb_repository(
+    repositories: &serde_json::Value,
+    namespace: &str,
+    requested_name: &str,
+) -> Option<String> {
+    let requested_name = requested_name.trim();
+    cnb_collection(repositories).iter().find_map(|repository| {
+        let path = repository.get("path").and_then(serde_json::Value::as_str)?;
+        let name = repository
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| path.rsplit('/').next())?;
+        let (repository_namespace, repository_name) = path.rsplit_once('/')?;
+        if name.eq_ignore_ascii_case(requested_name)
+            && repository_name.eq_ignore_ascii_case(requested_name)
+            && repository_namespace.eq_ignore_ascii_case(namespace.trim())
+            && validate_repository_slug(path).is_ok()
+        {
+            Some(path.to_string())
+        } else {
+            None
+        }
+    })
 }
 
 #[tauri::command]
@@ -1589,11 +1706,11 @@ async fn create_cnb_repository(
     private_repo: bool,
 ) -> Result<CnbRepositoryResult, String> {
     let token = resolve_cnb_token(token)?;
-    let client = CnbClient::new(token).map_err(public_error)?;
+    let client = CnbClient::new(token).map_err(cnb_public_error)?;
     client
         .create_repository(&slug, &name, &description, private_repo)
         .await
-        .map_err(public_error)?;
+        .map_err(cnb_public_error)?;
     Ok(CnbRepositoryResult {
         repository: format!("{}/{}", slug.trim(), name.trim()),
         visibility: if private_repo { "private" } else { "public" }.to_string(),
@@ -1602,18 +1719,61 @@ async fn create_cnb_repository(
 
 #[tauri::command]
 async fn ensure_cnb_repository(slug: String, name: String) -> Result<CnbProjectSetup, String> {
+    if !valid_cnb_namespace(slug.trim()) || !valid_repository_segment(name.trim()) {
+        return Err("AD-CNB-105：CNB 组织或仓库名称格式不正确".to_string());
+    }
     let token = Zeroizing::new(resolve_cnb_token(String::new())?);
-    let client = CnbClient::new(token.as_str()).map_err(public_error)?;
+    let client = CnbClient::new(token.as_str()).map_err(cnb_public_error)?;
+    let namespaces = client.user_groups().await.map_err(cnb_public_error)?;
+    let namespace = cnb_namespaces(&namespaces)
+        .into_iter()
+        .find(|namespace| namespace.path.eq_ignore_ascii_case(slug.trim()))
+        .ok_or_else(|| {
+            "AD-CNB-104：所选 CNB 组织不存在或当前账号无权使用，请重新连接后选择可用组织"
+                .to_string()
+        })?;
+    let repositories = client
+        .repositories(&namespace.path)
+        .await
+        .map_err(cnb_public_error)?;
+    if let Some(repository) = existing_cnb_repository(&repositories, &namespace.path, &name) {
+        return Ok(CnbProjectSetup {
+            repository,
+            created: false,
+        });
+    }
+    if !namespace.can_create_repository {
+        return Err(
+            "AD-CNB-103：当前账号在所选 CNB 组织中没有创建仓库权限，请让组织管理员创建或提升权限"
+                .to_string(),
+        );
+    }
     let created = match client
-        .create_repository(&slug, &name, "由 ABCDeploy 管理的私有构建仓库", true)
+        .create_repository(
+            &namespace.path,
+            &name,
+            "由 ABCDeploy 管理的私有构建仓库",
+            true,
+        )
         .await
     {
         Ok(_) => true,
         Err(DeployError::CnbApi { status: 409, .. }) => false,
-        Err(error) => return Err(public_error(error)),
+        Err(error) => return Err(cnb_public_error(error)),
+    };
+    let repository = if created {
+        format!("{}/{}", namespace.path, name.trim())
+    } else {
+        let repositories = client
+            .repositories(&namespace.path)
+            .await
+            .map_err(cnb_public_error)?;
+        existing_cnb_repository(&repositories, &namespace.path, &name).ok_or_else(|| {
+            "AD-CNB-106：CNB 已存在同名仓库，但当前账号无法读取，请检查仓库权限".to_string()
+        })?
     };
     Ok(CnbProjectSetup {
-        repository: format!("{}/{}", slug.trim(), name.trim()),
+        repository,
         created,
     })
 }
@@ -1622,11 +1782,11 @@ async fn ensure_cnb_repository(slug: String, name: String) -> Result<CnbProjectS
 async fn enable_cnb_auto_trigger(repository: String) -> Result<ProviderCheck, String> {
     validate_repository_slug(&repository)?;
     let token = Zeroizing::new(resolve_cnb_token(String::new())?);
-    let client = CnbClient::new(token.as_str()).map_err(public_error)?;
+    let client = CnbClient::new(token.as_str()).map_err(cnb_public_error)?;
     client
         .enable_auto_trigger(&repository)
         .await
-        .map_err(public_error)?;
+        .map_err(cnb_public_error)?;
     Ok(ProviderCheck {
         provider: "cnb-auto-trigger".to_string(),
         ok: true,
@@ -1751,7 +1911,7 @@ fn resolve_cnb_token(mut provided: String) -> Result<String, String> {
     provided.zeroize();
     read_keyring_secret("cnb-token").map_err(|error| {
         if error == "missing" {
-            "请重新连接 CNB，并保存令牌后再创建仓库".to_string()
+            "AD-CNB-101：CNB 登录状态已失效，请返回连接步骤重新授权".to_string()
         } else {
             public_error(error)
         }
@@ -1896,16 +2056,24 @@ fn parse_deploy_environment(value: &str) -> Result<EnvironmentName, String> {
 }
 
 fn validate_repository_slug(value: &str) -> Result<(), String> {
-    let mut segments = value.split('/');
-    let owner = segments.next().unwrap_or_default();
-    let repository = segments.next().unwrap_or_default();
-    if segments.next().is_some()
-        || !valid_repository_segment(owner)
-        || !valid_repository_segment(repository)
+    let segments = value.split('/').collect::<Vec<_>>();
+    if segments.len() < 2
+        || segments
+            .iter()
+            .any(|segment| !valid_repository_segment(segment))
     {
         return Err("CNB 密钥仓库应填写为 所属组织/仓库名".to_string());
     }
     Ok(())
+}
+
+fn valid_cnb_namespace(value: &str) -> bool {
+    let segments = value.split('/').collect::<Vec<_>>();
+    !segments.is_empty()
+        && segments.len() <= 20
+        && segments
+            .iter()
+            .all(|segment| valid_repository_segment(segment))
 }
 
 fn valid_repository_segment(value: &str) -> bool {
@@ -2054,6 +2222,41 @@ fn public_error(error: impl std::fmt::Display) -> String {
     redact_text(&error.to_string())
 }
 
+fn cnb_public_error(error: DeployError) -> String {
+    let (code, message) = match error {
+        DeployError::MissingCredential(_) | DeployError::CnbApi { status: 401, .. } => {
+            ("AD-CNB-101", "CNB 登录状态已失效，请返回连接步骤重新授权")
+        }
+        DeployError::Http(error) if error.status().is_some_and(|status| status.as_u16() == 429) => {
+            ("AD-CNB-107", "CNB 请求过于频繁，请稍后重新尝试")
+        }
+        DeployError::Http(_) => ("AD-CNB-102", "暂时无法连接 CNB，请检查网络后重试"),
+        DeployError::CnbApi { status: 403, .. } => {
+            ("AD-CNB-103", "当前 CNB 令牌或组织角色缺少所需权限")
+        }
+        DeployError::CnbApi { status: 404, .. } => {
+            ("AD-CNB-104", "CNB 中找不到所选组织或仓库，请重新选择组织")
+        }
+        DeployError::CnbApi {
+            status: 400 | 422, ..
+        }
+        | DeployError::InvalidManifest(_) => {
+            ("AD-CNB-105", "CNB 拒绝了当前组织或仓库配置，请检查名称")
+        }
+        DeployError::CnbApi { status: 409, .. } => {
+            ("AD-CNB-106", "CNB 已存在同名资源，但当前账号无法正常读取")
+        }
+        DeployError::CnbApi { status: 429, .. } => {
+            ("AD-CNB-107", "CNB 请求过于频繁，请稍后重新尝试")
+        }
+        DeployError::CnbApi { status, .. } if status >= 500 => {
+            ("AD-CNB-102", "CNB 服务暂时不可用，请稍后重试")
+        }
+        _ => ("AD-CNB-199", "CNB 服务请求没有完成，请稍后重试"),
+    };
+    format!("{code}：{message}")
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2120,11 +2323,13 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DeploymentRun, apply_public_route_checks, cloud_setup_required, is_deployment_owned_path,
+        DeploymentRun, apply_public_route_checks, cloud_setup_required, cnb_account_from_responses,
+        cnb_public_error, existing_cnb_repository, is_deployment_owned_path,
         parse_deployment_artifacts, rollback_script, runtime_config_key, runtime_config_template,
         runtime_secret_key, same_artifact_digests, stage_key, update_run_from_cnb,
         validate_git_branch, validate_repository_slug,
     };
+    use deploy_core::error::DeployError;
     use deploy_core::model::PublicRouteCheck;
 
     fn run() -> DeploymentRun {
@@ -2269,14 +2474,14 @@ providers:
 
     #[test]
     fn validates_cnb_repositories_and_release_branches() {
-        for repository in ["team/project", "abc_1/project.name"] {
+        for repository in ["team/project", "abc_1/project.name", "parent/team/project"] {
             assert!(validate_repository_slug(repository).is_ok());
         }
         for repository in [
             "project",
-            "team/project/extra",
             "team/project name",
             "../project",
+            "team//project",
         ] {
             assert!(validate_repository_slug(repository).is_err());
         }
@@ -2293,6 +2498,66 @@ providers:
         ] {
             assert!(validate_git_branch(branch).is_err());
         }
+    }
+
+    #[test]
+    fn uses_cnb_organization_namespace_instead_of_login_username() {
+        let account = cnb_account_from_responses(
+            &json!({
+                "username": "cnb.boxuDF6MQHA",
+                "nickname": "马成龙"
+            }),
+            &json!({
+                "data": [
+                    {
+                        "path": "read-only-team",
+                        "name": "只读团队",
+                        "access_role": "Guest",
+                        "freeze": false
+                    },
+                    {
+                        "path": "blacksco0920",
+                        "name": "blacksco0920",
+                        "access_role": "Owner",
+                        "freeze": false
+                    }
+                ]
+            }),
+        );
+
+        assert_eq!(account.username, "cnb.boxuDF6MQHA");
+        assert_eq!(account.default_namespace, "blacksco0920");
+        assert_eq!(account.namespaces[0].path, "blacksco0920");
+        assert!(account.namespaces[0].can_create_repository);
+    }
+
+    #[test]
+    fn reuses_existing_cnb_repository_case_insensitively() {
+        let repositories = json!({
+            "data": [
+                {"name": "FinAgent", "path": "blacksco0920/FinAgent"},
+                {"name": "other", "path": "blacksco0920/other"}
+            ]
+        });
+
+        assert_eq!(
+            existing_cnb_repository(&repositories, "blacksco0920", "finagent").as_deref(),
+            Some("blacksco0920/FinAgent")
+        );
+    }
+
+    #[test]
+    fn maps_cnb_api_failures_without_exposing_raw_response_bodies() {
+        let message = cnb_public_error(DeployError::CnbApi {
+            status: 404,
+            message: r#"{"errcode":5,"errmsg":"Resource not found."}"#.to_string(),
+        });
+
+        assert_eq!(
+            message,
+            "AD-CNB-104：CNB 中找不到所选组织或仓库，请重新选择组织"
+        );
+        assert!(!message.contains("Resource not found"));
     }
 
     #[test]

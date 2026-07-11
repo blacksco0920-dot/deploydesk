@@ -85,7 +85,14 @@ function App() {
     useState<UserFacingIssue | null>(null);
 
   const reportError = useCallback((message: string) => {
-    toast.error(message, { duration: 7000 });
+    const issue = issueFromUnknown(message, "当前步骤没有完成");
+    const nextStep = issue.nextSteps[0];
+    toast.error(`${issue.code} · ${issue.title}`, {
+      description: [issue.message, nextStep ? `下一步：${nextStep}` : ""]
+        .filter(Boolean)
+        .join(" "),
+      duration: 9000,
+    });
   }, []);
 
   const reportDeploymentIssue = useCallback((issue: UserFacingIssue) => {

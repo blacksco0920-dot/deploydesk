@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${1:-0.2.0-preview.1}"
+VERSION="${1:-0.2.0-preview.2}"
 ASSET_DIR="${2:-$ROOT_DIR/target/release/bundle}"
 RELEASE_HOST="${RELEASE_HOST:-}"
 RELEASE_USER="${RELEASE_USER:-ubuntu}"
