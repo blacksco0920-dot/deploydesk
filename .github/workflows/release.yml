@@ -34,7 +34,9 @@ jobs:
           - name: Windows x64
             os: windows-2025
             rust_targets: x86_64-pc-windows-msvc
-            args: --bundles nsis,msi --ci
+            # WiX/MSI 不接受 "preview.1" 这类文本预发布标识。
+            # 预览版使用功能完整的 NSIS Windows 安装程序。
+            args: --bundles nsis --ci
             signing_identity: ""
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -90,6 +92,7 @@ jobs:
           releaseBody: |
             ABCDeploy 小白部署 V2 预览安装包。
 
+            Windows 预览版提供 NSIS `.exe` 安装程序；稳定版使用正式版本号后再同时提供 MSI。
             当前构建未配置商业代码签名证书，请下载后校验 GitHub Release 资产摘要。
           releaseDraft: false
           prerelease: true

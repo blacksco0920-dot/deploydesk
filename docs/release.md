@@ -26,6 +26,8 @@ scripts/publish-release-assets.sh \
 
 脚本只接受当前版本的 `.dmg`、`.exe`、`.msi`、`.AppImage` 和 `.deb`，使用已有 `known_hosts` 严格校验服务器身份，生成 SHA-256 后上传到：
 
+Windows 预览版使用 NSIS `.exe`。WiX/MSI 不接受 `preview.1` 这类文本预发布标识，因此 MSI 仅在使用纯数字正式版本号的稳定版中启用；这不影响 Windows 客户端的安装和使用。
+
 ```text
 /opt/infra/releases/abcdeploy/
   latest.json

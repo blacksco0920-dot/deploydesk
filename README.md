@@ -65,7 +65,7 @@ flowchart LR
 优先从 [ABCDeploy 官网](https://abcdeploy.finagent.cloud) 下载；无法访问时可使用 [GitHub Releases](https://github.com/blacksco0920-dot/abcdeploy/releases) 备用入口：
 
 - macOS Apple Silicon / Intel：`.dmg`
-- Windows x64：NSIS `.exe` 或 `.msi`
+- Windows x64：预览版提供 NSIS `.exe`；稳定版再同时提供 `.msi`
 - Linux x64：`.AppImage` 或 `.deb`
 
 Alpha 安装包尚未配置商业代码签名证书时，系统可能显示来源提示。请只从本仓库 Release 下载，并核对发布页面资产。
