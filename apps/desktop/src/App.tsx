@@ -171,12 +171,6 @@ function App() {
         setWorkspace(result);
         setProjectPath(path);
         await setAppSetting("active-project", path);
-        if (
-          result.manifestExists &&
-          (resumeStep === "deploying" || resumeStep === "workspace")
-        ) {
-          await syncExternalDeployments(path).catch(() => []);
-        }
         const runs = await listDeploymentRuns(path);
         setDeploymentRuns(runs);
         const resumable = runs.find((run) =>
@@ -548,6 +542,16 @@ function App() {
     await goToStep("workspace");
   }
 
+  async function refreshWorkspaceProject() {
+    if (!projectPath) return;
+    try {
+      await syncExternalDeployments(projectPath);
+    } catch (error) {
+      reportError(toMessage(error));
+    }
+    await loadProject(projectPath, "workspace");
+  }
+
   async function promoteToProduction(source: DeploymentRun) {
     setApplying(true);
     try {
@@ -766,7 +770,7 @@ function App() {
           }}
           onPromote={promoteToProduction}
           onRollback={rollbackProjectEnvironment}
-          onRefresh={() => loadProject(projectPath, "workspace")}
+          onRefresh={refreshWorkspaceProject}
           path={projectPath}
           runs={deploymentRuns}
           workspace={workspace}

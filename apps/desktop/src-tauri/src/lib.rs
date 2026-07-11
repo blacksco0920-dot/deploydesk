@@ -1665,6 +1665,8 @@ async fn connect_cnb(token: String, persist: bool) -> Result<CnbAccount, String>
     let groups = client.user_groups().await.map_err(cnb_public_error)?;
     if persist {
         write_keyring_secret("cnb-token", token.as_str())?;
+    } else {
+        cache_secret("cnb-token", token.as_str());
     }
     Ok(cnb_account_from_responses(&user, &groups))
 }
@@ -2033,6 +2035,12 @@ fn resolve_cnb_token(mut provided: String) -> Result<String, String> {
         return Ok(token);
     }
     provided.zeroize();
+    if let Ok(token) = std::env::var("CNB_TOKEN") {
+        let token = token.trim();
+        if !token.is_empty() {
+            return Ok(token.to_string());
+        }
+    }
     read_keyring_secret("cnb-token").map_err(|error| {
         if error == "missing" {
             "AD-CNB-101：CNB 登录状态已失效，请返回连接步骤重新授权".to_string()
