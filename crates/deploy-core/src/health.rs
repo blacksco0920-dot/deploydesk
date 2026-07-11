@@ -1,4 +1,5 @@
-use std::net::ToSocketAddrs;
+use std::collections::HashSet;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::error::Result;
@@ -55,25 +56,35 @@ pub async fn check_http_health(
 }
 
 pub async fn check_public_route(host: &str, path: &str) -> PublicRouteCheck {
+    check_public_route_for_target(host, path, None).await
+}
+
+pub async fn check_public_route_for_target(
+    host: &str,
+    path: &str,
+    expected_target: Option<&str>,
+) -> PublicRouteCheck {
     let route_path = if path.starts_with('/') { path } else { "/" };
     let url = format!("https://{host}{route_path}");
-    let lookup_host = host.to_string();
-    let lookup = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::task::spawn_blocking(move || {
-            (lookup_host.as_str(), 443)
-                .to_socket_addrs()
-                .map(|mut addresses| addresses.next().is_some())
-        }),
-    )
-    .await;
-    if !matches!(lookup, Ok(Ok(Ok(true)))) {
+    let Some(route_addresses) = resolve_addresses(host).await else {
         return PublicRouteCheck {
             url,
             reachable: false,
             phase: "dns".to_string(),
             status: None,
             message: format!("{host} 尚未解析，请添加指向目标服务器的 A 或 AAAA 记录"),
+        };
+    };
+    if let Some(expected_target) = expected_target
+        && let Some(target_addresses) = resolve_addresses(expected_target).await
+        && route_addresses.is_disjoint(&target_addresses)
+    {
+        return PublicRouteCheck {
+            url,
+            reachable: false,
+            phase: "dns".to_string(),
+            status: None,
+            message: format!("{host} 已解析，但没有指向刚刚验证的目标服务器"),
         };
     }
 
@@ -126,5 +137,46 @@ pub async fn check_public_route(host: &str, path: &str) -> PublicRouteCheck {
                 )
             },
         },
+    }
+}
+
+async fn resolve_addresses(host: &str) -> Option<HashSet<IpAddr>> {
+    if let Ok(address) = host.parse::<IpAddr>() {
+        return Some(HashSet::from([address]));
+    }
+    let lookup_host = host.to_string();
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            (lookup_host.as_str(), 443)
+                .to_socket_addrs()
+                .map(|addresses| {
+                    addresses
+                        .map(|address| address.ip())
+                        .collect::<HashSet<_>>()
+                })
+        }),
+    )
+    .await
+    {
+        Ok(Ok(Ok(addresses))) if !addresses.is_empty() => Some(addresses),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_addresses;
+
+    #[tokio::test]
+    async fn parses_literal_target_addresses_without_dns() {
+        let addresses = resolve_addresses("42.193.229.35")
+            .await
+            .expect("literal address");
+        assert!(
+            addresses
+                .iter()
+                .any(|address| address.to_string() == "42.193.229.35")
+        );
     }
 }

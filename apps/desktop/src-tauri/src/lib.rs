@@ -508,7 +508,7 @@ async fn refresh_deployment(
                 apply_runner_log_diagnostic(&mut run, &log);
             }
             if run.status == "success" {
-                verify_public_routes(&mut run).await;
+                verify_public_routes(&mut run, &state).await;
             }
         }
         Err(error) => {
@@ -599,7 +599,7 @@ async fn finalize_successful_deployment(run: &mut DeploymentRun, state: &Workspa
         }
     }
     run.issue_code = None;
-    verify_public_routes(run).await;
+    verify_public_routes(run, state).await;
 }
 
 async fn capture_deployment_artifacts(
@@ -683,7 +683,7 @@ fn same_artifact_digests(left: &[DeploymentArtifact], right: &[DeploymentArtifac
         })
 }
 
-async fn verify_public_routes(run: &mut DeploymentRun) {
+async fn verify_public_routes(run: &mut DeploymentRun, state: &WorkspaceState) {
     let manifest = match load_manifest(Path::new(&run.project_path).join(MANIFEST_FILE).as_path()) {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -705,9 +705,21 @@ async fn verify_public_routes(run: &mut DeploymentRun) {
     if routes.is_empty() {
         return;
     }
+    let expected_target = state
+        .server_for_project(Path::new(&run.project_path), &run.environment)
+        .ok()
+        .flatten()
+        .map(|server| server.host);
     let mut checks = Vec::with_capacity(routes.len());
     for route in routes {
-        checks.push(deploy_core::health::check_public_route(&route.host, &route.path).await);
+        checks.push(
+            deploy_core::health::check_public_route_for_target(
+                &route.host,
+                &route.path,
+                expected_target.as_deref(),
+            )
+            .await,
+        );
     }
     apply_public_route_checks(run, &checks);
 }
