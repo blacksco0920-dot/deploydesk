@@ -47,4 +47,12 @@ describe("user-facing deployment errors", () => {
     );
     expect(issue.nextSteps[0]).toContain("同名仓库权限");
   });
+
+  it("turns uncommitted project files into a clear deployment choice", () => {
+    const issue = issueFromUnknown(
+      "AD-GIT-101：发现尚未提交的项目文件：src/app.ts。为避免部署旧代码，已暂停同步",
+    );
+    expect(issue.title).toBe("项目改动还没有提交");
+    expect(issue.nextSteps[0]).toContain("部署上次已提交版本");
+  });
 });

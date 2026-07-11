@@ -72,6 +72,11 @@ enum ReleaseChannel {
 
 pub fn render_project_files(manifest: &ProjectManifest) -> Result<Vec<GeneratedFile>> {
     let mut files = Vec::new();
+    files.push(GeneratedFile {
+        path: ".deploydesk/.gitignore".to_string(),
+        content: "# ABCDeploy 本机状态，不上传到代码仓库。\nbackups/\nruntime/\nstate/\n"
+            .to_string(),
+    });
     for (name, environment) in manifest.environments.entries() {
         files.push(GeneratedFile {
             path: format!(".deploydesk/generated/{}/docker-compose.yml", name.as_str()),
@@ -1083,6 +1088,11 @@ mod tests {
             path: "/".to_string(),
         });
         let files = render_project_files(&manifest).expect("render files");
+        assert!(files.iter().any(|file| {
+            file.path == ".deploydesk/.gitignore"
+                && file.content.contains("backups/")
+                && file.content.contains("state/")
+        }));
         assert!(files.iter().any(|file| {
             file.path == ".deploydesk/generated/staging/docker-compose.yml"
                 && file.content.contains("example-app-staging")

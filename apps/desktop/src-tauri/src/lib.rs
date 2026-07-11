@@ -1804,6 +1804,7 @@ fn sync_project_to_cnb(
     path: String,
     repository: String,
     branch: String,
+    allow_uncommitted: bool,
 ) -> Result<SourceSyncResult, String> {
     validate_repository_slug(&repository)?;
     validate_git_branch(&branch)?;
@@ -1826,14 +1827,24 @@ fn sync_project_to_cnb(
     let unrelated = status
         .lines()
         .filter_map(status_path)
-        .filter(|path| !is_deployment_owned_path(path))
-        .take(4)
+        .filter(|path| !is_deployment_owned_path(path) && !is_deployment_internal_path(path))
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    if !unrelated.is_empty() {
+    if !unrelated.is_empty() && !allow_uncommitted {
+        let examples = unrelated
+            .iter()
+            .take(3)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("、");
+        let remaining = unrelated.len().saturating_sub(3);
+        let suffix = if remaining > 0 {
+            format!("等 {} 个文件", unrelated.len())
+        } else {
+            String::new()
+        };
         return Err(format!(
-            "还有未提交的业务代码：{}。请先在编程工具中保存版本，再继续部署",
-            unrelated.join("、")
+            "AD-GIT-101：发现尚未提交的项目文件：{examples}{suffix}。为避免部署旧代码，已暂停同步"
         ));
     }
 
@@ -2126,6 +2137,7 @@ fn deployment_owned_paths(root: &Path) -> Vec<String> {
         "deploy.yaml",
         ".cnb.yml",
         ".github/workflows/sync-cnb.yml",
+        ".deploydesk/.gitignore",
         ".deploydesk/generated",
     ]
     .into_iter()
@@ -2137,8 +2149,22 @@ fn deployment_owned_paths(root: &Path) -> Vec<String> {
 fn is_deployment_owned_path(path: &str) -> bool {
     matches!(
         path,
-        "deploy.yaml" | ".cnb.yml" | ".cnb/tag_deploy.yml" | ".github/workflows/sync-cnb.yml"
+        "deploy.yaml"
+            | ".cnb.yml"
+            | ".cnb/tag_deploy.yml"
+            | ".github/workflows/sync-cnb.yml"
+            | ".deploydesk/.gitignore"
     ) || path.starts_with(".deploydesk/generated/")
+}
+
+fn is_deployment_internal_path(path: &str) -> bool {
+    [
+        ".deploydesk/backups/",
+        ".deploydesk/runtime/",
+        ".deploydesk/state/",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
 }
 
 fn status_path(line: &str) -> Option<&str> {
@@ -2361,10 +2387,10 @@ mod tests {
     use super::{
         DeploymentRun, apply_public_route_checks, cache_secret, cached_secret,
         cloud_setup_required, cnb_account_from_responses, cnb_public_error, evict_cached_secret,
-        existing_cnb_repository, is_deployment_owned_path, parse_deployment_artifacts,
-        rollback_script, runtime_config_key, runtime_config_template, runtime_secret_key,
-        same_artifact_digests, stage_key, update_run_from_cnb, validate_git_branch,
-        validate_repository_slug,
+        existing_cnb_repository, is_deployment_internal_path, is_deployment_owned_path,
+        parse_deployment_artifacts, rollback_script, runtime_config_key, runtime_config_template,
+        runtime_secret_key, same_artifact_digests, stage_key, update_run_from_cnb,
+        validate_git_branch, validate_repository_slug,
     };
     use deploy_core::error::DeployError;
     use deploy_core::model::PublicRouteCheck;
@@ -2617,6 +2643,7 @@ providers:
             ".cnb.yml",
             ".cnb/tag_deploy.yml",
             ".github/workflows/sync-cnb.yml",
+            ".deploydesk/.gitignore",
             ".deploydesk/generated/staging/Caddyfile",
         ] {
             assert!(is_deployment_owned_path(path), "{path}");
@@ -2629,6 +2656,16 @@ providers:
         ] {
             assert!(!is_deployment_owned_path(path), "{path}");
         }
+        for path in [
+            ".deploydesk/backups/plan/deploy.yaml",
+            ".deploydesk/runtime/staging/.runtime.env",
+            ".deploydesk/state/last-plan.json",
+        ] {
+            assert!(is_deployment_internal_path(path), "{path}");
+        }
+        assert!(!is_deployment_internal_path(
+            ".deploydesk/generated/staging/Caddyfile"
+        ));
     }
 
     #[test]

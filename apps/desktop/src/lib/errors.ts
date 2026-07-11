@@ -27,7 +27,7 @@ export function issueFromUnknown(
   const coded = message.match(CODE_PATTERN);
   return {
     code: coded?.[1] ?? "AD-APP-001",
-    title,
+    title: titleForCode(coded?.[1]) ?? title,
     message: coded?.[2] ?? message,
     nextSteps: nextStepsForCode(coded?.[1]),
     technicalDetails: coded ? [] : [message],
@@ -36,6 +36,8 @@ export function issueFromUnknown(
 }
 
 function nextStepsForCode(code?: string): string[] {
+  if (code === "AD-GIT-101")
+    return ["回到编程工具提交这些改动，或明确选择部署上次已提交版本"];
   if (code === "AD-CNB-101") return ["重新连接 CNB，然后回到当前任务刷新状态"];
   if (code === "AD-CNB-102") return ["检查网络能否访问 cnb.cool，然后重新尝试"];
   if (code === "AD-CNB-103")
@@ -55,6 +57,11 @@ function nextStepsForCode(code?: string): string[] {
   if (code === "AD-NET-201")
     return ["修正 DNS 或 HTTPS 后重新检查，无需重新构建"];
   return ["确认当前页面的检查项，处理后重新尝试"];
+}
+
+function titleForCode(code?: string): string | undefined {
+  if (code === "AD-GIT-101") return "项目改动还没有提交";
+  return undefined;
 }
 
 function isUserFacingIssue(value: unknown): value is UserFacingIssue {

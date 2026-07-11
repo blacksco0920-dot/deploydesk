@@ -596,6 +596,7 @@ export async function syncProjectToCnb(
   path: string,
   repository: string,
   branch: string,
+  allowUncommitted = false,
 ): Promise<SourceSyncResult> {
   if (!isTauri()) {
     return {
@@ -609,6 +610,7 @@ export async function syncProjectToCnb(
     path,
     repository,
     branch,
+    allowUncommitted,
   });
 }
 

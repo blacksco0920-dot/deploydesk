@@ -41,6 +41,14 @@ import { RecommendationStep } from "./components/onboarding/RecommendationStep";
 import { RequirementsStep } from "./components/onboarding/RequirementsStep";
 import { ReviewStep } from "./components/onboarding/ReviewStep";
 import { Button } from "./components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "./components/ui/dialog";
 import { issueFromProvider, issueFromUnknown } from "./lib/errors";
 import type {
   OnboardingStep,
@@ -53,6 +61,12 @@ import type {
 } from "./types";
 
 type AppScreen = "home" | "onboarding" | "workspace";
+
+interface PendingCloudSetup {
+  codeRepository: string;
+  secretRepository: string;
+  issue: UserFacingIssue;
+}
 
 export function shouldRefreshDeploymentStatus(
   screen: AppScreen,
@@ -90,6 +104,8 @@ function App() {
   const [currentRun, setCurrentRun] = useState<DeploymentRun | null>(null);
   const [deploymentIssue, setDeploymentIssue] =
     useState<UserFacingIssue | null>(null);
+  const [pendingCloudSetup, setPendingCloudSetup] =
+    useState<PendingCloudSetup | null>(null);
 
   const reportError = useCallback((message: string) => {
     const issue = issueFromUnknown(message, "当前步骤没有完成");
@@ -400,6 +416,7 @@ function App() {
   async function completeCloudSetup(
     codeRepository: string,
     secretRepository: string,
+    allowUncommitted = false,
   ) {
     if (!workspace || !projectPath || !currentRun) return;
     setApplying(true);
@@ -428,7 +445,12 @@ function App() {
       }
       await applyManifest(projectPath, manifestYaml);
       const branch = data.source?.release_branch ?? "main";
-      await syncProjectToCnb(projectPath, codeRepository, branch);
+      await syncProjectToCnb(
+        projectPath,
+        codeRepository,
+        branch,
+        allowUncommitted,
+      );
       const autoTrigger = await enableCnbAutoTrigger(codeRepository);
       if (!autoTrigger.ok) throw new Error(autoTrigger.summary);
       const refreshed = await openProject(projectPath);
@@ -439,8 +461,14 @@ function App() {
         run,
         ...current.filter((item) => item.id !== run.id),
       ]);
+      setPendingCloudSetup(null);
       toast.success("持续部署连接已完成，测试环境开始构建");
     } catch (error) {
+      const issue = issueFromUnknown(error, "持续部署连接没有完成");
+      if (issue.code === "AD-GIT-101" && !allowUncommitted) {
+        setPendingCloudSetup({ codeRepository, secretRepository, issue });
+        return;
+      }
       reportError(toMessage(error));
     } finally {
       setApplying(false);
@@ -709,6 +737,49 @@ function App() {
           </div>
         </div>
       ) : null}
+
+      <Dialog
+        onOpenChange={(open) => !open && setPendingCloudSetup(null)}
+        open={Boolean(pendingCloudSetup)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{pendingCloudSetup?.issue.title}</DialogTitle>
+            <DialogDescription>
+              {pendingCloudSetup?.issue.message}
+            </DialogDescription>
+          </DialogHeader>
+          <p className="m-0 text-sm leading-6 text-[var(--muted-foreground)]">
+            继续后，这些本地改动不会上传；CNB 将部署 Git
+            中最近一次已提交的业务代码，ABCDeploy 生成的部署配置仍会单独保存。
+          </p>
+          <DialogFooter>
+            <Button
+              disabled={applying}
+              onClick={() => setPendingCloudSetup(null)}
+              variant="secondary"
+            >
+              暂不部署
+            </Button>
+            <Button
+              disabled={applying || !pendingCloudSetup}
+              onClick={() => {
+                if (!pendingCloudSetup) return;
+                const setup = pendingCloudSetup;
+                setPendingCloudSetup(null);
+                void completeCloudSetup(
+                  setup.codeRepository,
+                  setup.secretRepository,
+                  true,
+                );
+              }}
+            >
+              {applying ? <LoaderCircle className="animate-spin-slow" /> : null}
+              部署已提交版本
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Toaster
         closeButton
