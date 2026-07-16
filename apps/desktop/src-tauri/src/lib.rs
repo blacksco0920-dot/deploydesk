@@ -8414,6 +8414,8 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .on_window_event(|window, event| {
+            #[cfg(not(target_os = "macos"))]
+            let _ = (window, event);
             #[cfg(target_os = "macos")]
             if window.label() == "main"
                 && let tauri::WindowEvent::CloseRequested { api, .. } = event
@@ -8516,6 +8518,8 @@ pub fn run() {
         .expect("ABCDeploy failed to build");
 
     app.run(|app_handle, event| {
+        #[cfg(not(target_os = "macos"))]
+        let _ = app_handle;
         if let tauri::RunEvent::Exit = &event {
             stop_preview_tunnels();
             stop_local_start_processes();
