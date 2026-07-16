@@ -42,7 +42,7 @@ jobs:
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: 安装 pnpm
         uses: pnpm/action-setup@v6
@@ -114,7 +114,7 @@ jobs:
       contents: write
     steps:
       - name: 检出发布脚本
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: 下载全部安装包
         env:
