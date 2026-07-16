@@ -28,13 +28,18 @@ keyring.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
 tauri = { version = "2", features = [] }
+tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
+tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 ssh-key.workspace = true
 zeroize.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
 
 [dev-dependencies]
 tempfile.workspace = true

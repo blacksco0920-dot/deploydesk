@@ -120,6 +120,8 @@ pub enum ServiceKind {
 pub struct HealthcheckConfig {
     #[serde(default = "default_health_path")]
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
     #[serde(default = "default_health_interval")]
     pub interval_seconds: u32,
     #[serde(default = "default_health_retries")]
@@ -130,6 +132,7 @@ impl Default for HealthcheckConfig {
     fn default() -> Self {
         Self {
             path: default_health_path(),
+            command: None,
             interval_seconds: default_health_interval(),
             retries: default_health_retries(),
         }
@@ -466,8 +469,10 @@ pub struct FrameworkDetection {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Framework {
+    NodeJs,
     NestJs,
     NextJs,
+    FastApi,
     Vite,
     UniApp,
     Taro,
@@ -485,6 +490,10 @@ pub struct DetectedService {
     pub dockerfile: Option<String>,
     pub suggested_port: u16,
     pub build_command: Option<String>,
+    #[serde(default)]
+    pub start_command: Option<String>,
+    #[serde(default)]
+    pub dependency_file: Option<String>,
     pub confidence: u8,
 }
 
@@ -521,7 +530,18 @@ pub struct DeploymentPlan {
     pub changes: Vec<FileChange>,
     pub steps: Vec<PlanStep>,
     pub user_actions: Vec<UserAction>,
+    #[serde(default)]
+    pub blockers: Vec<PlanBlocker>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct PlanBlocker {
+    pub code: String,
+    pub title: String,
+    pub detail: String,
+    pub service: Option<String>,
+    pub resolution: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -624,6 +644,15 @@ pub struct PublicRouteCheck {
     pub phase: String,
     pub status: Option<u16>,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DnsProviderHint {
+    pub zone: String,
+    pub provider: String,
+    pub management_url: Option<String>,
+    pub name_servers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

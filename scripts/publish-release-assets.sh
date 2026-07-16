@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${1:-0.2.0-preview.3}"
+DEFAULT_VERSION="$(node -p "require(process.argv[1]).version" "$ROOT_DIR/package.json")"
+VERSION="${1:-$DEFAULT_VERSION}"
 ASSET_DIR="${2:-$ROOT_DIR/target/release/bundle}"
 RELEASE_HOST="${RELEASE_HOST:-}"
 RELEASE_USER="${RELEASE_USER:-ubuntu}"
@@ -48,6 +49,16 @@ done < <(find "$ASSET_DIR" -type f \( \
 \) -print0)
 
 node "$ROOT_DIR/scripts/build-release-manifest.mjs" "$UPLOAD_DIR" "$MANIFEST" "$VERSION"
+node - "$MANIFEST" <<'NODE'
+const fs = require("node:fs");
+const manifest = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const missing = Object.entries(manifest.assets)
+  .filter(([, asset]) => !asset.available)
+  .map(([platform]) => platform);
+if (missing.length) {
+  throw new Error(`安装包不完整，缺少平台：${missing.join(", ")}`);
+}
+NODE
 (
   cd "$UPLOAD_DIR"
   shasum -a 256 ./* > SHA256SUMS

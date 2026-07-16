@@ -4,7 +4,7 @@ import * as React from "react";
 import { cn } from "../../lib/utils";
 
 export const buttonVariants = cva(
-  "inline-flex shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors duration-150 outline-none disabled:pointer-events-none disabled:opacity-45 focus-visible:ring-2 focus-visible:ring-[var(--focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--background)] [&_svg]:pointer-events-none [&_svg]:size-4",
+  "a11y-button inline-flex shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-md border border-transparent text-sm font-medium transition-colors duration-150 outline-none disabled:pointer-events-none disabled:opacity-45 focus-visible:ring-2 focus-visible:ring-[var(--focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--background)] [&_svg]:pointer-events-none [&_svg]:size-4",
   {
     variants: {
       variant: {
@@ -42,6 +42,7 @@ export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
     return (
       <Component
         className={cn(buttonVariants({ variant, size }), className)}
+        data-variant={variant ?? "default"}
         ref={ref}
         {...props}
       />

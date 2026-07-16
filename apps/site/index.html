@@ -5,13 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="ABCDeploy 小白部署：引导式完成容器构建、测试环境、生产发布、HTTPS 与回滚。"
+      content="ABCDeploy 小白部署：在本机运行、管理版本、部署测试版，再选择验证通过的版本发布正式版。"
     />
     <meta name="theme-color" content="#f5f6f3" />
     <meta property="og:title" content="ABCDeploy 小白部署" />
     <meta
       property="og:description"
-      content="选择项目，连接服务，确认计划。小白也能完成企业级容器化部署。"
+      content="合并 main 自动生成版本并部署测试，验证通过后再选择版本发布正式环境。"
     />
     <meta property="og:image" content="/abcdeploy-workspace.png" />
     <link rel="icon" type="image/svg+xml" href="/abcdeploy.svg" />
@@ -44,8 +44,8 @@
           <p class="product-name">ABCDeploy</p>
           <h1 id="hero-title">小白部署</h1>
           <p class="hero-lead">
-            选中代码目录，跟着引导连接构建服务和服务器。测试、生产、HTTPS
-            与回滚，一次配置清楚。
+            本机启停、版本生成、测试部署和正式发布都在一个工作台。连接与配置只维护一次，之后合并
+            main 就能自动部署测试。
           </p>
           <div class="hero-actions">
             <a class="button primary" href="#download" data-primary-download
@@ -58,7 +58,7 @@
             >
           </div>
           <p class="release-meta">
-            <span data-release-version>预览版 v0.2.0-preview.3</span>
+            <span data-release-version>预览版 v0.2.0-preview.4</span>
             <span>Apache-2.0</span>
             <span>macOS · Windows · Linux</span>
           </p>
@@ -66,104 +66,109 @@
       </section>
 
       <section class="trust-strip" aria-label="产品原则">
-        <span>先测试，再生产</span>
-        <span>同一镜像精准晋级</span>
-        <span>密钥不进项目文件</span>
-        <span>Caddy 自动 HTTPS</span>
+        <span>main 自动生成版本</span>
+        <span>测试环境自动部署</span>
+        <span>已验证版本自由选择</span>
+        <span>配置与连接持续复用</span>
       </section>
 
       <section class="section intro" id="how">
         <div class="section-heading">
-          <p class="eyebrow">第一次部署</p>
-          <h2>只做三件事</h2>
-          <p>
-            系统能识别和推荐的都自动完成；必须由你决定的权限、服务器身份和生产发布会明确展示。
-          </p>
+          <p class="eyebrow">项目工作流</p>
+          <h2>四个场景，各自完成一件事</h2>
+          <p>初次完成连接后，日常上线不必反复填写服务器、密钥和环境配置。</p>
         </div>
         <ol class="steps">
           <li>
             <span>01</span>
-            <h3>选择项目</h3>
+            <h3>在本机运行</h3>
             <p>
-              只读识别框架、服务和端口，并用公开的 `.env.example`
-              作为配置模板，不读取真实 `.env`。
+              查看项目服务和运行依赖，逐个控制或一键启动，快速确认项目能否打开。
             </p>
           </li>
           <li>
             <span>02</span>
-            <h3>连接资源</h3>
+            <h3>管理版本</h3>
             <p>
-              连接 CNB，填写服务器地址。已有 SSH Key
-              自动发现，没有则在本机生成。
+              每次合并 main 自动生成一个版本，集中查看提交、镜像和测试结果。
             </p>
           </li>
           <li>
             <span>03</span>
-            <h3>确认部署</h3>
-            <p>
-              预览文件变化，先上线测试环境；验证通过后再发布同一个镜像到生产。
-            </p>
+            <h3>部署测试版</h3>
+            <p>新版本自动部署到测试环境；需要时也能选择已有版本重新部署。</p>
+          </li>
+          <li>
+            <span>04</span>
+            <h3>发布正式版</h3>
+            <p>从多个测试通过的版本中选择一个，把同一镜像发布到正式环境。</p>
           </li>
         </ol>
       </section>
 
       <section class="section product-proof">
         <div class="proof-copy">
-          <p class="eyebrow">推荐策略已内置</p>
-          <h2>不用先成为 DevOps 专家</h2>
+          <p class="eyebrow">自动化与人工确认</p>
+          <h2>平时自动跑，发布时由你选择</h2>
           <p>
-            默认采用开发、测试、生产三环境隔离。代码只构建一次，测试通过的镜像摘要才允许晋级生产；失败时保留当前数据并恢复上一健康版本。
+            连接代码仓库、镜像仓库和服务器后，系统会复用这些信息。代码合并到
+            main 后自动构建并部署测试，正式发布只需要选择已经验证的版本。
           </p>
           <dl>
             <div>
-              <dt>构建</dt>
-              <dd>CNB 云原生构建</dd>
+              <dt>生成</dt>
+              <dd>main 合并后自动创建版本</dd>
             </div>
             <div>
-              <dt>运行</dt>
-              <dd>Docker Compose</dd>
+              <dt>验证</dt>
+              <dd>自动部署测试并记录结果</dd>
             </div>
             <div>
-              <dt>入口</dt>
-              <dd>Caddy 与自动 HTTPS</dd>
+              <dt>发布</dt>
+              <dd>选择已通过版本晋级生产</dd>
             </div>
           </dl>
         </div>
         <figure>
           <img
             src="/abcdeploy-app.png"
-            alt="ABCDeploy 推荐部署方案界面"
+            alt="ABCDeploy 管理项目版本界面"
             loading="lazy"
           />
-          <figcaption>每一步说明结果，不要求先理解流水线语法。</figcaption>
+          <figcaption>只有需要授权或确认的操作才会打断你。</figcaption>
         </figure>
       </section>
 
       <section class="section environments" aria-labelledby="environment-title">
         <div class="section-heading">
-          <p class="eyebrow">企业级默认值</p>
-          <h2 id="environment-title">三个环境，各司其职</h2>
+          <p class="eyebrow">清晰分工</p>
+          <h2 id="environment-title">你只看当前场景需要的信息</h2>
         </div>
-        <div class="environment-table" role="table" aria-label="环境职责">
+        <div class="environment-table" role="table" aria-label="项目工作流场景">
           <div class="environment-row header" role="row">
-            <span role="columnheader">环境</span
-            ><span role="columnheader">用途</span
-            ><span role="columnheader">发布方式</span>
+            <span role="columnheader">场景</span
+            ><span role="columnheader">你关心什么</span
+            ><span role="columnheader">系统做什么</span>
           </div>
           <div class="environment-row" role="row">
-            <strong role="cell">开发</strong
-            ><span role="cell">本机改代码与调试</span
-            ><span role="cell">不影响线上</span>
+            <strong role="cell">本机运行</strong
+            ><span role="cell">服务能否正常打开</span
+            ><span role="cell">识别并控制本地服务</span>
           </div>
           <div class="environment-row" role="row">
-            <strong role="cell">测试</strong
-            ><span role="cell">验证真实容器和依赖</span
-            ><span role="cell">稳定代码自动部署</span>
+            <strong role="cell">管理版本</strong
+            ><span role="cell">有哪些版本可以使用</span
+            ><span role="cell">关联提交、镜像和测试状态</span>
           </div>
           <div class="environment-row" role="row">
-            <strong role="cell">生产</strong
-            ><span role="cell">面向正式用户</span
-            ><span role="cell">人工确认同一镜像</span>
+            <strong role="cell">部署测试版</strong
+            ><span role="cell">测试地址是否可用</span
+            ><span role="cell">main 更新后自动部署</span>
+          </div>
+          <div class="environment-row" role="row">
+            <strong role="cell">发布正式版</strong
+            ><span role="cell">这次上线哪个版本</span
+            ><span role="cell">发布所选的同一镜像</span>
           </div>
         </div>
       </section>
@@ -190,7 +195,7 @@
           <article>
             <h3>生产精准晋级</h3>
             <p>
-              生产只接收测试健康的完整提交和同一镜像摘要，不在发布时重新构建。
+              多个测试通过的版本可以保留候选；发布时使用所选版本的同一镜像，不再重新构建。
             </p>
           </article>
           <article>

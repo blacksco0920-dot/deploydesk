@@ -230,7 +230,7 @@ h2 {
 }
 .steps {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 0;
   margin: 56px 0 0;
   padding: 0;
@@ -238,7 +238,7 @@ h2 {
   border-top: 1px solid var(--line);
 }
 .steps li {
-  min-height: 210px;
+  min-height: 230px;
   padding: 26px 34px 0 0;
   border-bottom: 1px solid var(--line);
 }
@@ -320,7 +320,7 @@ h2 {
 }
 .environment-row {
   display: grid;
-  grid-template-columns: 140px 1fr 1fr;
+  grid-template-columns: 160px 1fr 1fr;
   min-height: 68px;
   align-items: center;
   border-bottom: 1px solid var(--line);

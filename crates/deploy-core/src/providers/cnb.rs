@@ -12,6 +12,7 @@ use crate::error::{DeployError, Result};
 use crate::redact::redact_text;
 
 const DEFAULT_API_BASE: &str = "https://api.cnb.cool";
+const MAX_RUNNER_LOG_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct CnbBuildStatus {
@@ -96,8 +97,39 @@ impl CnbClient {
 
     pub async fn repositories(&self, slug: &str) -> Result<Value> {
         let slug = encode_segment(slug);
-        self.request(Method::GET, &format!("/{slug}/-/repos"), None)
-            .await
+        self.request(
+            Method::GET,
+            &format!("/{slug}/-/repos?page=1&page_size=100"),
+            None,
+        )
+        .await
+    }
+
+    /// Checks whether a repository is visible to the current CNB account.
+    ///
+    /// Secret repositories do not expose build-history APIs, so probing
+    /// `/-/build/logs` reports 403 even when they exist. Listing the owner's
+    /// repositories is the documented read-only endpoint that works for both
+    /// source and secret repositories.
+    pub async fn repository_exists(&self, repository: &str) -> Result<bool> {
+        let repository = repository.trim();
+        let Some((owner, name)) = repository.rsplit_once('/') else {
+            return Err(DeployError::InvalidManifest(
+                "CNB 仓库位置应填写为 所属组织/仓库名".to_string(),
+            ));
+        };
+        if owner.is_empty() || name.is_empty() {
+            return Err(DeployError::InvalidManifest(
+                "CNB 仓库位置应填写为 所属组织/仓库名".to_string(),
+            ));
+        }
+        let repositories = self.repositories(owner).await?;
+        Ok(repositories
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("path").and_then(Value::as_str))
+            .any(|path| path.eq_ignore_ascii_case(repository)))
     }
 
     pub async fn create_repository(
@@ -194,7 +226,7 @@ impl CnbClient {
             "branch": branch,
             "event": event,
             "title": title,
-            "sync": "false"
+            "sync": false
         });
         if let Some(revision) = revision {
             body["sha"] = Value::String(revision.to_string());
@@ -226,6 +258,34 @@ impl CnbClient {
             None,
         )
         .await
+    }
+
+    pub async fn runner_log(&self, repository: &str, pipeline_id: &str) -> Result<String> {
+        let repository = encode_segment(repository);
+        let pipeline_id = encode_segment(pipeline_id);
+        let response = self
+            .client
+            .get(format!(
+                "{}/{repository}/-/build/runner/download/log/{pipeline_id}",
+                self.api_base
+            ))
+            .bearer_auth(&self.token)
+            .header("Accept", "text/plain")
+            .send()
+            .await?;
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        if !status.is_success() {
+            return Err(DeployError::CnbApi {
+                status: status.as_u16(),
+                message: permission_hint(
+                    status.as_u16(),
+                    &redact_text(&String::from_utf8_lossy(&bytes)),
+                ),
+            });
+        }
+        let start = bytes.len().saturating_sub(MAX_RUNNER_LOG_BYTES);
+        Ok(String::from_utf8_lossy(&bytes[start..]).into_owned())
     }
 
     async fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
@@ -388,9 +448,8 @@ fn permission_hint(status: u16, message: &str) -> String {
     if status != 403 {
         return message.to_string();
     }
-    format!(
-        "权限不足。读取设置需要 repo-manage:r，修改设置需要 repo-manage:rw，触发构建需要 repo-cnb-trigger:rw，创建仓库需要 group-resource:rw。原始信息: {message}"
-    )
+    "权限不足。读取构建历史需要 repo-cnb-history:r，读取设置需要 repo-manage:r，修改设置需要 repo-manage:rw，触发构建需要 repo-cnb-trigger:rw，创建仓库需要 group-resource:rw。"
+        .to_string()
 }
 
 #[cfg(test)]
@@ -406,6 +465,17 @@ mod tests {
         let debug = format!("{client:?}");
         assert!(!debug.contains("very-secret-token"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn permission_errors_name_the_missing_capabilities_without_raw_responses() {
+        let message = permission_hint(
+            403,
+            r#"{"errmsg":"Missing required scopes: repo-cnb-history:r"}"#,
+        );
+        assert!(message.contains("repo-cnb-history:r"));
+        assert!(!message.contains("errmsg"));
+        assert!(!message.contains("Missing required scopes"));
     }
 
     #[test]
@@ -536,6 +606,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checks_secret_repository_existence_through_the_owner_list() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set timeout");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let count = stream.read(&mut chunk).expect("read request");
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if request_is_complete(&request) {
+                    break;
+                }
+            }
+
+            let response_body = r#"[{"name":"deploy-secrets","path":"team/deploy-secrets"}]"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            String::from_utf8(request).expect("request is UTF-8")
+        });
+
+        let client =
+            CnbClient::with_api_base("test-token", format!("http://{address}")).expect("client");
+        assert!(
+            client
+                .repository_exists("team/deploy-secrets")
+                .await
+                .expect("check repository")
+        );
+
+        let request = server.join().expect("test server thread");
+        assert!(request.starts_with("GET /team/-/repos?page=1&page_size=100 HTTP/1.1"));
+    }
+
+    #[tokio::test]
     async fn creates_a_private_repository_with_the_documented_api_shape() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let address = listener.local_addr().expect("test server address");
@@ -590,6 +706,64 @@ mod tests {
                 "name": "project",
                 "description": "部署项目",
                 "visibility": "private"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn triggers_a_revision_with_a_boolean_async_flag() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set timeout");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let count = stream.read(&mut chunk).expect("read request");
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if request_is_complete(&request) {
+                    break;
+                }
+            }
+            let response_body = r#"{"sn":"cnb-production-1"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            String::from_utf8(request).expect("request is UTF-8")
+        });
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let client =
+            CnbClient::with_api_base("test-token", format!("http://{address}")).expect("client");
+        client
+            .trigger_build_at_revision(
+                "owner/project",
+                "main",
+                "api_trigger_production",
+                "Promote verified commit",
+                Some(revision),
+            )
+            .await
+            .expect("trigger build");
+        let request = server.join().expect("test server thread");
+        let (_, body) = request.split_once("\r\n\r\n").expect("HTTP request");
+        assert_eq!(
+            serde_json::from_str::<Value>(body).expect("JSON body"),
+            json!({
+                "branch": "main",
+                "event": "api_trigger_production",
+                "title": "Promote verified commit",
+                "sync": false,
+                "sha": revision
             })
         );
     }

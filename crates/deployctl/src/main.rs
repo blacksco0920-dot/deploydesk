@@ -457,6 +457,15 @@ fn print_plan_summary(plan: &deploy_core::model::DeploymentPlan) {
     for change in &plan.changes {
         println!("- {:?} {}", change.kind, change.path);
     }
+    if !plan.blockers.is_empty() {
+        println!("部署前必须处理：{} 项", plan.blockers.len());
+        for blocker in &plan.blockers {
+            println!(
+                "- {} {}：{}",
+                blocker.code, blocker.title, blocker.resolution
+            );
+        }
+    }
     println!("需要你处理：{} 项", plan.user_actions.len());
     for action in &plan.user_actions {
         println!("- {}：{}", action.title, action.detail);

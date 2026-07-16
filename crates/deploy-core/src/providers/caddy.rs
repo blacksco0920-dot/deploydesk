@@ -1,17 +1,17 @@
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use crate::error::{DeployError, Result};
 use crate::model::ProviderCheck;
 use crate::providers::ssh::SshProfile;
 use crate::redact::redact_text;
+use crate::system_command;
 
 const SERVER_BOOTSTRAP: &str = include_str!("../../../../scripts/server-bootstrap.sh");
 
 pub fn validate_caddyfile(path: &Path) -> Result<ProviderCheck> {
     let output = if command_exists("caddy") {
-        Command::new("caddy")
+        system_command("caddy")
             .arg("validate")
             .arg("--config")
             .arg(path)
@@ -20,7 +20,7 @@ pub fn validate_caddyfile(path: &Path) -> Result<ProviderCheck> {
             .output()
     } else {
         let mount = format!("{}:/etc/caddy/Caddyfile:ro", path.to_string_lossy());
-        Command::new("docker")
+        system_command("docker")
             .args([
                 "run",
                 "--rm",
@@ -152,7 +152,7 @@ fn marker_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 }
 
 fn command_exists(command: &str) -> bool {
-    Command::new(command)
+    system_command(command)
         .arg("version")
         .output()
         .is_ok_and(|output| output.status.success())

@@ -1,0 +1,4 @@
+# ABCDeploy 本机状态，不上传到代码仓库。
+backups/
+runtime/
+state/

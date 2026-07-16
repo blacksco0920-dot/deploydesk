@@ -1,12 +1,12 @@
 use std::path::Path;
-use std::process::Command;
 
 use crate::error::{DeployError, Result};
 use crate::model::ProviderCheck;
 use crate::redact::redact_text;
+use crate::system_command;
 
 pub fn check_engine() -> Result<ProviderCheck> {
-    let output = Command::new("docker")
+    let output = system_command("docker")
         .args(["info", "--format", "{{.ServerVersion}}"])
         .output()
         .map_err(|error| {
@@ -46,7 +46,7 @@ pub fn check_engine() -> Result<ProviderCheck> {
 }
 
 pub fn validate_compose(compose_file: &Path, env_file: Option<&Path>) -> Result<ProviderCheck> {
-    let mut command = Command::new("docker");
+    let mut command = system_command("docker");
     command.arg("compose");
     if let Some(env_file) = env_file {
         command.arg("--env-file").arg(env_file);

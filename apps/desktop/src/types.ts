@@ -1,6 +1,8 @@
 export type Framework =
+  | "node_js"
   | "nest_js"
   | "next_js"
+  | "fast_api"
   | "vite"
   | "uni_app"
   | "taro"
@@ -25,6 +27,8 @@ export interface DetectedService {
   dockerfile: string | null;
   suggested_port: number;
   build_command: string | null;
+  start_command: string | null;
+  dependency_file: string | null;
   confidence: number;
 }
 
@@ -107,7 +111,16 @@ export interface DeploymentPlan {
   changes: FileChange[];
   steps: PlanStep[];
   user_actions: UserAction[];
+  blockers?: PlanBlocker[];
   warnings: string[];
+}
+
+export interface PlanBlocker {
+  code: string;
+  title: string;
+  detail: string;
+  service: string | null;
+  resolution: string;
 }
 
 export interface WorkspacePreview {
@@ -198,30 +211,127 @@ export interface SecretStatus {
   stored: boolean;
 }
 
+export type ConfigProfileKind =
+  "ai" | "database" | "redis" | "dns" | "registry" | "custom";
+export type ConfigProfileScope = "any" | "local" | "remote";
+
+export interface ConfigProfile {
+  id: string;
+  kind: ConfigProfileKind;
+  provider: string;
+  name: string;
+  scope: ConfigProfileScope;
+  values: Record<string, string>;
+  secretFields: string[];
+  configuredSecretFields: string[];
+  isDefault: boolean;
+  updatedAt: string;
+}
+
+export interface ConfigProfileInput {
+  id?: string;
+  kind: ConfigProfileKind;
+  provider: string;
+  name: string;
+  scope: ConfigProfileScope;
+  values: Record<string, string>;
+  secretFields: string[];
+  secrets: Record<string, string>;
+  isDefault: boolean;
+}
+
+export interface ProjectProfileBinding {
+  environment: RuntimeEnvironment;
+  kind: ConfigProfileKind;
+  profileId: string;
+}
+
+export interface RuntimeConfigRecommendation {
+  content: string;
+  appliedProfiles: string[];
+  filledVariables: string[];
+}
+
+export interface ExistingProjectConfig {
+  sourceFiles: string[];
+  content: string;
+}
+
+export interface LocalEnvWriteResult {
+  path: string;
+  written: boolean;
+  requiresConfirmation: boolean;
+  backupPath: string | null;
+}
+
+export interface LocalPreviewService {
+  id: string;
+  kind: "api" | "web" | "worker" | "static";
+  buildStrategy: "existing" | "generated" | "needs_input";
+  dockerfile: string;
+  hostPort: number | null;
+  url: string | null;
+  running: boolean;
+}
+
+export interface LocalPreviewStatus {
+  state: "not_prepared" | "stopped" | "running" | "partial" | "unavailable";
+  message: string;
+  composePath: string;
+  envReady: boolean;
+  services: LocalPreviewService[];
+  writtenFiles: string[];
+}
+
+export interface LocalDevelopmentSupport {
+  available: boolean;
+  serviceCount: number;
+  message: string;
+}
+
+export interface LocalInfrastructureStatus {
+  state: "not_prepared" | "stopped" | "running" | "partial" | "unavailable";
+  message: string;
+  postgresRunning: boolean;
+  redisRunning: boolean;
+  postgresPort: number;
+  redisPort: number;
+  profilesReady: boolean;
+}
+
 export interface PipelineIdentityResult {
   created: boolean;
   fingerprint: string;
 }
 
+export type RuntimeEnvironment = "development" | "staging" | "production";
+
 export interface RuntimeSecretStatus {
-  environment: "staging" | "production";
+  environment: RuntimeEnvironment;
   variable: string;
   stored: boolean;
 }
 
 export interface RuntimeConfigFile {
-  environment: "staging" | "production";
+  environment: RuntimeEnvironment;
   filename: string;
   sourceFiles: string[];
   content: string;
   templateContent: string;
+  requiredVariables: string[];
   stored: boolean;
+  authorizationRequired: boolean;
 }
 
 export interface RuntimeConfigStatus {
-  environment: "staging" | "production";
+  environment: RuntimeEnvironment;
   filename: string;
   stored: boolean;
+}
+
+export interface RuntimeConfigSyncStatus {
+  stored: boolean;
+  synchronized: boolean;
 }
 
 export interface CnbSecretBundle {
@@ -260,7 +370,19 @@ export interface RecentProject {
   latestStatus: DeploymentRunStatus | null;
   latestEnvironment: "staging" | "production" | null;
   latestMessage: string | null;
+  latestRunId?: string | null;
+  latestSourceRunId?: string | null;
+  latestCurrentStage?: string | null;
+  latestActionKind?: string | null;
+  latestIssueCode?: string | null;
+  latestCompletedSteps?: string[];
+  latestUpdatedAt?: string | null;
   activeRunCount: number;
+}
+
+export interface RelinkProjectResult {
+  path: string;
+  name: string;
 }
 
 export type NavigationSection =
@@ -295,6 +417,21 @@ export interface ServerResource extends ServerForm {
   lastCheckedAt: string;
 }
 
+export interface RouteConflictCheck {
+  conflicts: Array<{
+    host: string;
+    source: "main" | "managed";
+  }>;
+  takeoverAvailable: boolean;
+}
+
+export interface DnsProviderHint {
+  zone: string;
+  provider: string;
+  managementUrl: string | null;
+  nameServers: string[];
+}
+
 export type DeploymentRunStatus =
   "queued" | "running" | "needs_action" | "success" | "failed" | "cancelled";
 
@@ -313,6 +450,7 @@ export interface DeploymentRun {
   currentStage: string;
   buildSerial: string | null;
   commitSha: string | null;
+  sourceTitle?: string | null;
   sourceRunId: string | null;
   candidateTag: string | null;
   artifacts: DeploymentArtifact[];

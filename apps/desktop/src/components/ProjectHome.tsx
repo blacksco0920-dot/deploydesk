@@ -1,4 +1,5 @@
 import {
+  AlertCircle,
   ArrowRight,
   CheckCircle2,
   Clock3,
@@ -10,7 +11,14 @@ import {
   Trash2,
 } from "lucide-react";
 import { useMemo, useState } from "react";
-import type { RecentProject, SystemPreflight } from "../types";
+import type { DeploymentRun, RecentProject, SystemPreflight } from "../types";
+import {
+  isFirstDeployTask,
+  preferredProjectTask,
+  recentProjectStatus,
+  type ProjectSetupTask,
+  type ProjectVerificationTask,
+} from "../lib/projects";
 import { Brand } from "./Brand";
 import { Button } from "./ui/button";
 import {
@@ -34,6 +42,15 @@ interface ProjectHomeProps {
   loading: boolean;
   preflight: SystemPreflight | null;
   projects: RecentProject[];
+  releaseReadyPaths?: string[];
+  selectingProject?: boolean;
+  selectionIssue?: {
+    message: string;
+    title: string;
+  } | null;
+  setupTasks?: ProjectSetupTask[];
+  verificationTasks?: ProjectVerificationTask[];
+  taskRuns: DeploymentRun[];
   showDemo: boolean;
   onSelect: () => void;
   onDemo: () => void;
@@ -46,6 +63,12 @@ export function ProjectHome({
   loading,
   preflight,
   projects,
+  releaseReadyPaths = [],
+  selectingProject = false,
+  selectionIssue = null,
+  setupTasks = [],
+  verificationTasks = [],
+  taskRuns,
   showDemo,
   onSelect,
   onDemo,
@@ -56,6 +79,7 @@ export function ProjectHome({
   const [pendingRemoval, setPendingRemoval] = useState<RecentProject | null>(
     null,
   );
+  const releaseReadyProjectPaths = new Set(releaseReadyPaths);
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
     if (!normalized) return projects;
@@ -65,6 +89,59 @@ export function ProjectHome({
         project.path.toLocaleLowerCase().includes(normalized),
     );
   }, [projects, query]);
+  const visibleProjects = filtered
+    .map((project) => {
+      const task = preferredProjectTask(taskRuns, project.path);
+      const setupTask = setupTasks.find(
+        (item) =>
+          item.projectPath === project.path &&
+          (!isFirstDeployTask(item) || project.latestStatus === null),
+      );
+      const verificationTask = verificationTasks.find(
+        (item) =>
+          item.projectPath === project.path &&
+          item.runId === project.latestRunId &&
+          project.latestStatus === "success" &&
+          project.latestEnvironment === "staging",
+      );
+      return {
+        project,
+        setupTask,
+        state: projectListState(project, task, setupTask, verificationTask),
+        task,
+        verificationTask,
+      };
+    })
+    .sort(
+      (left, right) =>
+        projectListStatePriority(left.state) -
+        projectListStatePriority(right.state),
+    );
+  const userActionCount = visibleProjects.filter(
+    ({ state }) => state === "user-action",
+  ).length;
+  const automaticCount = visibleProjects.filter(
+    ({ state }) => state === "automatic",
+  ).length;
+  const visibleProjectGroups = [
+    {
+      key: "user-action",
+      label: "等待你处理",
+      projects: visibleProjects.filter(({ state }) => state === "user-action"),
+    },
+    {
+      key: "automatic",
+      label: "自动处理中",
+      projects: visibleProjects.filter(({ state }) => state === "automatic"),
+    },
+    {
+      key: "normal",
+      label: userActionCount || automaticCount ? "其他项目" : "项目",
+      projects: visibleProjects.filter(({ state }) => state === "normal"),
+    },
+  ].filter((group) => group.projects.length > 0);
+  const recoveringProjects = loading && projects.length === 0;
+  const projectSelectionBlocked = recoveringProjects || selectingProject;
 
   return (
     <TooltipProvider delayDuration={350}>
@@ -78,14 +155,20 @@ export function ProjectHome({
           ) : (
             <Brand />
           )}
-          <Button disabled={loading} onClick={onSelect} size="sm">
-            {loading ? (
-              <LoaderCircle className="animate-spin-slow" />
-            ) : (
-              <Plus />
-            )}
-            添加项目
-          </Button>
+          {!embedded ? (
+            <Button
+              disabled={projectSelectionBlocked}
+              onClick={onSelect}
+              size="sm"
+            >
+              {selectingProject ? (
+                <LoaderCircle className="animate-spin-slow" />
+              ) : (
+                <Plus />
+              )}
+              添加项目
+            </Button>
+          ) : null}
         </header>
 
         <main className="min-h-0 flex-1 overflow-auto">
@@ -95,12 +178,18 @@ export function ProjectHome({
             <div className="mb-9 flex items-end justify-between gap-6">
               <div>
                 <h1 className="m-0 text-[28px] font-semibold leading-tight">
-                  {projects.length ? "继续你的项目" : "部署第一个项目"}
+                  {recoveringProjects
+                    ? "正在恢复工作区"
+                    : projects.length
+                      ? "继续你的项目"
+                      : "部署第一个项目"}
                 </h1>
                 <p className="mt-2 text-sm leading-6 text-[var(--muted-foreground)]">
-                  {projects.length
-                    ? "项目、连接和部署进度已经保存在这台电脑上。"
-                    : "选择代码目录，系统会先只读识别，再给出推荐部署方案。"}
+                  {recoveringProjects
+                    ? "正在查找这台电脑上已经保存的项目和部署进度。"
+                    : projects.length
+                      ? "项目、连接和部署进度已经保存在这台电脑上。"
+                      : "选择 AI 生成的整个项目文件夹，系统会先只读识别。"}
                 </p>
               </div>
               {projects.length > 4 ? (
@@ -116,63 +205,123 @@ export function ProjectHome({
               ) : null}
             </div>
 
-            {projects.length ? (
+            {selectionIssue ? (
+              <div
+                className="mb-5 flex items-start justify-between gap-5 rounded-lg border border-[var(--warning)]/30 bg-[var(--warning-soft)] px-4 py-3"
+                role="alert"
+              >
+                <div className="flex items-start gap-3">
+                  <AlertCircle className="mt-0.5 size-4 shrink-0 text-[var(--warning)]" />
+                  <div>
+                    <strong className="text-sm">{selectionIssue.title}</strong>
+                    <p className="mb-0 mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
+                      {selectionIssue.message}
+                    </p>
+                  </div>
+                </div>
+                <Button
+                  disabled={selectingProject}
+                  onClick={onSelect}
+                  size="sm"
+                >
+                  <FolderOpen />
+                  重新选择文件夹
+                </Button>
+              </div>
+            ) : null}
+
+            {recoveringProjects ? (
+              <section className="flex min-h-[240px] flex-col items-center justify-center border-y border-[var(--border)] py-12 text-center">
+                <LoaderCircle className="size-6 animate-spin-slow text-[var(--accent)]" />
+                <strong className="mt-4 text-sm">正在读取最近项目</strong>
+                <span className="mt-1 text-xs text-[var(--muted-foreground)]">
+                  如果有上次打开的项目，会直接恢复到原来的页面。
+                </span>
+              </section>
+            ) : projects.length ? (
               <section
-                aria-label="最近项目"
+                aria-label="按当前状态分组的项目"
                 className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]"
               >
-                {filtered.map((project) => (
+                {visibleProjectGroups.map((group) => (
                   <div
-                    className="group flex min-h-[76px] items-center gap-3 border-b border-[var(--border)] px-4 last:border-b-0 hover:bg-[var(--muted)]"
-                    key={project.id}
+                    className="border-b border-[var(--border)] last:border-b-0"
+                    key={group.key}
                   >
-                    <button
-                      className="flex min-w-0 flex-1 items-center gap-3 py-3 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--focus)]"
-                      onClick={() => onOpen(project)}
-                      type="button"
-                    >
-                      <span className="grid size-10 shrink-0 place-items-center rounded-md border border-[var(--border)] bg-[var(--surface)] text-[var(--muted-foreground)]">
-                        <FolderOpen className="size-[18px]" />
-                      </span>
-                      <span className="min-w-0 flex-1">
-                        <span className="flex items-center gap-2">
-                          <strong className="truncate text-sm font-medium">
-                            {project.name}
-                          </strong>
-                          {!project.pathExists ? (
-                            <span className="text-xs text-[var(--warning)]">
-                              目录已移动
-                            </span>
-                          ) : null}
-                        </span>
-                        <span className="mt-1 block truncate text-xs text-[var(--muted-foreground)]">
-                          {project.serviceCount} 个服务 ·{" "}
-                          {stepLabel(project.currentStep)}
-                        </span>
-                      </span>
-                      <span className="hidden items-center gap-1.5 text-xs text-[var(--subtle-foreground)] sm:flex">
-                        <Clock3 className="size-3.5" />
-                        {formatRelativeTime(project.lastOpenedAt)}
-                      </span>
-                      <ArrowRight className="size-4 shrink-0 text-[var(--subtle-foreground)]" />
-                    </button>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          aria-label={`移除 ${project.name}`}
-                          className="opacity-0 group-hover:opacity-100 focus:opacity-100"
-                          onClick={() => setPendingRemoval(project)}
-                          size="icon"
-                          variant="ghost"
-                        >
-                          <MoreHorizontal />
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent>项目选项</TooltipContent>
-                    </Tooltip>
+                    <h2 className="m-0 flex items-center justify-between border-b border-[var(--border)] bg-[var(--muted)] px-4 py-2 text-xs font-medium text-[var(--muted-foreground)]">
+                      <span>{group.label}</span>
+                      <span>{group.projects.length}</span>
+                    </h2>
+                    {group.projects.map(
+                      ({ project, setupTask, task, verificationTask }) => {
+                        return (
+                          <div
+                            className="group flex min-h-[76px] items-center gap-3 border-b border-[var(--border)] px-4 last:border-b-0 hover:bg-[var(--muted)]"
+                            key={project.id}
+                          >
+                            <button
+                              className="flex min-w-0 flex-1 items-center gap-3 py-3 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--focus)]"
+                              onClick={() => onOpen(project)}
+                              type="button"
+                            >
+                              <span className="grid size-10 shrink-0 place-items-center rounded-md border border-[var(--border)] bg-[var(--surface)] text-[var(--muted-foreground)]">
+                                <FolderOpen className="size-[18px]" />
+                              </span>
+                              <span className="min-w-0 flex-1">
+                                <span className="flex items-center gap-2">
+                                  <strong className="truncate text-sm font-medium">
+                                    {project.name}
+                                  </strong>
+                                  {!project.pathExists ? (
+                                    <span className="text-xs text-[var(--warning)]">
+                                      找不到原文件夹
+                                    </span>
+                                  ) : null}
+                                </span>
+                                <span className="mt-1 block truncate text-xs text-[var(--muted-foreground)]">
+                                  {project.serviceCount} 个服务 ·{" "}
+                                  {recentProjectStatus(
+                                    project,
+                                    task,
+                                    setupTask,
+                                    verificationTask,
+                                    releaseReadyProjectPaths.has(project.path),
+                                  )}
+                                </span>
+                              </span>
+                              {project.pathExists ? (
+                                <span className="hidden items-center gap-1.5 text-xs text-[var(--subtle-foreground)] sm:flex">
+                                  <Clock3 className="size-3.5" />
+                                  {formatRelativeTime(project.lastOpenedAt)}
+                                </span>
+                              ) : (
+                                <span className="hidden text-xs font-medium text-[var(--warning)] sm:block">
+                                  重新找到
+                                </span>
+                              )}
+                              <ArrowRight className="size-4 shrink-0 text-[var(--subtle-foreground)]" />
+                            </button>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  aria-label={`移除 ${project.name} 的本机项目记录`}
+                                  className="opacity-0 group-hover:opacity-100 focus:opacity-100"
+                                  onClick={() => setPendingRemoval(project)}
+                                  size="icon"
+                                  variant="ghost"
+                                >
+                                  <MoreHorizontal />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>移除本机项目记录</TooltipContent>
+                            </Tooltip>
+                          </div>
+                        );
+                      },
+                    )}
                   </div>
                 ))}
-                {!filtered.length ? (
+                {!visibleProjects.length ? (
                   <div className="px-5 py-12 text-center text-sm text-[var(--muted-foreground)]">
                     没有匹配的项目
                   </div>
@@ -185,12 +334,12 @@ export function ProjectHome({
                 </span>
                 <h2 className="m-0 text-base font-semibold">从本机项目开始</h2>
                 <p className="mb-6 mt-2 max-w-md text-sm leading-6 text-[var(--muted-foreground)]">
-                  识别过程不会运行项目代码，也不会读取环境变量的值。
+                  选择包含前端、后端等完整代码的最外层文件夹，不要只选其中一个子文件夹。识别过程不会运行代码，也不会读取配置值。
                 </p>
                 <div className="flex items-center gap-2">
-                  <Button disabled={loading} onClick={onSelect}>
+                  <Button disabled={selectingProject} onClick={onSelect}>
                     <FolderOpen />
-                    选择项目目录
+                    选择整个项目文件夹
                   </Button>
                   {showDemo ? (
                     <Button onClick={onDemo} variant="secondary">
@@ -204,16 +353,16 @@ export function ProjectHome({
             <div className="mt-5 flex items-center gap-2 text-xs text-[var(--muted-foreground)]">
               <CheckCircle2
                 className={
-                  preflight?.ready_for_cloud_deploy
+                  preflight?.ready_for_local_preview
                     ? "size-4 text-[var(--success)]"
                     : "size-4 text-[var(--warning)]"
                 }
               />
               <span>
                 {preflight
-                  ? preflight.ready_for_cloud_deploy
-                    ? `本机部署能力正常 · ${preflight.operating_system}`
-                    : "本机还有一项工具需要处理，选择项目后会给出办法"
+                  ? preflight.ready_for_local_preview
+                    ? `本机环境可用 · ${friendlyOperatingSystem(preflight.operating_system)}`
+                    : "本机环境还需要准备，进入项目后会给出具体原因"
                   : "正在检查本机部署能力"}
               </span>
             </div>
@@ -227,10 +376,12 @@ export function ProjectHome({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>从最近项目中移除？</DialogTitle>
+            <DialogTitle>
+              移除 {pendingRemoval?.name ?? "这个项目"} 的本机记录？
+            </DialogTitle>
             <DialogDescription>
-              只会删除 ABCDeploy
-              在本机保存的项目记录，不会删除代码、部署文件或服务器数据。
+              只会从 ABCDeploy
+              的项目列表中移除，不会删除项目代码、部署文件或服务器数据。
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -238,6 +389,7 @@ export function ProjectHome({
               取消
             </Button>
             <Button
+              aria-label={`确认移除 ${pendingRemoval?.name ?? "这个项目"} 的本机记录`}
               onClick={() => {
                 if (pendingRemoval) onForget(pendingRemoval);
                 setPendingRemoval(null);
@@ -254,16 +406,42 @@ export function ProjectHome({
   );
 }
 
-function stepLabel(step: RecentProject["currentStep"]) {
-  return {
-    inspection: "等待确认识别结果",
-    connections: "等待连接服务",
-    recommendation: "等待确认方案",
-    requirements: "等待补充必要信息",
-    review: "等待部署确认",
-    deploying: "正在部署",
-    workspace: "已进入项目工作台",
-  }[step];
+export type ProjectListState = "user-action" | "automatic" | "normal";
+
+export function projectListState(
+  project: RecentProject,
+  task?: DeploymentRun,
+  setupTask?: ProjectSetupTask,
+  verificationTask?: ProjectVerificationTask,
+): ProjectListState {
+  if (!project.pathExists) return "user-action";
+  if (task?.status === "failed" || task?.status === "needs_action") {
+    return "user-action";
+  }
+  if (task?.status === "queued" || task?.status === "running") {
+    return "automatic";
+  }
+  if (project.activeRunCount > 0) return "automatic";
+  if (setupTask || verificationTask) return "user-action";
+  if (
+    project.latestStatus === "failed" ||
+    project.latestStatus === "needs_action"
+  ) {
+    return "user-action";
+  }
+  return "normal";
+}
+
+function projectListStatePriority(state: ProjectListState) {
+  return state === "user-action" ? 0 : state === "automatic" ? 1 : 2;
+}
+
+export function friendlyOperatingSystem(value: string) {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "macos" || normalized === "darwin") return "macOS";
+  if (normalized === "windows" || normalized === "win32") return "Windows";
+  if (normalized === "linux") return "Linux";
+  return value;
 }
 
 function formatRelativeTime(value: string) {

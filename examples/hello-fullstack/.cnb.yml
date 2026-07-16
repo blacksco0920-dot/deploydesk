@@ -4,7 +4,11 @@ $:
   - docker:
       image: node:22-slim
     env:
+      COREPACK_NPM_REGISTRY: https://registry.npmmirror.com
       DEPLOYDESK_ENV: production
+      NO_PROXY: registry.npmmirror.com
+      no_proxy: registry.npmmirror.com
+      npm_config_registry: https://registry.npmmirror.com
     imports:
     - https://cnb.cool/replace-me/secret/-/blob/main/env.production.yml
     name: deploydesk-production-approved
@@ -40,6 +44,24 @@ $:
         if (runtimeFile) {
           if (runtimeFile.includes("\0")) {
             console.error(`密钥仓库字段 ${runtimeFileSource} 包含无效字符`);
+            process.exit(1);
+          }
+          const configured = new Map();
+          for (const line of runtimeFile.split(/\r?\n/)) {
+            const normalized = line.trimStart().replace(/^export\s+/, "");
+            const equals = normalized.indexOf("=");
+            if (equals <= 0) continue;
+            const name = normalized.slice(0, equals).trim();
+            if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) continue;
+            const value = normalized.slice(equals + 1).trim();
+            const present = value !== "" && value !== "\"\"" && value !== String.fromCharCode(39, 39);
+            configured.set(name, present);
+          }
+          const missing = variables
+            .filter((variable) => variable.required && !configured.get(variable.name))
+            .map((variable) => variable.name);
+          if (missing.length) {
+            console.error(`缺少密钥仓库字段：${missing.join(", ")}`);
             process.exit(1);
           }
           const content = runtimeFile.endsWith("\n") ? runtimeFile : `${runtimeFile}\n`;
@@ -109,12 +131,32 @@ $:
         exec 9>"$HOME/.deploydesk/locks/server-deploy.lock"
         flock -w 900 9 || { echo '"'"'同一服务器已有部署任务，等待超时'"'"' >&2; exit 75; }
         cd '"'"'.deploydesk/apps/abcdeploy-hello-fullstack/production'"'"'
+        minimum_free_kb=5242880
+        available_kb="$(df -Pk . | awk '"'"'NR == 2 { print $4 }'"'"')"
+        case "$available_kb" in '"'"''"'"'|*[!0-9]*) echo '"'"'AD-SRV-208：无法读取服务器剩余磁盘空间'"'"' >&2; exit 1 ;; esac
+        if [ "$available_kb" -lt "$minimum_free_kb" ]; then
+          docker image prune -a -f >/dev/null 2>&1 || true
+          available_kb="$(df -Pk . | awk '"'"'NR == 2 { print $4 }'"'"')"
+        fi
+        if [ "$available_kb" -lt "$minimum_free_kb" ]; then
+          echo '"'"'AD-SRV-208：服务器可用磁盘空间不足 5GB，已安全清理未使用镜像但仍不足'"'"' >&2
+          exit 1
+        fi
+        PERSISTED_RUNTIME_FILE="$HOME/.deploydesk/runtime-config/abcdeploy-hello-fullstack/production.env"
+        if [ -s "$PERSISTED_RUNTIME_FILE" ]; then
+          cp "$PERSISTED_RUNTIME_FILE" .runtime.env.next
+        fi
         backup_file() {
-          if [ -f "$1" ]; then cp "$1" "$1.previous"; else rm -f "$1.previous"; fi
+          if [ -f "$1" ]; then
+            cp "$1" "$1.previous.next"
+            mv -f "$1.previous.next" "$1.previous"
+          else
+            rm -f "$1.previous" "$1.previous.next"
+          fi
         }
         restore_previous() {
           for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
-            if [ -f "$file.previous" ]; then cp "$file.previous" "$file"; fi
+            if [ -f "$file.previous" ]; then mv -f "$file.previous" "$file"; fi
           done
         }
         for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
@@ -123,26 +165,27 @@ $:
           mv "$file.next" "$file"
         done
         chmod 600 .runtime.env .release.env
+        release_id="$(sed -n '"'"'s/^DEPLOYDESK_RELEASE_ID=//p'"'"' .release.env | head -n 1)"
+        case "$release_id" in '"'"''"'"'|*[!A-Za-z0-9._-]*) echo '"'"'发布记录标识无效'"'"' >&2; exit 1 ;; esac
         if docker compose --env-file .release.env -f docker-compose.yml config --quiet && \
            docker compose --env-file .release.env -f docker-compose.yml pull && \
-           docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180; then
-          release_id="$(sed -n '"'"'s/^DEPLOYDESK_RELEASE_ID=//p'"'"' .release.env | head -n 1)"
+           docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --force-recreate --wait --wait-timeout 180; then
+          :
         else
           deploy_status=$?
           if [ "true" = "true" ] && [ -f .release.env.previous ]; then
             restore_previous
             docker compose --env-file .release.env -f docker-compose.yml pull || true
-            docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180 || true
+            docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --force-recreate --wait --wait-timeout 180 || true
           fi
           exit "$deploy_status"
         fi
-        case "$release_id" in '"'"''"'"'|*[!A-Za-z0-9._-]*) echo '"'"'发布记录标识无效'"'"' >&2; exit 1 ;; esac
         mkdir -p .history "$HOME/.deploydesk/caddy/sites"
         cp .release.env ".history/$release_id.env"
         old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
         if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
         CADDY_CONTAINER="$(cat "$HOME/.deploydesk/caddy/container-name" 2>/dev/null || printf '"'"'deploydesk-caddy'"'"')"
-        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites'"'"')"
+        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites")"
         case "$CADDY_CONTAINER" in '"'"''"'"'|*[!A-Za-z0-9_.-]*) echo '"'"'AD-SRV-205：Caddy 容器记录无效'"'"' >&2; exit 1 ;; esac
         case "$CADDY_SITE_DIRECTORY" in /*) ;; *) echo '"'"'AD-SRV-205：Caddy 路由目录记录无效'"'"' >&2; exit 1 ;; esac
         test -d "$CADDY_SITE_DIRECTORY" && test -w "$CADDY_SITE_DIRECTORY" || { echo '"'"'AD-SRV-205：Caddy 路由目录不可写'"'"' >&2; exit 1; }
@@ -169,7 +212,11 @@ $:
   - docker:
       image: node:22-slim
     env:
+      COREPACK_NPM_REGISTRY: https://registry.npmmirror.com
       DEPLOYDESK_ENV: staging
+      NO_PROXY: registry.npmmirror.com
+      no_proxy: registry.npmmirror.com
+      npm_config_registry: https://registry.npmmirror.com
     imports:
     - https://cnb.cool/replace-me/secret/-/blob/main/env.staging.yml
     name: deploydesk-release-candidate
@@ -184,6 +231,7 @@ $:
       - apt-get update && apt-get install -y --no-install-recommends ca-certificates git openssh-client && rm -rf /var/lib/apt/lists/*
     - name: 安装依赖
       script:
+      - corepack enable
       - corepack pnpm install --frozen-lockfile
     - name: 验证 1
       script:
@@ -227,6 +275,24 @@ $:
         if (runtimeFile) {
           if (runtimeFile.includes("\0")) {
             console.error(`密钥仓库字段 ${runtimeFileSource} 包含无效字符`);
+            process.exit(1);
+          }
+          const configured = new Map();
+          for (const line of runtimeFile.split(/\r?\n/)) {
+            const normalized = line.trimStart().replace(/^export\s+/, "");
+            const equals = normalized.indexOf("=");
+            if (equals <= 0) continue;
+            const name = normalized.slice(0, equals).trim();
+            if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) continue;
+            const value = normalized.slice(equals + 1).trim();
+            const present = value !== "" && value !== "\"\"" && value !== String.fromCharCode(39, 39);
+            configured.set(name, present);
+          }
+          const missing = variables
+            .filter((variable) => variable.required && !configured.get(variable.name))
+            .map((variable) => variable.name);
+          if (missing.length) {
+            console.error(`缺少密钥仓库字段：${missing.join(", ")}`);
             process.exit(1);
           }
           const content = runtimeFile.endsWith("\n") ? runtimeFile : `${runtimeFile}\n`;
@@ -296,12 +362,32 @@ $:
         exec 9>"$HOME/.deploydesk/locks/server-deploy.lock"
         flock -w 900 9 || { echo '"'"'同一服务器已有部署任务，等待超时'"'"' >&2; exit 75; }
         cd '"'"'.deploydesk/apps/abcdeploy-hello-fullstack/staging'"'"'
+        minimum_free_kb=5242880
+        available_kb="$(df -Pk . | awk '"'"'NR == 2 { print $4 }'"'"')"
+        case "$available_kb" in '"'"''"'"'|*[!0-9]*) echo '"'"'AD-SRV-208：无法读取服务器剩余磁盘空间'"'"' >&2; exit 1 ;; esac
+        if [ "$available_kb" -lt "$minimum_free_kb" ]; then
+          docker image prune -a -f >/dev/null 2>&1 || true
+          available_kb="$(df -Pk . | awk '"'"'NR == 2 { print $4 }'"'"')"
+        fi
+        if [ "$available_kb" -lt "$minimum_free_kb" ]; then
+          echo '"'"'AD-SRV-208：服务器可用磁盘空间不足 5GB，已安全清理未使用镜像但仍不足'"'"' >&2
+          exit 1
+        fi
+        PERSISTED_RUNTIME_FILE="$HOME/.deploydesk/runtime-config/abcdeploy-hello-fullstack/staging.env"
+        if [ -s "$PERSISTED_RUNTIME_FILE" ]; then
+          cp "$PERSISTED_RUNTIME_FILE" .runtime.env.next
+        fi
         backup_file() {
-          if [ -f "$1" ]; then cp "$1" "$1.previous"; else rm -f "$1.previous"; fi
+          if [ -f "$1" ]; then
+            cp "$1" "$1.previous.next"
+            mv -f "$1.previous.next" "$1.previous"
+          else
+            rm -f "$1.previous" "$1.previous.next"
+          fi
         }
         restore_previous() {
           for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
-            if [ -f "$file.previous" ]; then cp "$file.previous" "$file"; fi
+            if [ -f "$file.previous" ]; then mv -f "$file.previous" "$file"; fi
           done
         }
         for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
@@ -310,26 +396,27 @@ $:
           mv "$file.next" "$file"
         done
         chmod 600 .runtime.env .release.env
+        release_id="$(sed -n '"'"'s/^DEPLOYDESK_RELEASE_ID=//p'"'"' .release.env | head -n 1)"
+        case "$release_id" in '"'"''"'"'|*[!A-Za-z0-9._-]*) echo '"'"'发布记录标识无效'"'"' >&2; exit 1 ;; esac
         if docker compose --env-file .release.env -f docker-compose.yml config --quiet && \
            docker compose --env-file .release.env -f docker-compose.yml pull && \
-           docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180; then
-          release_id="$(sed -n '"'"'s/^DEPLOYDESK_RELEASE_ID=//p'"'"' .release.env | head -n 1)"
+           docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --force-recreate --wait --wait-timeout 180; then
+          :
         else
           deploy_status=$?
           if [ "true" = "true" ] && [ -f .release.env.previous ]; then
             restore_previous
             docker compose --env-file .release.env -f docker-compose.yml pull || true
-            docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180 || true
+            docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --force-recreate --wait --wait-timeout 180 || true
           fi
           exit "$deploy_status"
         fi
-        case "$release_id" in '"'"''"'"'|*[!A-Za-z0-9._-]*) echo '"'"'发布记录标识无效'"'"' >&2; exit 1 ;; esac
         mkdir -p .history "$HOME/.deploydesk/caddy/sites"
         cp .release.env ".history/$release_id.env"
         old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
         if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
         CADDY_CONTAINER="$(cat "$HOME/.deploydesk/caddy/container-name" 2>/dev/null || printf '"'"'deploydesk-caddy'"'"')"
-        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites'"'"')"
+        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites")"
         case "$CADDY_CONTAINER" in '"'"''"'"'|*[!A-Za-z0-9_.-]*) echo '"'"'AD-SRV-205：Caddy 容器记录无效'"'"' >&2; exit 1 ;; esac
         case "$CADDY_SITE_DIRECTORY" in /*) ;; *) echo '"'"'AD-SRV-205：Caddy 路由目录记录无效'"'"' >&2; exit 1 ;; esac
         test -d "$CADDY_SITE_DIRECTORY" && test -w "$CADDY_SITE_DIRECTORY" || { echo '"'"'AD-SRV-205：Caddy 路由目录不可写'"'"' >&2; exit 1; }
@@ -386,7 +473,11 @@ $:
   - docker:
       image: node:22-slim
     env:
+      COREPACK_NPM_REGISTRY: https://registry.npmmirror.com
       DEPLOYDESK_ENV: production
+      NO_PROXY: registry.npmmirror.com
+      no_proxy: registry.npmmirror.com
+      npm_config_registry: https://registry.npmmirror.com
     imports:
     - https://cnb.cool/replace-me/secret/-/blob/main/env.production.yml
     name: deploydesk-production-approved
@@ -422,6 +513,24 @@ $:
         if (runtimeFile) {
           if (runtimeFile.includes("\0")) {
             console.error(`密钥仓库字段 ${runtimeFileSource} 包含无效字符`);
+            process.exit(1);
+          }
+          const configured = new Map();
+          for (const line of runtimeFile.split(/\r?\n/)) {
+            const normalized = line.trimStart().replace(/^export\s+/, "");
+            const equals = normalized.indexOf("=");
+            if (equals <= 0) continue;
+            const name = normalized.slice(0, equals).trim();
+            if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) continue;
+            const value = normalized.slice(equals + 1).trim();
+            const present = value !== "" && value !== "\"\"" && value !== String.fromCharCode(39, 39);
+            configured.set(name, present);
+          }
+          const missing = variables
+            .filter((variable) => variable.required && !configured.get(variable.name))
+            .map((variable) => variable.name);
+          if (missing.length) {
+            console.error(`缺少密钥仓库字段：${missing.join(", ")}`);
             process.exit(1);
           }
           const content = runtimeFile.endsWith("\n") ? runtimeFile : `${runtimeFile}\n`;
@@ -491,12 +600,32 @@ $:
         exec 9>"$HOME/.deploydesk/locks/server-deploy.lock"
         flock -w 900 9 || { echo '"'"'同一服务器已有部署任务，等待超时'"'"' >&2; exit 75; }
         cd '"'"'.deploydesk/apps/abcdeploy-hello-fullstack/production'"'"'
+        minimum_free_kb=5242880
+        available_kb="$(df -Pk . | awk '"'"'NR == 2 { print $4 }'"'"')"
+        case "$available_kb" in '"'"''"'"'|*[!0-9]*) echo '"'"'AD-SRV-208：无法读取服务器剩余磁盘空间'"'"' >&2; exit 1 ;; esac
+        if [ "$available_kb" -lt "$minimum_free_kb" ]; then
+          docker image prune -a -f >/dev/null 2>&1 || true
+          available_kb="$(df -Pk . | awk '"'"'NR == 2 { print $4 }'"'"')"
+        fi
+        if [ "$available_kb" -lt "$minimum_free_kb" ]; then
+          echo '"'"'AD-SRV-208：服务器可用磁盘空间不足 5GB，已安全清理未使用镜像但仍不足'"'"' >&2
+          exit 1
+        fi
+        PERSISTED_RUNTIME_FILE="$HOME/.deploydesk/runtime-config/abcdeploy-hello-fullstack/production.env"
+        if [ -s "$PERSISTED_RUNTIME_FILE" ]; then
+          cp "$PERSISTED_RUNTIME_FILE" .runtime.env.next
+        fi
         backup_file() {
-          if [ -f "$1" ]; then cp "$1" "$1.previous"; else rm -f "$1.previous"; fi
+          if [ -f "$1" ]; then
+            cp "$1" "$1.previous.next"
+            mv -f "$1.previous.next" "$1.previous"
+          else
+            rm -f "$1.previous" "$1.previous.next"
+          fi
         }
         restore_previous() {
           for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
-            if [ -f "$file.previous" ]; then cp "$file.previous" "$file"; fi
+            if [ -f "$file.previous" ]; then mv -f "$file.previous" "$file"; fi
           done
         }
         for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
@@ -505,26 +634,27 @@ $:
           mv "$file.next" "$file"
         done
         chmod 600 .runtime.env .release.env
+        release_id="$(sed -n '"'"'s/^DEPLOYDESK_RELEASE_ID=//p'"'"' .release.env | head -n 1)"
+        case "$release_id" in '"'"''"'"'|*[!A-Za-z0-9._-]*) echo '"'"'发布记录标识无效'"'"' >&2; exit 1 ;; esac
         if docker compose --env-file .release.env -f docker-compose.yml config --quiet && \
            docker compose --env-file .release.env -f docker-compose.yml pull && \
-           docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180; then
-          release_id="$(sed -n '"'"'s/^DEPLOYDESK_RELEASE_ID=//p'"'"' .release.env | head -n 1)"
+           docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --force-recreate --wait --wait-timeout 180; then
+          :
         else
           deploy_status=$?
           if [ "true" = "true" ] && [ -f .release.env.previous ]; then
             restore_previous
             docker compose --env-file .release.env -f docker-compose.yml pull || true
-            docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180 || true
+            docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --force-recreate --wait --wait-timeout 180 || true
           fi
           exit "$deploy_status"
         fi
-        case "$release_id" in '"'"''"'"'|*[!A-Za-z0-9._-]*) echo '"'"'发布记录标识无效'"'"' >&2; exit 1 ;; esac
         mkdir -p .history "$HOME/.deploydesk/caddy/sites"
         cp .release.env ".history/$release_id.env"
         old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
         if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
         CADDY_CONTAINER="$(cat "$HOME/.deploydesk/caddy/container-name" 2>/dev/null || printf '"'"'deploydesk-caddy'"'"')"
-        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites'"'"')"
+        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites")"
         case "$CADDY_CONTAINER" in '"'"''"'"'|*[!A-Za-z0-9_.-]*) echo '"'"'AD-SRV-205：Caddy 容器记录无效'"'"' >&2; exit 1 ;; esac
         case "$CADDY_SITE_DIRECTORY" in /*) ;; *) echo '"'"'AD-SRV-205：Caddy 路由目录记录无效'"'"' >&2; exit 1 ;; esac
         test -d "$CADDY_SITE_DIRECTORY" && test -w "$CADDY_SITE_DIRECTORY" || { echo '"'"'AD-SRV-205：Caddy 路由目录不可写'"'"' >&2; exit 1; }
@@ -551,7 +681,11 @@ $:
   - docker:
       image: node:22-slim
     env:
+      COREPACK_NPM_REGISTRY: https://registry.npmmirror.com
       DEPLOYDESK_ENV: staging
+      NO_PROXY: registry.npmmirror.com
+      no_proxy: registry.npmmirror.com
+      npm_config_registry: https://registry.npmmirror.com
     imports:
     - https://cnb.cool/replace-me/secret/-/blob/main/env.staging.yml
     name: deploydesk-staging-redeploy
@@ -587,6 +721,24 @@ $:
         if (runtimeFile) {
           if (runtimeFile.includes("\0")) {
             console.error(`密钥仓库字段 ${runtimeFileSource} 包含无效字符`);
+            process.exit(1);
+          }
+          const configured = new Map();
+          for (const line of runtimeFile.split(/\r?\n/)) {
+            const normalized = line.trimStart().replace(/^export\s+/, "");
+            const equals = normalized.indexOf("=");
+            if (equals <= 0) continue;
+            const name = normalized.slice(0, equals).trim();
+            if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) continue;
+            const value = normalized.slice(equals + 1).trim();
+            const present = value !== "" && value !== "\"\"" && value !== String.fromCharCode(39, 39);
+            configured.set(name, present);
+          }
+          const missing = variables
+            .filter((variable) => variable.required && !configured.get(variable.name))
+            .map((variable) => variable.name);
+          if (missing.length) {
+            console.error(`缺少密钥仓库字段：${missing.join(", ")}`);
             process.exit(1);
           }
           const content = runtimeFile.endsWith("\n") ? runtimeFile : `${runtimeFile}\n`;
@@ -656,12 +808,32 @@ $:
         exec 9>"$HOME/.deploydesk/locks/server-deploy.lock"
         flock -w 900 9 || { echo '"'"'同一服务器已有部署任务，等待超时'"'"' >&2; exit 75; }
         cd '"'"'.deploydesk/apps/abcdeploy-hello-fullstack/staging'"'"'
+        minimum_free_kb=5242880
+        available_kb="$(df -Pk . | awk '"'"'NR == 2 { print $4 }'"'"')"
+        case "$available_kb" in '"'"''"'"'|*[!0-9]*) echo '"'"'AD-SRV-208：无法读取服务器剩余磁盘空间'"'"' >&2; exit 1 ;; esac
+        if [ "$available_kb" -lt "$minimum_free_kb" ]; then
+          docker image prune -a -f >/dev/null 2>&1 || true
+          available_kb="$(df -Pk . | awk '"'"'NR == 2 { print $4 }'"'"')"
+        fi
+        if [ "$available_kb" -lt "$minimum_free_kb" ]; then
+          echo '"'"'AD-SRV-208：服务器可用磁盘空间不足 5GB，已安全清理未使用镜像但仍不足'"'"' >&2
+          exit 1
+        fi
+        PERSISTED_RUNTIME_FILE="$HOME/.deploydesk/runtime-config/abcdeploy-hello-fullstack/staging.env"
+        if [ -s "$PERSISTED_RUNTIME_FILE" ]; then
+          cp "$PERSISTED_RUNTIME_FILE" .runtime.env.next
+        fi
         backup_file() {
-          if [ -f "$1" ]; then cp "$1" "$1.previous"; else rm -f "$1.previous"; fi
+          if [ -f "$1" ]; then
+            cp "$1" "$1.previous.next"
+            mv -f "$1.previous.next" "$1.previous"
+          else
+            rm -f "$1.previous" "$1.previous.next"
+          fi
         }
         restore_previous() {
           for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
-            if [ -f "$file.previous" ]; then cp "$file.previous" "$file"; fi
+            if [ -f "$file.previous" ]; then mv -f "$file.previous" "$file"; fi
           done
         }
         for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
@@ -670,26 +842,27 @@ $:
           mv "$file.next" "$file"
         done
         chmod 600 .runtime.env .release.env
+        release_id="$(sed -n '"'"'s/^DEPLOYDESK_RELEASE_ID=//p'"'"' .release.env | head -n 1)"
+        case "$release_id" in '"'"''"'"'|*[!A-Za-z0-9._-]*) echo '"'"'发布记录标识无效'"'"' >&2; exit 1 ;; esac
         if docker compose --env-file .release.env -f docker-compose.yml config --quiet && \
            docker compose --env-file .release.env -f docker-compose.yml pull && \
-           docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180; then
-          release_id="$(sed -n '"'"'s/^DEPLOYDESK_RELEASE_ID=//p'"'"' .release.env | head -n 1)"
+           docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --force-recreate --wait --wait-timeout 180; then
+          :
         else
           deploy_status=$?
           if [ "true" = "true" ] && [ -f .release.env.previous ]; then
             restore_previous
             docker compose --env-file .release.env -f docker-compose.yml pull || true
-            docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180 || true
+            docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --force-recreate --wait --wait-timeout 180 || true
           fi
           exit "$deploy_status"
         fi
-        case "$release_id" in '"'"''"'"'|*[!A-Za-z0-9._-]*) echo '"'"'发布记录标识无效'"'"' >&2; exit 1 ;; esac
         mkdir -p .history "$HOME/.deploydesk/caddy/sites"
         cp .release.env ".history/$release_id.env"
         old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
         if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
         CADDY_CONTAINER="$(cat "$HOME/.deploydesk/caddy/container-name" 2>/dev/null || printf '"'"'deploydesk-caddy'"'"')"
-        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites'"'"')"
+        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites")"
         case "$CADDY_CONTAINER" in '"'"''"'"'|*[!A-Za-z0-9_.-]*) echo '"'"'AD-SRV-205：Caddy 容器记录无效'"'"' >&2; exit 1 ;; esac
         case "$CADDY_SITE_DIRECTORY" in /*) ;; *) echo '"'"'AD-SRV-205：Caddy 路由目录记录无效'"'"' >&2; exit 1 ;; esac
         test -d "$CADDY_SITE_DIRECTORY" && test -w "$CADDY_SITE_DIRECTORY" || { echo '"'"'AD-SRV-205：Caddy 路由目录不可写'"'"' >&2; exit 1; }
@@ -712,12 +885,26 @@ $:
         else
           echo '"'"'ROUTE_PENDING: AD-SRV-203：应用已健康运行，但统一 Caddy 当前未运行。'"'"'
         fi'
+deploydesk-production:
+  push:
+  - name: deploydesk-production-approval
+    stages:
+    - name: 发布已验证版本
+      options:
+        event: api_trigger_production
+        sync: true
+        title: ABCDeploy production promotion
+      type: cnb:apply
 main:
   push:
   - docker:
       image: node:22-slim
     env:
+      COREPACK_NPM_REGISTRY: https://registry.npmmirror.com
       DEPLOYDESK_ENV: staging
+      NO_PROXY: registry.npmmirror.com
+      no_proxy: registry.npmmirror.com
+      npm_config_registry: https://registry.npmmirror.com
     imports:
     - https://cnb.cool/replace-me/secret/-/blob/main/env.staging.yml
     name: deploydesk-release-candidate
@@ -732,6 +919,7 @@ main:
       - apt-get update && apt-get install -y --no-install-recommends ca-certificates git openssh-client && rm -rf /var/lib/apt/lists/*
     - name: 安装依赖
       script:
+      - corepack enable
       - corepack pnpm install --frozen-lockfile
     - name: 验证 1
       script:
@@ -777,6 +965,24 @@ main:
             console.error(`密钥仓库字段 ${runtimeFileSource} 包含无效字符`);
             process.exit(1);
           }
+          const configured = new Map();
+          for (const line of runtimeFile.split(/\r?\n/)) {
+            const normalized = line.trimStart().replace(/^export\s+/, "");
+            const equals = normalized.indexOf("=");
+            if (equals <= 0) continue;
+            const name = normalized.slice(0, equals).trim();
+            if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) continue;
+            const value = normalized.slice(equals + 1).trim();
+            const present = value !== "" && value !== "\"\"" && value !== String.fromCharCode(39, 39);
+            configured.set(name, present);
+          }
+          const missing = variables
+            .filter((variable) => variable.required && !configured.get(variable.name))
+            .map((variable) => variable.name);
+          if (missing.length) {
+            console.error(`缺少密钥仓库字段：${missing.join(", ")}`);
+            process.exit(1);
+          }
           const content = runtimeFile.endsWith("\n") ? runtimeFile : `${runtimeFile}\n`;
           fs.writeFileSync(outputPath, content, { mode: 0o600 });
         } else {
@@ -844,12 +1050,32 @@ main:
         exec 9>"$HOME/.deploydesk/locks/server-deploy.lock"
         flock -w 900 9 || { echo '"'"'同一服务器已有部署任务，等待超时'"'"' >&2; exit 75; }
         cd '"'"'.deploydesk/apps/abcdeploy-hello-fullstack/staging'"'"'
+        minimum_free_kb=5242880
+        available_kb="$(df -Pk . | awk '"'"'NR == 2 { print $4 }'"'"')"
+        case "$available_kb" in '"'"''"'"'|*[!0-9]*) echo '"'"'AD-SRV-208：无法读取服务器剩余磁盘空间'"'"' >&2; exit 1 ;; esac
+        if [ "$available_kb" -lt "$minimum_free_kb" ]; then
+          docker image prune -a -f >/dev/null 2>&1 || true
+          available_kb="$(df -Pk . | awk '"'"'NR == 2 { print $4 }'"'"')"
+        fi
+        if [ "$available_kb" -lt "$minimum_free_kb" ]; then
+          echo '"'"'AD-SRV-208：服务器可用磁盘空间不足 5GB，已安全清理未使用镜像但仍不足'"'"' >&2
+          exit 1
+        fi
+        PERSISTED_RUNTIME_FILE="$HOME/.deploydesk/runtime-config/abcdeploy-hello-fullstack/staging.env"
+        if [ -s "$PERSISTED_RUNTIME_FILE" ]; then
+          cp "$PERSISTED_RUNTIME_FILE" .runtime.env.next
+        fi
         backup_file() {
-          if [ -f "$1" ]; then cp "$1" "$1.previous"; else rm -f "$1.previous"; fi
+          if [ -f "$1" ]; then
+            cp "$1" "$1.previous.next"
+            mv -f "$1.previous.next" "$1.previous"
+          else
+            rm -f "$1.previous" "$1.previous.next"
+          fi
         }
         restore_previous() {
           for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
-            if [ -f "$file.previous" ]; then cp "$file.previous" "$file"; fi
+            if [ -f "$file.previous" ]; then mv -f "$file.previous" "$file"; fi
           done
         }
         for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
@@ -858,26 +1084,27 @@ main:
           mv "$file.next" "$file"
         done
         chmod 600 .runtime.env .release.env
+        release_id="$(sed -n '"'"'s/^DEPLOYDESK_RELEASE_ID=//p'"'"' .release.env | head -n 1)"
+        case "$release_id" in '"'"''"'"'|*[!A-Za-z0-9._-]*) echo '"'"'发布记录标识无效'"'"' >&2; exit 1 ;; esac
         if docker compose --env-file .release.env -f docker-compose.yml config --quiet && \
            docker compose --env-file .release.env -f docker-compose.yml pull && \
-           docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180; then
-          release_id="$(sed -n '"'"'s/^DEPLOYDESK_RELEASE_ID=//p'"'"' .release.env | head -n 1)"
+           docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --force-recreate --wait --wait-timeout 180; then
+          :
         else
           deploy_status=$?
           if [ "true" = "true" ] && [ -f .release.env.previous ]; then
             restore_previous
             docker compose --env-file .release.env -f docker-compose.yml pull || true
-            docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --wait --wait-timeout 180 || true
+            docker compose --env-file .release.env -f docker-compose.yml up -d --remove-orphans --force-recreate --wait --wait-timeout 180 || true
           fi
           exit "$deploy_status"
         fi
-        case "$release_id" in '"'"''"'"'|*[!A-Za-z0-9._-]*) echo '"'"'发布记录标识无效'"'"' >&2; exit 1 ;; esac
         mkdir -p .history "$HOME/.deploydesk/caddy/sites"
         cp .release.env ".history/$release_id.env"
         old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +6 || true)"
         if [ -n "$old_releases" ]; then printf '"'"'%s\n'"'"' "$old_releases" | xargs rm -f; fi
         CADDY_CONTAINER="$(cat "$HOME/.deploydesk/caddy/container-name" 2>/dev/null || printf '"'"'deploydesk-caddy'"'"')"
-        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites'"'"')"
+        CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || printf '"'"'%s'"'"' "$HOME/.deploydesk/caddy/sites")"
         case "$CADDY_CONTAINER" in '"'"''"'"'|*[!A-Za-z0-9_.-]*) echo '"'"'AD-SRV-205：Caddy 容器记录无效'"'"' >&2; exit 1 ;; esac
         case "$CADDY_SITE_DIRECTORY" in /*) ;; *) echo '"'"'AD-SRV-205：Caddy 路由目录记录无效'"'"' >&2; exit 1 ;; esac
         test -d "$CADDY_SITE_DIRECTORY" && test -w "$CADDY_SITE_DIRECTORY" || { echo '"'"'AD-SRV-205：Caddy 路由目录不可写'"'"' >&2; exit 1; }

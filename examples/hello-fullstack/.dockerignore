@@ -1,0 +1,21 @@
+# 由 ABCDeploy 生成，减少构建上下文并阻止本地密钥进入镜像。
+.git
+**/.git
+node_modules
+**/node_modules
+dist
+**/dist
+.next
+**/.next
+.nuxt
+**/.nuxt
+coverage
+**/coverage
+.deploydesk/generated
+.deploydesk/state
+.deploydesk/backups
+.deploydesk/runtime
+.env
+.env.*
+!.env.example
+*.log
