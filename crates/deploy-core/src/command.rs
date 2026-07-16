@@ -48,6 +48,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolves_standard_system_tools_for_gui_apps() {
         assert!(resolve_executable("sh").is_file());
