@@ -7,16 +7,30 @@ import type {
   CnbProjectSetup,
   CnbAccount,
   CnbSecretBundle,
+  ConfigProfile,
+  ConfigProfileInput,
   DeploymentRun,
+  DnsProviderHint,
+  ExistingProjectConfig,
+  LocalEnvWriteResult,
+  LocalDevelopmentSupport,
+  LocalPreviewStatus,
+  LocalInfrastructureStatus,
   OnboardingStep,
+  ProjectProfileBinding,
   ProviderCheck,
   PipelineIdentityResult,
   RecentProject,
+  RelinkProjectResult,
+  RouteConflictCheck,
   ServerForm,
   ServerResource,
   SecretStatus,
   RuntimeConfigFile,
+  RuntimeConfigRecommendation,
   RuntimeConfigStatus,
+  RuntimeConfigSyncStatus,
+  RuntimeEnvironment,
   RuntimeSecretStatus,
   SourceSyncResult,
   GeneratedSshIdentity,
@@ -25,12 +39,14 @@ import type {
   WorkspacePreview,
 } from "./types";
 
-export async function selectProjectDirectory(): Promise<string | null> {
+export async function selectProjectDirectory(
+  title = "选择 AI 生成的整个项目文件夹（不要只选前端或后端）",
+): Promise<string | null> {
   if (!isTauri()) return null;
   const selected = await open({
     directory: true,
     multiple: false,
-    title: "选择项目目录",
+    title,
   });
   return typeof selected === "string" ? selected : null;
 }
@@ -82,6 +98,11 @@ export async function getPreflight(): Promise<SystemPreflight> {
 export async function openProject(path: string): Promise<WorkspacePreview> {
   if (!isTauri()) {
     const workspace = demoWorkspace(path);
+    const manifestYaml = localStorage.getItem(demoManifestKey(path));
+    if (manifestYaml) {
+      workspace.manifestExists = true;
+      workspace.manifestYaml = manifestYaml;
+    }
     rememberDemoProject(path, workspace);
     return workspace;
   }
@@ -91,6 +112,52 @@ export async function openProject(path: string): Promise<WorkspacePreview> {
 export async function listRecentProjects(): Promise<RecentProject[]> {
   if (!isTauri()) return readDemoProjects();
   return invoke<RecentProject[]>("list_recent_projects");
+}
+
+export async function relinkProject(
+  oldPath: string,
+  newPath: string,
+): Promise<RelinkProjectResult> {
+  if (!isTauri()) {
+    const projects = readDemoProjects();
+    const project = projects.find((item) => item.path === oldPath);
+    if (!project) throw new Error("原项目记录不存在，请重新添加");
+    const now = new Date().toISOString();
+    localStorage.setItem(
+      DEMO_PROJECTS_KEY,
+      JSON.stringify(
+        projects.map((item) =>
+          item.path === oldPath
+            ? { ...item, path: newPath, pathExists: true, lastOpenedAt: now }
+            : item,
+        ),
+      ),
+    );
+    const runs = readDemoRuns().map((run) =>
+      run.projectPath === oldPath ? { ...run, projectPath: newPath } : run,
+    );
+    localStorage.setItem(DEMO_RUNS_KEY, JSON.stringify(runs));
+    const oldPrefix = `abcdeploy.setting.project.${encodeURIComponent(oldPath)}.`;
+    const newPrefix = `abcdeploy.setting.project.${encodeURIComponent(newPath)}.`;
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (!key?.startsWith(oldPrefix)) continue;
+      const value = localStorage.getItem(key);
+      localStorage.removeItem(key);
+      index -= 1;
+      if (value !== null) {
+        localStorage.setItem(
+          `${newPrefix}${key.slice(oldPrefix.length)}`,
+          value,
+        );
+      }
+    }
+    if (localStorage.getItem("abcdeploy.setting.active-project") === oldPath) {
+      localStorage.setItem("abcdeploy.setting.active-project", newPath);
+    }
+    return { path: newPath, name: project.name };
+  }
+  return invoke<RelinkProjectResult>("relink_project", { oldPath, newPath });
 }
 
 export async function getAppSetting(key: string): Promise<string | null> {
@@ -103,12 +170,388 @@ export async function getAppSetting(key: string): Promise<string | null> {
   return invoke<string | null>("get_app_setting", { key });
 }
 
+export async function getAppSettings(
+  keys: string[],
+): Promise<Record<string, string>> {
+  const unique = Array.from(new Set(keys));
+  if (!isTauri()) {
+    const entries = await Promise.all(
+      unique.map(async (key) => [key, await getAppSetting(key)] as const),
+    );
+    return Object.fromEntries(
+      entries.filter(
+        (entry): entry is readonly [string, string] => entry[1] !== null,
+      ),
+    );
+  }
+  return invoke<Record<string, string>>("get_app_settings", { keys: unique });
+}
+
 export async function setAppSetting(key: string, value: string): Promise<void> {
   if (!isTauri()) {
     localStorage.setItem(`abcdeploy.setting.${key}`, value);
     return;
   }
   return invoke("set_app_setting", { key, value });
+}
+
+export async function listConfigProfiles(): Promise<ConfigProfile[]> {
+  if (!isTauri()) return readDemoConfigProfiles();
+  return invoke<ConfigProfile[]>("list_config_profiles");
+}
+
+export async function saveConfigProfile(
+  input: ConfigProfileInput,
+): Promise<ConfigProfile> {
+  if (!isTauri()) {
+    const profiles = readDemoConfigProfiles();
+    const id = input.id ?? `${input.kind}-${Date.now()}`;
+    const profile: ConfigProfile = {
+      id,
+      kind: input.kind,
+      provider: input.provider,
+      name: input.name,
+      scope: input.scope,
+      values: input.values,
+      secretFields: input.secretFields,
+      configuredSecretFields: input.secretFields.filter(
+        (field) =>
+          Boolean(input.secrets[field]) ||
+          profiles
+            .find((item) => item.id === id)
+            ?.configuredSecretFields.includes(field),
+      ),
+      isDefault:
+        input.isDefault ||
+        !profiles.some((profile) => profile.kind === input.kind),
+      updatedAt: new Date().toISOString(),
+    };
+    const previousSecrets = demoConfigProfileSecrets.get(id) ?? {};
+    demoConfigProfileSecrets.set(id, {
+      ...previousSecrets,
+      ...Object.fromEntries(
+        Object.entries(input.secrets).filter(([, value]) => Boolean(value)),
+      ),
+    });
+    const next = profiles
+      .filter((item) => item.id !== id)
+      .map((item) =>
+        profile.isDefault && item.kind === profile.kind
+          ? { ...item, isDefault: false }
+          : item,
+      );
+    next.push(profile);
+    localStorage.setItem(DEMO_CONFIG_PROFILES_KEY, JSON.stringify(next));
+    return profile;
+  }
+  return invoke<ConfigProfile>("save_config_profile", { input });
+}
+
+export async function deleteConfigProfile(id: string): Promise<boolean> {
+  if (!isTauri()) {
+    const profiles = readDemoConfigProfiles();
+    const next = profiles.filter((profile) => profile.id !== id);
+    localStorage.setItem(DEMO_CONFIG_PROFILES_KEY, JSON.stringify(next));
+    demoConfigProfileSecrets.delete(id);
+    return next.length !== profiles.length;
+  }
+  return invoke<boolean>("delete_config_profile", { id });
+}
+
+export async function bindConfigProfile(
+  path: string,
+  environment: RuntimeEnvironment,
+  kind: ConfigProfile["kind"],
+  profileId: string,
+): Promise<ProjectProfileBinding> {
+  if (!isTauri()) {
+    const binding = { environment, kind, profileId };
+    localStorage.setItem(
+      demoBindingKey(path, environment, kind),
+      JSON.stringify(binding),
+    );
+    return binding;
+  }
+  return invoke<ProjectProfileBinding>("bind_config_profile", {
+    path,
+    environment,
+    kind,
+    profileId,
+  });
+}
+
+export async function listConfigProfileBindings(
+  path: string,
+  environment: RuntimeEnvironment,
+): Promise<ProjectProfileBinding[]> {
+  if (!isTauri()) {
+    return (["ai", "database", "redis", "dns", "registry", "custom"] as const)
+      .map((kind) =>
+        localStorage.getItem(demoBindingKey(path, environment, kind)),
+      )
+      .flatMap((value) =>
+        value ? [JSON.parse(value) as ProjectProfileBinding] : [],
+      );
+  }
+  return invoke<ProjectProfileBinding[]>("list_config_profile_bindings", {
+    path,
+    environment,
+  });
+}
+
+export async function recommendRuntimeConfig(
+  path: string,
+  environment: RuntimeEnvironment,
+  profileIds: string[],
+  content?: string,
+): Promise<RuntimeConfigRecommendation> {
+  if (!isTauri()) {
+    const current = await loadRuntimeConfig(path, environment);
+    const profiles = readDemoConfigProfiles().filter(
+      (profile) =>
+        profileIds.includes(profile.id) &&
+        (profile.scope === "any" ||
+          (profile.scope === "local" && environment === "development") ||
+          (profile.scope === "remote" && environment !== "development")),
+    );
+    const suggestions: Record<string, string> = Object.fromEntries(
+      profiles.flatMap((profile) =>
+        Object.entries(
+          demoRuntimeValuesFromProfile(profile, path, environment),
+        ),
+      ),
+    );
+    const source = content ?? current.content;
+    for (const variable of demoEmptyRuntimeVariables(source)) {
+      if (demoInternalRuntimeSecret(variable) && !suggestions[variable]) {
+        suggestions[variable] = demoGeneratedRuntimeSecret(
+          path,
+          environment,
+          variable,
+        );
+      }
+    }
+    const recommendation = fillDemoRuntimeValues(source, suggestions);
+    return {
+      content: recommendation.content,
+      appliedProfiles: profiles
+        .filter((profile) =>
+          Object.keys(
+            demoRuntimeValuesFromProfile(profile, path, environment),
+          ).some((variable) =>
+            recommendation.filledVariables.includes(variable),
+          ),
+        )
+        .map((profile) => profile.name),
+      filledVariables: recommendation.filledVariables,
+    };
+  }
+  return invoke<RuntimeConfigRecommendation>("recommend_runtime_config", {
+    path,
+    environment,
+    profileIds,
+    content: content ?? null,
+  });
+}
+
+export async function writeLocalEnv(
+  path: string,
+  content: string,
+  overwrite = false,
+): Promise<LocalEnvWriteResult> {
+  if (!isTauri()) {
+    localStorage.setItem(`abcdeploy.demo.local-env.${path}`, content);
+    return {
+      path: `${path}/.env`,
+      written: true,
+      requiresConfirmation: false,
+      backupPath: null,
+    };
+  }
+  return invoke<LocalEnvWriteResult>("write_local_env", {
+    path,
+    content,
+    overwrite,
+  });
+}
+
+export async function getLocalInfrastructureStatus(): Promise<LocalInfrastructureStatus> {
+  if (!isTauri()) return demoLocalInfrastructureStatus();
+  return invoke<LocalInfrastructureStatus>("get_local_infrastructure_status");
+}
+
+export async function prepareLocalInfrastructure(): Promise<LocalInfrastructureStatus> {
+  if (!isTauri()) {
+    localStorage.setItem("abcdeploy.demo.local-infrastructure", "running");
+    await Promise.all([
+      saveConfigProfile({
+        id: "profile-local-postgres",
+        kind: "database",
+        provider: "abcdeploy_local_postgres",
+        name: "ABCDeploy 本机 PostgreSQL",
+        scope: "local",
+        values: { host: "127.0.0.1", port: "55432", user: "abcdeploy" },
+        secretFields: ["password"],
+        secrets: { password: "demo-local-password" },
+        isDefault: true,
+      }),
+      saveConfigProfile({
+        id: "profile-local-redis",
+        kind: "redis",
+        provider: "abcdeploy_local_redis",
+        name: "ABCDeploy 本机 Redis",
+        scope: "local",
+        values: { host: "127.0.0.1", port: "56379" },
+        secretFields: ["password"],
+        secrets: { password: "demo-local-password" },
+        isDefault: true,
+      }),
+    ]);
+    return demoLocalInfrastructureStatus();
+  }
+  return invoke<LocalInfrastructureStatus>("prepare_local_infrastructure");
+}
+
+export async function prepareLocalPreview(
+  path: string,
+): Promise<LocalPreviewStatus> {
+  if (!isTauri()) return demoLocalPreview(path, "stopped");
+  return invoke<LocalPreviewStatus>("prepare_local_preview", { path });
+}
+
+export async function startLocalPreview(
+  path: string,
+  developmentMode = false,
+): Promise<LocalPreviewStatus> {
+  if (!isTauri()) {
+    localStorage.setItem(`abcdeploy.demo.local.${path}`, "running");
+    localStorage.removeItem(`abcdeploy.demo.local-services.${path}`);
+    return demoLocalPreview(path, "running");
+  }
+  return invoke<LocalPreviewStatus>("start_local_preview", {
+    path,
+    developmentMode,
+  });
+}
+
+export async function startLocalPreviewService(
+  path: string,
+  serviceId: string,
+  developmentMode = false,
+): Promise<LocalPreviewStatus> {
+  if (!isTauri()) {
+    const services = readDemoLocalServices(path);
+    services[serviceId] = true;
+    localStorage.setItem(
+      `abcdeploy.demo.local-services.${path}`,
+      JSON.stringify(services),
+    );
+    return demoLocalPreview(path, "partial");
+  }
+  return invoke<LocalPreviewStatus>("start_local_preview_service", {
+    path,
+    serviceId,
+    developmentMode,
+  });
+}
+
+export async function cancelLocalPreviewStart(path: string): Promise<boolean> {
+  if (!isTauri()) return true;
+  return invoke<boolean>("cancel_local_preview_start", { path });
+}
+
+export async function stopManagedLocalPortOwner(port: number): Promise<string> {
+  if (!isTauri()) return "其他项目";
+  return invoke<string>("stop_managed_local_port_owner", { port });
+}
+
+export async function getLocalPreviewStatus(
+  path: string,
+): Promise<LocalPreviewStatus> {
+  if (!isTauri()) {
+    const state = (localStorage.getItem(`abcdeploy.demo.local.${path}`) ??
+      "stopped") as LocalPreviewStatus["state"];
+    return demoLocalPreview(path, state);
+  }
+  return invoke<LocalPreviewStatus>("get_local_preview_status", { path });
+}
+
+export async function getLocalDevelopmentSupport(
+  path: string,
+): Promise<LocalDevelopmentSupport> {
+  if (!isTauri()) {
+    return {
+      available: true,
+      serviceCount: 3,
+      message: "修改代码后会自动重启后端或刷新网页，仅影响本机运行。",
+    };
+  }
+  return invoke<LocalDevelopmentSupport>("get_local_development_support", {
+    path,
+  });
+}
+
+export async function prepareLocalDevelopment(
+  path: string,
+): Promise<LocalDevelopmentSupport> {
+  if (!isTauri()) return getLocalDevelopmentSupport(path);
+  return invoke<LocalDevelopmentSupport>("prepare_local_development", {
+    path,
+  });
+}
+
+export async function stopLocalPreview(
+  path: string,
+): Promise<LocalPreviewStatus> {
+  if (!isTauri()) {
+    localStorage.setItem(`abcdeploy.demo.local.${path}`, "stopped");
+    localStorage.removeItem(`abcdeploy.demo.local-services.${path}`);
+    return demoLocalPreview(path, "stopped");
+  }
+  return invoke<LocalPreviewStatus>("stop_local_preview", { path });
+}
+
+export async function stopLocalPreviewService(
+  path: string,
+  serviceId: string,
+): Promise<LocalPreviewStatus> {
+  if (!isTauri()) {
+    const services = readDemoLocalServices(path);
+    services[serviceId] = false;
+    localStorage.setItem(
+      `abcdeploy.demo.local-services.${path}`,
+      JSON.stringify(services),
+    );
+    localStorage.setItem(`abcdeploy.demo.local.${path}`, "partial");
+    return demoLocalPreview(path, "partial");
+  }
+  return invoke<LocalPreviewStatus>("stop_local_preview_service", {
+    path,
+    serviceId,
+  });
+}
+
+export async function setLocalInfrastructureService(
+  service: "postgres" | "redis",
+  running: boolean,
+): Promise<LocalInfrastructureStatus> {
+  if (!isTauri()) {
+    const status = demoLocalInfrastructureStatus();
+    const next = {
+      postgres: service === "postgres" ? running : status.postgresRunning,
+      redis: service === "redis" ? running : status.redisRunning,
+    };
+    localStorage.setItem(
+      "abcdeploy.demo.local-infrastructure-services",
+      JSON.stringify(next),
+    );
+    localStorage.setItem("abcdeploy.demo.local-infrastructure", "prepared");
+    return demoLocalInfrastructureStatus();
+  }
+  return invoke<LocalInfrastructureStatus>("set_local_infrastructure_service", {
+    service,
+    running,
+  });
 }
 
 export async function saveProjectStep(
@@ -148,6 +591,7 @@ export async function applyManifest(
   manifestYaml: string,
 ): Promise<ApplyResult> {
   if (!isTauri()) {
+    localStorage.setItem(demoManifestKey(path), manifestYaml);
     return {
       planId: "demo-plan",
       writtenFiles: ["deploy.yaml"],
@@ -158,6 +602,24 @@ export async function applyManifest(
     path,
     manifestYaml,
     confirmed: true,
+  });
+}
+
+export async function saveManifestDraft(
+  path: string,
+  manifestYaml: string,
+): Promise<ApplyResult> {
+  if (!isTauri()) {
+    localStorage.setItem(demoManifestKey(path), manifestYaml);
+    return {
+      planId: "demo-draft-plan",
+      writtenFiles: ["deploy.yaml"],
+      backupDirectory: `${path}/.deploydesk/backups/demo-draft-plan`,
+    };
+  }
+  return invoke<ApplyResult>("save_manifest_draft", {
+    path,
+    manifestYaml,
   });
 }
 
@@ -200,9 +662,50 @@ export async function checkServer(form: ServerForm): Promise<ProviderCheck> {
   });
 }
 
+export async function installServerKeyWithPassword(
+  form: ServerForm,
+  password: string,
+): Promise<ProviderCheck> {
+  if (!isTauri()) {
+    return {
+      provider: "ssh",
+      ok: Boolean(form.host && form.user && form.keyPath && password),
+      summary: password ? "服务器已建立安全连接" : "请填写服务器登录密码",
+      details: ["公钥已幂等安装；服务器密码未保存"],
+      code: password ? null : "AD-SSH-105",
+      nextSteps: password ? [] : ["填写服务器登录密码后重试"],
+      retryable: !password,
+    };
+  }
+  return invoke<ProviderCheck>("install_server_key_with_password", {
+    name: form.name,
+    host: form.host,
+    user: form.user,
+    keyPath: form.keyPath,
+    port: form.port,
+    hostFingerprint: form.hostFingerprint,
+    password,
+  });
+}
+
 export async function listServers(): Promise<ServerResource[]> {
-  if (!isTauri()) return [];
+  if (!isTauri()) return Object.values(readDemoServerBindings());
   return invoke<ServerResource[]>("list_servers");
+}
+
+export async function getProjectServer(
+  path: string,
+  environment: "staging" | "production",
+): Promise<ServerResource | null> {
+  if (!isTauri()) {
+    return (
+      readDemoServerBindings()[demoServerBindingKey(path, environment)] ?? null
+    );
+  }
+  return invoke<ServerResource | null>("get_project_server", {
+    path,
+    environment,
+  });
 }
 
 export async function bindProjectServer(
@@ -211,12 +714,16 @@ export async function bindProjectServer(
   server: ServerForm,
 ): Promise<ServerResource> {
   if (!isTauri()) {
-    return {
+    const resource = {
       ...server,
       id: `demo-${server.user}@${server.host}:${server.port}`,
       keyPathExists: true,
       lastCheckedAt: new Date().toISOString(),
     };
+    const bindings = readDemoServerBindings();
+    bindings[demoServerBindingKey(path, environment)] = resource;
+    localStorage.setItem(DEMO_SERVER_BINDINGS_KEY, JSON.stringify(bindings));
+    return resource;
   }
   return invoke<ServerResource>("bind_project_server", {
     path,
@@ -321,6 +828,22 @@ export async function refreshDeployment(runId: string): Promise<DeploymentRun> {
   return invoke<DeploymentRun>("refresh_deployment", { runId });
 }
 
+export interface StagingPreviewTunnel {
+  url: string;
+  service: string;
+}
+
+export async function openStagingPreviewTunnel(
+  runId: string,
+): Promise<StagingPreviewTunnel> {
+  if (!isTauri()) {
+    return { url: "http://127.0.0.1:4173", service: "web" };
+  }
+  return invoke<StagingPreviewTunnel>("open_staging_preview_tunnel", {
+    runId,
+  });
+}
+
 export async function listDeploymentRuns(
   path: string,
 ): Promise<DeploymentRun[]> {
@@ -336,6 +859,52 @@ export async function listActiveDeploymentRuns(): Promise<DeploymentRun[]> {
     );
   }
   return invoke<DeploymentRun[]>("list_active_deployment_runs");
+}
+
+export async function listAttentionDeploymentRuns(): Promise<DeploymentRun[]> {
+  if (!isTauri()) {
+    const latestByEnvironment = new Map<string, DeploymentRun>();
+    for (const run of readDemoRuns()) {
+      const key = `${run.projectPath}:${run.environment}`;
+      const current = latestByEnvironment.get(key);
+      if (!current || run.startedAt > current.startedAt) {
+        latestByEnvironment.set(key, run);
+      }
+    }
+    return Array.from(latestByEnvironment.values())
+      .filter((run) =>
+        ["queued", "running", "needs_action", "failed"].includes(run.status),
+      )
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+  return invoke<DeploymentRun[]>("list_attention_deployment_runs");
+}
+
+export async function listRecentSuccessfulDeploymentRuns(): Promise<
+  DeploymentRun[]
+> {
+  if (!isTauri()) {
+    const latestByEnvironment = new Map<string, DeploymentRun>();
+    for (const run of readDemoRuns()) {
+      if (run.status !== "success") continue;
+      const key = `${run.projectPath}:${run.environment}`;
+      const current = latestByEnvironment.get(key);
+      if (!current || run.startedAt > current.startedAt) {
+        latestByEnvironment.set(key, run);
+      }
+    }
+    return Array.from(latestByEnvironment.values())
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .slice(0, 20);
+  }
+  return invoke<DeploymentRun[]>("list_recent_successful_deployment_runs");
+}
+
+export async function detectDnsProvider(
+  host: string,
+): Promise<DnsProviderHint | null> {
+  if (!isTauri()) return null;
+  return invoke<DnsProviderHint | null>("detect_dns_provider", { host });
 }
 
 export async function syncExternalDeployments(
@@ -365,6 +934,54 @@ export async function bootstrapServerCaddy(
     hostFingerprint: form.hostFingerprint,
     confirmed: true,
   });
+}
+
+export async function inspectServerRouteConflicts(
+  path: string,
+  environment: "staging" | "production",
+  server: ServerForm,
+): Promise<RouteConflictCheck> {
+  if (!isTauri()) return { conflicts: [], takeoverAvailable: false };
+  return invoke<RouteConflictCheck>("inspect_server_route_conflicts", {
+    path,
+    environment,
+    server,
+  });
+}
+
+export async function takeOverServerRoutes(
+  path: string,
+  environment: "staging" | "production",
+  server: ServerForm,
+): Promise<ProviderCheck> {
+  if (!isTauri()) {
+    return {
+      provider: "caddy",
+      ok: true,
+      summary: "现有地址已安全切换到 ABCDeploy 管理",
+      details: [],
+    };
+  }
+  return invoke<ProviderCheck>("take_over_server_routes", {
+    path,
+    environment,
+    server,
+    confirmed: true,
+  });
+}
+
+export async function reapplyDeploymentRoutes(
+  runId: string,
+): Promise<ProviderCheck> {
+  if (!isTauri()) {
+    return {
+      provider: "caddy",
+      ok: true,
+      summary: "正式地址已重新应用",
+      details: [],
+    };
+  }
+  return invoke<ProviderCheck>("reapply_deployment_routes", { runId });
 }
 
 export async function preparePipelineIdentity(
@@ -436,6 +1053,7 @@ export async function generateRuntimeSecret(
 export async function loadRuntimeConfig(
   path: string,
   environment: RuntimeConfigFile["environment"],
+  authorize = false,
 ): Promise<RuntimeConfigFile> {
   if (!isTauri()) {
     const templateContent = demoRuntimeTemplate(environment);
@@ -446,10 +1064,29 @@ export async function loadRuntimeConfig(
       sourceFiles: [".env.example"],
       content: content ?? templateContent,
       templateContent,
+      requiredVariables: ["DATABASE_URL", "APP_SECRET"],
       stored: content !== null,
+      authorizationRequired: false,
     };
   }
   return invoke<RuntimeConfigFile>("load_runtime_config", {
+    path,
+    environment,
+    authorize,
+  });
+}
+
+export async function loadExistingProjectConfig(
+  path: string,
+  environment: "staging" | "production",
+): Promise<ExistingProjectConfig> {
+  if (!isTauri()) {
+    return {
+      sourceFiles: [".env"],
+      content: readDemoRuntimeConfig(path, "development") ?? "",
+    };
+  }
+  return invoke<ExistingProjectConfig>("load_existing_project_config", {
     path,
     environment,
   });
@@ -471,9 +1108,38 @@ export async function storeRuntimeConfig(
   });
 }
 
+export async function getRuntimeConfigSyncStatus(
+  path: string,
+  environment: "staging" | "production",
+  server: ServerForm,
+): Promise<RuntimeConfigSyncStatus> {
+  if (!isTauri()) {
+    const stored = Boolean(readDemoRuntimeConfig(path, environment));
+    return { stored, synchronized: stored };
+  }
+  return invoke<RuntimeConfigSyncStatus>("runtime_config_sync_status", {
+    path,
+    environment,
+    server,
+  });
+}
+
+export async function syncRuntimeConfigToServer(
+  path: string,
+  environment: "staging" | "production",
+  server: ServerForm,
+): Promise<RuntimeConfigSyncStatus> {
+  if (!isTauri()) return { stored: true, synchronized: true };
+  return invoke<RuntimeConfigSyncStatus>("sync_runtime_config_to_server", {
+    path,
+    environment,
+    server,
+  });
+}
+
 export async function prepareCnbSecretBundle(
   path: string,
-  environment: RuntimeSecretStatus["environment"],
+  environment: CnbSecretBundle["environment"],
   secretRepository: string,
   server: ServerForm,
 ): Promise<CnbSecretBundle> {
@@ -533,9 +1199,10 @@ export async function rollbackEnvironment(
 export async function connectCnb(
   token: string,
   persist: boolean,
+  repository?: string,
 ): Promise<CnbAccount> {
   if (!isTauri()) {
-    return {
+    const account: CnbAccount = {
       connected: true,
       displayName: "示例用户",
       username: "cnb.demo-user",
@@ -549,12 +1216,25 @@ export async function connectCnb(
         },
       ],
     };
+    if (persist) {
+      localStorage.setItem(
+        "abcdeploy.demo.cnb-account",
+        JSON.stringify(account),
+      );
+    }
+    return account;
   }
-  return invoke("connect_cnb", { token, persist });
+  return invoke("connect_cnb", {
+    token,
+    persist,
+    repository: repository?.trim() || null,
+  });
 }
 
 export async function getCnbAccount(): Promise<CnbAccount> {
   if (!isTauri()) {
+    const stored = localStorage.getItem("abcdeploy.demo.cnb-account");
+    if (stored) return JSON.parse(stored) as CnbAccount;
     return {
       connected: false,
       displayName: "尚未连接",
@@ -586,6 +1266,36 @@ export async function ensureCnbRepository(
     return { repository: `${slug}/${name}`, created: true };
   }
   return invoke<CnbProjectSetup>("ensure_cnb_repository", { slug, name });
+}
+
+export async function checkCnbRepositoryAccess(
+  repository: string,
+): Promise<ProviderCheck> {
+  if (!isTauri()) {
+    return {
+      provider: "cnb-repository",
+      ok: true,
+      summary: "CNB 仓库可用",
+      details: [],
+    };
+  }
+  return invoke<ProviderCheck>("check_cnb_repository_access", { repository });
+}
+
+export async function checkCnbSecretRepositoryAccess(
+  repository: string,
+): Promise<ProviderCheck> {
+  if (!isTauri()) {
+    return {
+      provider: "cnb-secret-repository",
+      ok: true,
+      summary: "CNB 安全位置可用",
+      details: [],
+    };
+  }
+  return invoke<ProviderCheck>("check_cnb_secret_repository_access", {
+    repository,
+  });
 }
 
 export async function enableCnbAutoTrigger(
@@ -624,11 +1334,14 @@ export async function syncProjectToCnb(
   });
 }
 
-export async function getSecretStatus(key: string): Promise<SecretStatus> {
+export async function getSecretStatus(
+  key: string,
+  authorize = false,
+): Promise<SecretStatus> {
   if (!isTauri()) {
     return { key, stored: key.startsWith("registry.tcr.") };
   }
-  return invoke<SecretStatus>("secret_status", { key });
+  return invoke<SecretStatus>("secret_status", { authorize, key });
 }
 
 export async function storeSecret(
@@ -637,6 +1350,50 @@ export async function storeSecret(
 ): Promise<SecretStatus> {
   if (!isTauri()) return { key, stored: Boolean(value) };
   return invoke<SecretStatus>("store_secret", { key, value });
+}
+
+export async function checkRegistryCredentials(
+  registry: string,
+  username: string,
+  password: string,
+): Promise<ProviderCheck> {
+  if (!isTauri()) {
+    const ok = Boolean(registry.trim() && username.trim() && password);
+    return {
+      provider: "registry",
+      ok,
+      summary: ok ? "镜像仓库登录信息可用" : "登录信息还没有填写完整",
+      details: [],
+      code: ok ? undefined : "AD-IMG-201",
+      nextSteps: ok ? [] : ["填写登录用户名和访问密码后重新验证"],
+      retryable: false,
+    };
+  }
+  return invoke<ProviderCheck>("check_registry_credentials", {
+    registry,
+    username,
+    password,
+  });
+}
+
+export async function checkSavedRegistryCredentials(
+  registry: string,
+  secretPrefix: string,
+): Promise<ProviderCheck> {
+  if (!isTauri()) {
+    return {
+      provider: "registry",
+      ok: true,
+      summary: "镜像仓库登录信息可用",
+      details: [],
+      nextSteps: [],
+      retryable: false,
+    };
+  }
+  return invoke<ProviderCheck>("check_saved_registry_credentials", {
+    registry,
+    secretPrefix,
+  });
 }
 
 export async function deleteSecret(key: string): Promise<SecretStatus> {
@@ -685,6 +1442,243 @@ const DEMO_PROJECTS_KEY = "abcdeploy.demo.projects";
 const DEMO_RUNS_KEY = "abcdeploy.demo.runs";
 const DEMO_SECRETS_KEY = "abcdeploy.demo.secrets";
 const DEMO_RUNTIME_CONFIGS_KEY = "abcdeploy.demo.runtime-configs";
+const DEMO_CONFIG_PROFILES_KEY = "abcdeploy.demo.config-profiles";
+const DEMO_SERVER_BINDINGS_KEY = "abcdeploy.demo.server-bindings";
+
+function demoManifestKey(path: string) {
+  return `abcdeploy.demo.manifest.${encodeURIComponent(path)}`;
+}
+
+function demoServerBindingKey(
+  path: string,
+  environment: "staging" | "production",
+) {
+  return `${encodeURIComponent(path)}:${environment}`;
+}
+
+function readDemoServerBindings(): Record<string, ServerResource> {
+  try {
+    return JSON.parse(
+      localStorage.getItem(DEMO_SERVER_BINDINGS_KEY) ?? "{}",
+    ) as Record<string, ServerResource>;
+  } catch {
+    return {};
+  }
+}
+const demoConfigProfileSecrets = new Map<string, Record<string, string>>();
+const demoGeneratedRuntimeSecrets = new Map<string, string>();
+
+function demoEmptyRuntimeVariables(content: string): string[] {
+  return content.split("\n").flatMap((line) => {
+    const match = line.match(
+      /^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*(.*)$/,
+    );
+    return match && ["", '\"\"', "''"].includes(match[2].trim())
+      ? [match[1]]
+      : [];
+  });
+}
+
+function demoInternalRuntimeSecret(variable: string): boolean {
+  return [
+    "JWT_SECRET",
+    "AUTH_TOKEN_SECRET",
+    "SESSION_SECRET",
+    "COOKIE_SECRET",
+    "ENCRYPTION_KEY",
+    "SECRET_KEY",
+  ].some((suffix) => variable === suffix || variable.endsWith(`_${suffix}`));
+}
+
+function demoGeneratedRuntimeSecret(
+  path: string,
+  environment: RuntimeEnvironment,
+  variable: string,
+): string {
+  const key = `${path}:${environment}:${variable}`;
+  const existing = demoGeneratedRuntimeSecrets.get(key);
+  if (existing) return existing;
+  const bytes = new Uint8Array(32);
+  globalThis.crypto.getRandomValues(bytes);
+  const value = Array.from(bytes, (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  demoGeneratedRuntimeSecrets.set(key, value);
+  return value;
+}
+
+function demoRuntimeValuesFromProfile(
+  profile: ConfigProfile,
+  path: string,
+  environment: RuntimeEnvironment,
+): Record<string, string> {
+  const secrets = demoConfigProfileSecrets.get(profile.id) ?? {};
+  if (profile.kind === "ai" && profile.provider === "minimax") {
+    return {
+      AI_PROVIDER: "minimax",
+      ...(profile.values.base_url
+        ? { MINIMAX_BASE_URL: profile.values.base_url }
+        : {}),
+      ...(profile.values.model ? { MINIMAX_MODEL: profile.values.model } : {}),
+      ...(secrets.api_key ? { MINIMAX_API_KEY: secrets.api_key } : {}),
+    };
+  }
+  if (
+    profile.kind === "database" &&
+    profile.provider === "abcdeploy_local_postgres" &&
+    secrets.password
+  ) {
+    const project = path
+      .split(/[\\/]/)
+      .filter(Boolean)
+      .pop()
+      ?.toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "");
+    const database = `abc_demo_${project || "project"}_${environment}`;
+    const host = profile.values.host || "127.0.0.1";
+    const port = profile.values.port || "55432";
+    const user = profile.values.user || "abcdeploy";
+    return {
+      DATABASE_URL: `postgresql://${user}:${secrets.password}@${host}:${port}/${database}`,
+    };
+  }
+  if (
+    profile.kind === "redis" &&
+    profile.provider === "abcdeploy_local_redis" &&
+    secrets.password
+  ) {
+    const host = profile.values.host || "127.0.0.1";
+    const port = profile.values.port || "56379";
+    return { REDIS_URL: `redis://:${secrets.password}@${host}:${port}/0` };
+  }
+  if (profile.kind === "database" && secrets.url) {
+    return { DATABASE_URL: secrets.url };
+  }
+  if (profile.kind === "redis" && secrets.url) {
+    return { REDIS_URL: secrets.url };
+  }
+  if (profile.kind === "custom") {
+    const values: Record<string, string> = {};
+    const variable = profile.values.env_name;
+    if (variable && /^[A-Z_][A-Z0-9_]*$/.test(variable)) {
+      const value = profile.values.env_value || secrets[variable];
+      if (value) values[variable] = value;
+    }
+    return values;
+  }
+  return {};
+}
+
+function fillDemoRuntimeValues(
+  content: string,
+  suggestions: Record<string, string>,
+): { content: string; filledVariables: string[] } {
+  const filledVariables: string[] = [];
+  const lines = content.split("\n").map((line) => {
+    const match = line.match(/^(\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=)(.*)$/);
+    if (!match) return line;
+    const [, assignment, variable, rawValue] = match;
+    const suggestion = suggestions[variable];
+    if (!suggestion || !["", '""', "''"].includes(rawValue.trim())) {
+      return line;
+    }
+    filledVariables.push(variable);
+    return `${assignment}${demoDotenvValue(suggestion)}`;
+  });
+  return { content: lines.join("\n"), filledVariables };
+}
+
+function demoDotenvValue(value: string): string {
+  return /^[A-Za-z0-9_./:@+-]+$/.test(value) ? value : JSON.stringify(value);
+}
+
+function readDemoConfigProfiles(): ConfigProfile[] {
+  try {
+    const profiles = (
+      JSON.parse(
+        localStorage.getItem(DEMO_CONFIG_PROFILES_KEY) ?? "[]",
+      ) as ConfigProfile[]
+    ).map((profile) => ({
+      ...profile,
+      scope: profile.scope ?? "any",
+    }));
+    restoreDemoManagedProfileSecrets(profiles);
+    return profiles;
+  } catch {
+    return [];
+  }
+}
+
+function restoreDemoManagedProfileSecrets(profiles: ConfigProfile[]) {
+  if (
+    localStorage.getItem("abcdeploy.demo.local-infrastructure") !== "running"
+  ) {
+    return;
+  }
+  for (const profile of profiles) {
+    if (
+      (profile.provider === "abcdeploy_local_postgres" ||
+        profile.provider === "abcdeploy_local_redis") &&
+      !demoConfigProfileSecrets.has(profile.id)
+    ) {
+      demoConfigProfileSecrets.set(profile.id, {
+        password: "demo-local-password",
+      });
+    }
+  }
+}
+
+function demoBindingKey(
+  path: string,
+  environment: RuntimeEnvironment,
+  kind: ConfigProfile["kind"],
+) {
+  return `abcdeploy.demo.binding.${path}.${environment}.${kind}`;
+}
+
+function demoLocalInfrastructureStatus(): LocalInfrastructureStatus {
+  const prepared = localStorage.getItem("abcdeploy.demo.local-infrastructure");
+  const saved = localStorage.getItem(
+    "abcdeploy.demo.local-infrastructure-services",
+  );
+  const services = saved
+    ? (JSON.parse(saved) as { postgres: boolean; redis: boolean })
+    : { postgres: prepared === "running", redis: prepared === "running" };
+  const running = services.postgres && services.redis;
+  const partial = services.postgres || services.redis;
+  return {
+    state: running
+      ? "running"
+      : partial
+        ? "partial"
+        : prepared
+          ? "stopped"
+          : "not_prepared",
+    message: running
+      ? "本机数据库和 Redis 运行正常"
+      : partial
+        ? "部分本机基础服务正在运行"
+        : prepared
+          ? "本机基础服务已停止"
+          : "本机数据库和 Redis 尚未准备",
+    postgresRunning: services.postgres,
+    redisRunning: services.redis,
+    postgresPort: 55432,
+    redisPort: 56379,
+    profilesReady: running,
+  };
+}
+
+function readDemoLocalServices(path: string) {
+  try {
+    return JSON.parse(
+      localStorage.getItem(`abcdeploy.demo.local-services.${path}`) ?? "{}",
+    ) as Record<string, boolean>;
+  } catch {
+    return {};
+  }
+}
 
 function demoSecretId(path: string, environment: string, variable: string) {
   return `${path}:${environment}:${variable}`;
@@ -710,15 +1704,53 @@ function writeDemoSecret(path: string, environment: string, variable: string) {
 
 function demoRuntimeTemplate(environment: string) {
   return [
-    "# 项目运行配置",
+    "# 当前运行环境",
     `DEPLOYDESK_ENV=${environment}`,
+    "# 数据库连接地址",
     "DATABASE_URL=",
-    "JWT_SECRET=",
-    "MINIMAX_API_KEY=",
-    "MINIMAX_BASE_URL=https://api.minimax.chat/v1",
-    "VITE_API_BASE_URL=",
+    "# 应用内部安全密钥",
+    "APP_SECRET=",
+    "# 项目公开访问地址",
+    "PUBLIC_SITE_URL=",
+    "# 可选功能开关",
+    "OPTIONAL_FEATURE_ENABLED=",
     "",
   ].join("\n");
+}
+
+function demoLocalPreview(
+  path: string,
+  state: LocalPreviewStatus["state"],
+): LocalPreviewStatus {
+  const running = state === "running";
+  const individual = readDemoLocalServices(path);
+  return {
+    state,
+    message: running ? "本地容器均已通过运行检查" : "本地容器预览尚未启动",
+    composePath: `${path}/.deploydesk/generated/development/docker-compose.yml`,
+    envReady: localStorage.getItem(`abcdeploy.demo.local-env.${path}`) !== null,
+    writtenFiles: [],
+    services: [
+      {
+        id: "api",
+        kind: "api",
+        buildStrategy: "existing",
+        dockerfile: "apps/api/Dockerfile",
+        hostPort: 3000,
+        url: "http://127.0.0.1:3000",
+        running: running || Boolean(individual.api),
+      },
+      {
+        id: "admin",
+        kind: "static",
+        buildStrategy: "existing",
+        dockerfile: "apps/admin/Dockerfile",
+        hostPort: 4174,
+        url: "http://127.0.0.1:4174",
+        running: running || Boolean(individual.admin),
+      },
+    ],
+  };
 }
 
 function readDemoRuntimeConfig(path: string, environment: string) {
@@ -764,6 +1796,17 @@ function readDemoProjects(): RecentProject[] {
         latestEnvironment:
           latest?.environment ?? project.latestEnvironment ?? null,
         latestMessage: latest?.message ?? project.latestMessage ?? null,
+        latestRunId: latest?.id ?? project.latestRunId ?? null,
+        latestSourceRunId:
+          latest?.sourceRunId ?? project.latestSourceRunId ?? null,
+        latestCurrentStage:
+          latest?.currentStage ?? project.latestCurrentStage ?? null,
+        latestActionKind:
+          latest?.actionKind ?? project.latestActionKind ?? null,
+        latestIssueCode: latest?.issueCode ?? project.latestIssueCode ?? null,
+        latestCompletedSteps:
+          latest?.completedSteps ?? project.latestCompletedSteps ?? [],
+        latestUpdatedAt: latest?.updatedAt ?? project.latestUpdatedAt ?? null,
         activeRunCount: projectRuns.filter((run) =>
           ["queued", "running"].includes(run.status),
         ).length,
@@ -789,6 +1832,13 @@ function rememberDemoProject(path: string, workspace: WorkspacePreview) {
     latestStatus: previous?.latestStatus ?? null,
     latestEnvironment: previous?.latestEnvironment ?? null,
     latestMessage: previous?.latestMessage ?? null,
+    latestRunId: previous?.latestRunId ?? null,
+    latestSourceRunId: previous?.latestSourceRunId ?? null,
+    latestCurrentStage: previous?.latestCurrentStage ?? null,
+    latestActionKind: previous?.latestActionKind ?? null,
+    latestIssueCode: previous?.latestIssueCode ?? null,
+    latestCompletedSteps: previous?.latestCompletedSteps ?? [],
+    latestUpdatedAt: previous?.latestUpdatedAt ?? null,
     activeRunCount: previous?.activeRunCount ?? 0,
   };
   localStorage.setItem(
@@ -866,6 +1916,13 @@ function writeDemoRun(run: DeploymentRun) {
       latestStatus: run.status,
       latestEnvironment: run.environment,
       latestMessage: run.message,
+      latestRunId: run.id,
+      latestSourceRunId: run.sourceRunId,
+      latestCurrentStage: run.currentStage,
+      latestActionKind: run.actionKind,
+      latestIssueCode: run.issueCode,
+      latestCompletedSteps: run.completedSteps,
+      latestUpdatedAt: run.updatedAt,
       activeRunCount: nextRuns.filter(
         (item) =>
           item.projectPath === project.path &&
@@ -950,6 +2007,8 @@ release:
           dockerfile: "apps/api/Dockerfile",
           suggested_port: 3000,
           build_command: "corepack pnpm run build",
+          start_command: "corepack pnpm run start:prod",
+          dependency_file: "apps/api/package.json",
           confidence: 98,
         },
         {
@@ -961,6 +2020,8 @@ release:
           dockerfile: "apps/admin/Dockerfile",
           suggested_port: 80,
           build_command: "corepack pnpm run build",
+          start_command: null,
+          dependency_file: "apps/admin/package.json",
           confidence: 98,
         },
         {
@@ -972,6 +2033,8 @@ release:
           dockerfile: "apps/miniapp/Dockerfile",
           suggested_port: 80,
           build_command: "corepack pnpm run build",
+          start_command: null,
+          dependency_file: "apps/miniapp/package.json",
           confidence: 98,
         },
       ],
@@ -984,8 +2047,8 @@ release:
       environment_files: [".env.example"],
       environment_variables: [
         { name: "DATABASE_URL", secret: true, source: ".env.example" },
-        { name: "JWT_SECRET", secret: true, source: ".env.example" },
-        { name: "VITE_API_BASE_URL", secret: false, source: ".env.example" },
+        { name: "APP_SECRET", secret: true, source: ".env.example" },
+        { name: "PUBLIC_SITE_URL", secret: false, source: ".env.example" },
       ],
       diagnostics: [],
     },

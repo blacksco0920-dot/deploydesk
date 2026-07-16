@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -78,6 +77,12 @@ jobs:
       - name: 安装依赖
         run: pnpm install --frozen-lockfile
 
+      - name: 验证标签与应用版本一致
+        shell: bash
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          test "$GITHUB_REF_NAME" = "v$VERSION"
+
       - name: 构建并上传安装包
         uses: tauri-apps/tauri-action@v1
         env:
@@ -90,10 +95,12 @@ jobs:
           tagName: v__VERSION__
           releaseName: ABCDeploy v__VERSION__
           releaseBody: |
-            ABCDeploy 小白部署 V2 预览安装包。
+            ABCDeploy 小白部署预览安装包。
+
+            本版以“在本机运行、管理版本、部署测试版、发布正式版”四个场景组织主线；主分支可以自动生成版本并更新测试环境，多个测试通过版本可独立选择发布到正式环境。
 
             Windows 预览版提供 NSIS `.exe` 安装程序；稳定版使用正式版本号后再同时提供 MSI。
-            当前构建未配置商业代码签名证书，请下载后校验 GitHub Release 资产摘要。
+            当前公开构建未配置商业代码签名与公证，请下载后校验 Release 中的 SHA-256 摘要。
           releaseDraft: false
           prerelease: true
           generateReleaseNotes: true
@@ -126,6 +133,14 @@ jobs:
             | sed 's#release-assets/##' > release-assets/SHA256SUMS
           node scripts/build-release-manifest.mjs \
             release-assets release-assets/latest.json "$VERSION"
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const manifest = JSON.parse(fs.readFileSync("release-assets/latest.json", "utf8"));
+          const missing = Object.entries(manifest.assets)
+            .filter(([, asset]) => !asset.available)
+            .map(([platform]) => platform);
+          if (missing.length) throw new Error(`缺少平台安装包：${missing.join(", ")}`);
+          NODE
 
       - name: 上传发布清单
         env:

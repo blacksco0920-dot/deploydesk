@@ -27,13 +27,27 @@ struct ComposeFile {
 
 #[derive(Debug, Serialize)]
 struct ComposeService {
-    image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build: Option<ComposeBuild>,
     restart: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     env_file: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    extra_hosts: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ports: Vec<String>,
     environment: BTreeMap<String, String>,
     networks: BTreeMap<String, ComposeServiceNetwork>,
     labels: BTreeMap<String, String>,
     healthcheck: ComposeHealthcheck,
+}
+
+#[derive(Debug, Serialize)]
+struct ComposeBuild {
+    context: String,
+    dockerfile: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,8 +136,10 @@ fn render_compose(
     environment: &EnvironmentConfig,
 ) -> Result<String> {
     let network_name = format!("deploydesk-{}-{}", manifest.project.name, name.as_str());
+    let uses_shared_infrastructure = name != EnvironmentName::Development
+        && (environment.database.is_some() || environment.redis_namespace.is_some());
     let mut services = BTreeMap::new();
-    for service in &manifest.services {
+    for (index, service) in manifest.services.iter().enumerate() {
         let image_variable = image_variable(service);
         let mut labels = BTreeMap::new();
         labels.insert(
@@ -137,50 +153,157 @@ fn render_compose(
         labels.insert("deploydesk.service".to_string(), service.id.clone());
         let mut runtime = BTreeMap::new();
         runtime.insert("DEPLOYDESK_ENV".to_string(), name.as_str().to_string());
-        let health_command = match service.kind {
+        // The manifest's container port is the deployment contract used by the
+        // healthcheck and Caddy route. A copied local runtime file may still
+        // contain APP_PORT/PORT values that only make sense on the developer's
+        // machine, so make the deployment contract authoritative when the
+        // service explicitly declares either conventional listen variable.
+        for listen_variable in ["APP_PORT", "PORT"] {
+            if service
+                .runtime_env
+                .iter()
+                .any(|variable| variable.name == listen_variable)
+            {
+                runtime.insert(
+                    listen_variable.to_string(),
+                    service.container_port.to_string(),
+                );
+            }
+        }
+        if service
+            .dockerfile
+            .starts_with(".deploydesk/generated/build/Dockerfile.")
+            && matches!(service.kind, ServiceKind::Static | ServiceKind::Web)
+            && let Some(api) = manifest
+                .services
+                .iter()
+                .find(|candidate| candidate.kind == ServiceKind::Api)
+        {
+            runtime.insert("API_HOST".to_string(), api.id.clone());
+            runtime.insert("API_PORT".to_string(), api.container_port.to_string());
+        }
+        let health_command = service.healthcheck.command.clone().unwrap_or_else(|| match service.kind {
             ServiceKind::Static => format!(
-                "wget -q --spider http://127.0.0.1:{}{}",
+                "wget -Y off -q --spider http://127.0.0.1:{}{}",
                 service.container_port, service.healthcheck.path
             ),
             ServiceKind::Api | ServiceKind::Web | ServiceKind::Worker => format!(
-                "node -e \"fetch('http://127.0.0.1:{}{}').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
+                "node -e \"fetch('http://127.0.0.1:{}{}').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))\"",
                 service.container_port, service.healthcheck.path
             ),
-        };
+        });
+        let generated_caddy_runtime = service
+            .dockerfile
+            .starts_with(".deploydesk/generated/build/Dockerfile.")
+            && health_command.starts_with("wget -Y off -q --spider ");
+        let mut aliases = vec![
+            service_alias(manifest, name, service),
+            service.image.clone(),
+        ];
+        aliases.sort();
+        aliases.dedup();
+        let mut service_networks =
+            BTreeMap::from([("apps".to_string(), ComposeServiceNetwork { aliases })]);
+        if uses_shared_infrastructure {
+            service_networks.insert(
+                "infrastructure".to_string(),
+                ComposeServiceNetwork {
+                    aliases: Vec::new(),
+                },
+            );
+        }
         services.insert(
             service.id.clone(),
             ComposeService {
-                image: format!("${{{image_variable}:?请填写不可变镜像地址}}"),
-                restart: "unless-stopped".to_string(),
-                env_file: vec![".runtime.env".to_string()],
+                image: (name != EnvironmentName::Development)
+                    .then(|| format!("${{{image_variable}:?请填写不可变镜像地址}}")),
+                build: (name == EnvironmentName::Development).then(|| ComposeBuild {
+                    context: local_build_context(&service.context),
+                    dockerfile: local_dockerfile(&service.context, &service.dockerfile),
+                }),
+                restart: if name == EnvironmentName::Development {
+                    "no".to_string()
+                } else {
+                    "unless-stopped".to_string()
+                },
+                // A shared runtime file must only be injected into services that actually
+                // declare runtime variables. Otherwise an API-only value such as API_PORT can
+                // unexpectedly override an identically named Dockerfile default in a web
+                // container. Static services generally need their configuration at build time.
+                env_file: if service.runtime_env.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![if name == EnvironmentName::Development {
+                        "../../runtime/development.env".to_string()
+                    } else {
+                        ".runtime.env".to_string()
+                    }]
+                },
+                extra_hosts: if name == EnvironmentName::Development {
+                    vec!["host.docker.internal:host-gateway".to_string()]
+                } else {
+                    Vec::new()
+                },
+                ports: if name == EnvironmentName::Development
+                    && service.kind != ServiceKind::Worker
+                {
+                    vec![format!(
+                        "127.0.0.1:{}:{}",
+                        local_service_host_port(service, index),
+                        service.container_port
+                    )]
+                } else {
+                    Vec::new()
+                },
                 environment: runtime,
-                networks: BTreeMap::from([(
-                    "apps".to_string(),
-                    ComposeServiceNetwork {
-                        aliases: vec![service_alias(manifest, name, service)],
-                    },
-                )]),
+                networks: service_networks,
                 labels,
                 healthcheck: ComposeHealthcheck {
                     test: vec!["CMD-SHELL".to_string(), health_command],
-                    interval: format!("{}s", service.healthcheck.interval_seconds),
-                    timeout: "5s".to_string(),
-                    retries: service.healthcheck.retries,
-                    start_period: "20s".to_string(),
+                    interval: if generated_caddy_runtime {
+                        "2s".to_string()
+                    } else {
+                        format!("{}s", service.healthcheck.interval_seconds)
+                    },
+                    timeout: if generated_caddy_runtime {
+                        "2s".to_string()
+                    } else {
+                        "5s".to_string()
+                    },
+                    retries: if generated_caddy_runtime {
+                        15
+                    } else {
+                        service.healthcheck.retries
+                    },
+                    start_period: if generated_caddy_runtime {
+                        "1s".to_string()
+                    } else {
+                        "20s".to_string()
+                    },
                 },
+            },
+        );
+    }
+    let mut networks = BTreeMap::from([(
+        "apps".to_string(),
+        ComposeNetwork {
+            external: name != EnvironmentName::Development,
+            name: network_name,
+        },
+    )]);
+    if uses_shared_infrastructure {
+        networks.insert(
+            "infrastructure".to_string(),
+            ComposeNetwork {
+                external: true,
+                name: "abcdeploy-infra".to_string(),
             },
         );
     }
     let compose = ComposeFile {
         name: environment.target.namespace.clone(),
         services,
-        networks: BTreeMap::from([(
-            "apps".to_string(),
-            ComposeNetwork {
-                external: true,
-                name: network_name,
-            },
-        )]),
+        networks,
     };
     let mut content = serde_yaml_ng::to_string(&compose).map_err(|source| DeployError::Yaml {
         path: format!("generated/{}/docker-compose.yml", name.as_str()).into(),
@@ -188,6 +311,36 @@ fn render_compose(
     })?;
     content.insert_str(0, "# 由 ABCDeploy 生成。真实 .env 只保存在目标环境。\n");
     Ok(content)
+}
+
+fn local_build_context(context: &str) -> String {
+    if context == "." {
+        "../../..".to_string()
+    } else {
+        format!("../../../{context}")
+    }
+}
+
+fn local_dockerfile(context: &str, dockerfile: &str) -> String {
+    if context == "." {
+        dockerfile.to_string()
+    } else {
+        dockerfile
+            .strip_prefix(&format!("{context}/"))
+            .unwrap_or(dockerfile)
+            .to_string()
+    }
+}
+
+#[must_use]
+pub fn local_service_host_port(service: &ServiceConfig, index: usize) -> usize {
+    let base = match service.kind {
+        ServiceKind::Api => 3000,
+        ServiceKind::Web => 3100,
+        ServiceKind::Static => 4173,
+        ServiceKind::Worker => 3200,
+    };
+    base + index
 }
 
 fn render_env_example(
@@ -285,7 +438,16 @@ fn render_caddy(
             continue;
         };
         lines.push(String::new());
-        lines.push(format!("{} {{", route.host));
+        let site_address = if is_temporary_test_host(&route.host) {
+            // Public ACME validation for sslip.io is commonly intercepted by
+            // domestic cloud domain policies. Temporary test addresses are
+            // intentionally HTTP-only; production domains still use Caddy's
+            // automatic HTTPS.
+            format!("http://{}", route.host)
+        } else {
+            route.host.clone()
+        };
+        lines.push(format!("{site_address} {{"));
         if route.path == "/" {
             lines.push(format!(
                 "\treverse_proxy {}:{}",
@@ -307,6 +469,10 @@ fn render_caddy(
     lines.join("\n")
 }
 
+fn is_temporary_test_host(host: &str) -> bool {
+    host.to_ascii_lowercase().ends_with(".sslip.io")
+}
+
 fn render_cnb_pipeline(manifest: &ProjectManifest) -> Result<String> {
     let provider = CnbPipelineProvider;
     let release = release_pipeline(manifest)?;
@@ -316,6 +482,25 @@ fn render_cnb_pipeline(manifest: &ProjectManifest) -> Result<String> {
         manifest.source.release_branch.clone(),
         json!({ "push": [release.clone()] }),
     );
+    if manifest.release.production_mode == ProductionMode::Approval {
+        root.insert(
+            "deploydesk-production".to_string(),
+            json!({
+                "push": [{
+                    "name": "deploydesk-production-approval",
+                    "stages": [{
+                        "name": "发布已验证版本",
+                        "type": "cnb:apply",
+                        "options": {
+                            "event": provider.production_event(),
+                            "sync": true,
+                            "title": "ABCDeploy production promotion"
+                        }
+                    }]
+                }]
+            }),
+        );
+    }
     let mut api_triggers = Map::new();
     api_triggers.insert(provider.staging_event().to_string(), json!([release]));
     api_triggers.insert(
@@ -477,7 +662,13 @@ fn pipeline_definition(
         "docker": { "image": "node:22-slim" },
         "services": ["docker"],
         "imports": imports,
-        "env": { "DEPLOYDESK_ENV": environment.as_str() },
+        "env": {
+            "COREPACK_NPM_REGISTRY": "https://registry.npmmirror.com",
+            "DEPLOYDESK_ENV": environment.as_str(),
+            "NO_PROXY": "registry.npmmirror.com",
+            "no_proxy": "registry.npmmirror.com",
+            "npm_config_registry": "https://registry.npmmirror.com"
+        },
         "stages": stages
     })
 }
@@ -841,6 +1032,26 @@ fn runtime_env_script(
         "    console.error(`密钥仓库字段 ${runtimeFileSource} 包含无效字符`);".to_string(),
         "    process.exit(1);".to_string(),
         "  }".to_string(),
+        "  const configured = new Map();".to_string(),
+        "  for (const line of runtimeFile.split(/\\r?\\n/)) {".to_string(),
+        "    const normalized = line.trimStart().replace(/^export\\s+/, \"\");".to_string(),
+        "    const equals = normalized.indexOf(\"=\");".to_string(),
+        "    if (equals <= 0) continue;".to_string(),
+        "    const name = normalized.slice(0, equals).trim();".to_string(),
+        "    if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) continue;".to_string(),
+        "    const value = normalized.slice(equals + 1).trim();".to_string(),
+        "    const present = value !== \"\" && value !== \"\\\"\\\"\" && value !== String.fromCharCode(39, 39);"
+            .to_string(),
+        "    configured.set(name, present);".to_string(),
+        "  }".to_string(),
+        "  const missing = variables".to_string(),
+        "    .filter((variable) => variable.required && !configured.get(variable.name))"
+            .to_string(),
+        "    .map((variable) => variable.name);".to_string(),
+        "  if (missing.length) {".to_string(),
+        "    console.error(`缺少密钥仓库字段：${missing.join(\", \")}`);".to_string(),
+        "    process.exit(1);".to_string(),
+        "  }".to_string(),
         "  const content = runtimeFile.endsWith(\"\\n\") ? runtimeFile : `${runtimeFile}\\n`;"
             .to_string(),
         "  fs.writeFileSync(outputPath, content, { mode: 0o600 });".to_string(),
@@ -900,7 +1111,13 @@ fn remote_deploy_script(
     network: &str,
 ) -> String {
     let compose = "docker compose --env-file .release.env -f docker-compose.yml";
+    let migration_steps = remote_migration_steps(manifest, environment, compose);
     let site_name = format!("{}-{}.caddy", manifest.project.name, environment.as_str());
+    let persisted_runtime_file = format!(
+        ".deploydesk/runtime-config/{}/{}.env",
+        manifest.project.name,
+        environment.as_str()
+    );
     let prune_from = manifest.release.keep_releases.saturating_add(1);
     format!(
         r#"set -eu
@@ -908,12 +1125,32 @@ mkdir -p "$HOME/.deploydesk/locks"
 exec 9>"$HOME/.deploydesk/locks/server-deploy.lock"
 flock -w 900 9 || {{ echo '同一服务器已有部署任务，等待超时' >&2; exit 75; }}
 cd {remote_directory}
+minimum_free_kb=5242880
+available_kb="$(df -Pk . | awk 'NR == 2 {{ print $4 }}')"
+case "$available_kb" in ''|*[!0-9]*) echo 'AD-SRV-208：无法读取服务器剩余磁盘空间' >&2; exit 1 ;; esac
+if [ "$available_kb" -lt "$minimum_free_kb" ]; then
+  docker image prune -a -f >/dev/null 2>&1 || true
+  available_kb="$(df -Pk . | awk 'NR == 2 {{ print $4 }}')"
+fi
+if [ "$available_kb" -lt "$minimum_free_kb" ]; then
+  echo 'AD-SRV-208：服务器可用磁盘空间不足 5GB，已安全清理未使用镜像但仍不足' >&2
+  exit 1
+fi
+PERSISTED_RUNTIME_FILE="$HOME/{persisted_runtime_file}"
+if [ -s "$PERSISTED_RUNTIME_FILE" ]; then
+  cp "$PERSISTED_RUNTIME_FILE" .runtime.env.next
+fi
 backup_file() {{
-  if [ -f "$1" ]; then cp "$1" "$1.previous"; else rm -f "$1.previous"; fi
+  if [ -f "$1" ]; then
+    cp "$1" "$1.previous.next"
+    mv -f "$1.previous.next" "$1.previous"
+  else
+    rm -f "$1.previous" "$1.previous.next"
+  fi
 }}
 restore_previous() {{
   for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
-    if [ -f "$file.previous" ]; then cp "$file.previous" "$file"; fi
+    if [ -f "$file.previous" ]; then mv -f "$file.previous" "$file"; fi
   done
 }}
 for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
@@ -922,20 +1159,21 @@ for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
   mv "$file.next" "$file"
 done
 chmod 600 .runtime.env .release.env
+release_id="$(sed -n 's/^DEPLOYDESK_RELEASE_ID=//p' .release.env | head -n 1)"
+case "$release_id" in ''|*[!A-Za-z0-9._-]*) echo '发布记录标识无效' >&2; exit 1 ;; esac
 if {compose} config --quiet && \
    {compose} pull && \
-   {compose} up -d --remove-orphans --wait --wait-timeout 180; then
-  release_id="$(sed -n 's/^DEPLOYDESK_RELEASE_ID=//p' .release.env | head -n 1)"
+   {migration_steps}{compose} up -d --remove-orphans --force-recreate --wait --wait-timeout 180; then
+  :
 else
   deploy_status=$?
   if [ "{auto_rollback}" = "true" ] && [ -f .release.env.previous ]; then
     restore_previous
     {compose} pull || true
-    {compose} up -d --remove-orphans --wait --wait-timeout 180 || true
+    {compose} up -d --remove-orphans --force-recreate --wait --wait-timeout 180 || true
   fi
   exit "$deploy_status"
 fi
-case "$release_id" in ''|*[!A-Za-z0-9._-]*) echo '发布记录标识无效' >&2; exit 1 ;; esac
 mkdir -p .history "$HOME/.deploydesk/caddy/sites"
 cp .release.env ".history/$release_id.env"
 old_releases="$(ls -1t .history/*.env 2>/dev/null | tail -n +{prune_from} || true)"
@@ -965,12 +1203,68 @@ else
   echo 'ROUTE_PENDING: AD-SRV-203：应用已健康运行，但统一 Caddy 当前未运行。'
 fi"#,
         remote_directory = shell_quote(remote_directory),
+        persisted_runtime_file = persisted_runtime_file,
         compose = compose,
+        migration_steps = migration_steps,
         auto_rollback = manifest.release.auto_rollback,
         prune_from = prune_from,
         site_name = site_name,
         network = shell_quote(network),
     )
+}
+
+fn remote_migration_steps(
+    manifest: &ProjectManifest,
+    environment: EnvironmentName,
+    compose: &str,
+) -> String {
+    let config = manifest.environments.get(environment);
+    let mut commands = Vec::new();
+    for service in &manifest.services {
+        let Some(migration) = &service.migration else {
+            continue;
+        };
+        if migration.backup_required {
+            if let Some(database) = &config.database {
+                commands.extend([
+                    "mkdir -p .backups".to_string(),
+                    "POSTGRES_CONTAINER=\"$(docker ps --filter network=abcdeploy-infra --filter label=com.docker.compose.service=postgres --format '{{.Names}}' | head -n 1)\"".to_string(),
+                    "{ test -n \"$POSTGRES_CONTAINER\" || { echo 'AD-DB-201：没有找到 ABCDeploy 管理的 PostgreSQL 服务，已停止数据库迁移' >&2; exit 1; }; }".to_string(),
+                    format!(
+                        "DATABASE_EXISTS=\"$(docker exec \"$POSTGRES_CONTAINER\" sh -lc {} sh {} | tr -d '[:space:]')\"",
+                        shell_quote("exec psql -U \"$POSTGRES_USER\" -d postgres -Atqc \"SELECT 1 FROM pg_database WHERE datname = '$1'\""),
+                        shell_quote(&database.name),
+                    ),
+                    "{ test \"$DATABASE_EXISTS\" = 1 || { echo 'AD-DB-204：远程数据库尚未准备，请在客户端重新生成当前环境的云端安全配置' >&2; exit 1; }; }".to_string(),
+                    format!(
+                        "docker exec \"$POSTGRES_CONTAINER\" sh -lc {} sh {} > \".backups/${{release_id}}-{}.dump\"",
+                        shell_quote("exec pg_dump -Fc -U \"$POSTGRES_USER\" -d \"$1\""),
+                        shell_quote(&database.name),
+                        service.id,
+                    ),
+                    format!(
+                        "{{ test -s \".backups/${{release_id}}-{}.dump\" || {{ echo 'AD-DB-202：数据库备份没有生成，已停止迁移' >&2; exit 1; }}; }}",
+                        service.id
+                    ),
+                ]);
+            } else {
+                commands.push(
+                    "echo 'AD-DB-203：部署协议要求迁移前备份，但当前环境没有数据库记录' >&2; exit 1"
+                        .to_string(),
+                );
+            }
+        }
+        commands.push(format!(
+            "{compose} run -T --rm --no-deps {} sh -lc {}",
+            shell_quote(&service.id),
+            shell_quote(&migration.command),
+        ));
+    }
+    if commands.is_empty() {
+        String::new()
+    } else {
+        format!("{} && \\\n   ", commands.join(" && \\\n   "))
+    }
 }
 
 fn secret_import(manifest: &ProjectManifest, environment: EnvironmentName) -> String {
@@ -1075,7 +1369,7 @@ mod tests {
     use std::process::{Command, Stdio};
 
     use super::*;
-    use crate::model::DomainRoute;
+    use crate::model::{DomainRoute, EnvironmentVariable};
     use crate::plan::create_default_manifest;
     use crate::scanner::inspection_fixture;
 
@@ -1094,10 +1388,21 @@ mod tests {
                 && file.content.contains("state/")
         }));
         assert!(files.iter().any(|file| {
+            file.path == ".deploydesk/generated/development/docker-compose.yml"
+                && file.content.contains("build:")
+                && file.content.contains("../../runtime/development.env")
+                && file.content.contains("host.docker.internal:host-gateway")
+                && file.content.contains("127.0.0.1:3000:3000")
+                && !file.content.contains("请填写不可变镜像地址")
+        }));
+        assert!(files.iter().any(|file| {
             file.path == ".deploydesk/generated/staging/docker-compose.yml"
                 && file.content.contains("example-app-staging")
                 && file.content.contains("example-app-staging-api")
+                && file.content.contains("- example-app-api")
                 && file.content.contains(".runtime.env")
+                && file.content.contains("r.status<500?0:1")
+                && file.content.contains("abcdeploy-infra")
         }));
         assert!(files.iter().any(|file| {
             file.path == ".deploydesk/generated/production/docker-compose.yml"
@@ -1116,7 +1421,15 @@ mod tests {
         assert_eq!(main_pipeline.matches("构建并上传").count(), 1);
         assert!(pipeline.content.contains("api_trigger_staging"));
         assert!(pipeline.content.contains("corepack enable"));
+        assert!(pipeline.content.contains("COREPACK_NPM_REGISTRY"));
+        assert!(
+            pipeline
+                .content
+                .contains("NO_PROXY: registry.npmmirror.com")
+        );
         assert!(pipeline.content.contains("api_trigger_production"));
+        assert!(pipeline.content.contains("deploydesk-production:"));
+        assert!(pipeline.content.contains("type: cnb:apply"));
         assert!(pipeline.content.contains("tag_deploy.staging"));
         assert!(pipeline.content.contains("tag_deploy.production"));
         assert!(pipeline.content.contains("在测试环境验证生产候选"));
@@ -1128,6 +1441,20 @@ mod tests {
         assert!(pipeline.content.contains("StrictHostKeyChecking=yes"));
         assert!(pipeline.content.contains(".release.env.previous"));
         assert!(pipeline.content.contains("--wait-timeout 180"));
+        assert!(pipeline.content.contains("--force-recreate"));
+        assert!(pipeline.content.contains("docker image prune -a -f"));
+        assert!(pipeline.content.contains("AD-SRV-208"));
+        assert!(pipeline.content.contains("minimum_free_kb=5242880"));
+        assert!(pipeline.content.contains("pg_dump -Fc"));
+        assert!(pipeline.content.contains("AD-DB-204"));
+        assert!(pipeline.content.contains("SELECT 1 FROM pg_database"));
+        assert!(
+            pipeline
+                .content
+                .contains(".deploydesk/runtime-config/example-app/staging.env")
+        );
+        assert!(pipeline.content.contains(".backups/${release_id}-api.dump"));
+        assert!(pipeline.content.contains("run -T --rm --no-deps"));
         assert!(!pipeline.content.contains(":latest"));
         assert!(!pipeline.content.contains("ssh-keyscan"));
         assert!(!pipeline.content.contains("TCR_PASSWORD: actual"));
@@ -1164,6 +1491,89 @@ mod tests {
     }
 
     #[test]
+    fn runtime_file_is_not_injected_into_services_without_runtime_variables() {
+        let mut manifest = create_default_manifest(&inspection_fixture());
+        let mut static_service = manifest.services[0].clone();
+        static_service.id = "web".to_string();
+        static_service.kind = ServiceKind::Static;
+        static_service.image = "example-app-web".to_string();
+        static_service.dockerfile = ".deploydesk/generated/build/Dockerfile.web".to_string();
+        static_service.runtime_env.clear();
+        manifest.services.push(static_service);
+
+        let compose = render_compose(
+            &manifest,
+            EnvironmentName::Staging,
+            &manifest.environments.staging,
+        )
+        .expect("render staging compose");
+        let compose: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&compose).expect("parse staging compose");
+
+        assert!(compose["services"]["api"]["env_file"].is_sequence());
+        assert!(compose["services"]["web"].get("env_file").is_none());
+        assert_eq!(compose["services"]["web"]["environment"]["API_HOST"], "api");
+        assert_eq!(
+            compose["services"]["web"]["environment"]["API_PORT"],
+            "3000"
+        );
+    }
+
+    #[test]
+    fn temporary_sslip_routes_do_not_request_public_certificates() {
+        let mut manifest = create_default_manifest(&inspection_fixture());
+        manifest.environments.staging.domains = vec![DomainRoute {
+            service: manifest.services[0].id.clone(),
+            host: "demo.42-193-229-35.sslip.io".to_string(),
+            path: "/".to_string(),
+        }];
+
+        let caddy = render_caddy(
+            &manifest,
+            EnvironmentName::Staging,
+            &manifest.environments.staging,
+        );
+
+        assert!(caddy.contains("http://demo.42-193-229-35.sslip.io {"));
+        assert!(!caddy.contains("\ndemo.42-193-229-35.sslip.io {"));
+    }
+
+    #[test]
+    fn deployment_port_overrides_local_listen_port_values() {
+        let mut manifest = create_default_manifest(&inspection_fixture());
+        manifest.services[0].container_port = 3202;
+        manifest.services[0].runtime_env.push(EnvironmentVariable {
+            name: "APP_PORT".to_string(),
+            required: true,
+            secret: false,
+            default: None,
+            description: String::new(),
+        });
+        manifest.services[0].runtime_env.push(EnvironmentVariable {
+            name: "PORT".to_string(),
+            required: false,
+            secret: false,
+            default: None,
+            description: String::new(),
+        });
+
+        let compose = render_compose(
+            &manifest,
+            EnvironmentName::Staging,
+            &manifest.environments.staging,
+        )
+        .expect("render staging compose");
+        let compose: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&compose).expect("parse staging compose");
+
+        assert_eq!(
+            compose["services"]["api"]["environment"]["APP_PORT"],
+            "3202"
+        );
+        assert_eq!(compose["services"]["api"]["environment"]["PORT"], "3202");
+    }
+
+    #[test]
     fn automatic_production_uses_the_verified_candidate_digest() {
         let mut manifest = create_default_manifest(&inspection_fixture());
         manifest.release.production_mode = ProductionMode::Automatic;
@@ -1179,7 +1589,7 @@ mod tests {
     }
 
     #[test]
-    fn whole_runtime_file_reaches_deployment_without_field_parsing() {
+    fn whole_runtime_file_is_preserved_after_required_value_validation() {
         let tools_available = ["bash", "node"].into_iter().all(|tool| {
             Command::new(tool)
                 .arg("--version")
@@ -1202,7 +1612,8 @@ mod tests {
             ".deploydesk/runtime/staging",
         )
         .expect("render runtime script");
-        let runtime_file = "# 原始注释\nUNKNOWN_DETAIL=a=b#c\nEMPTY=\n";
+        let runtime_file =
+            "# 原始注释\nDATABASE_URL=postgresql://example\nUNKNOWN_DETAIL=a=b#c\nEMPTY=\n";
         let status = Command::new("bash")
             .current_dir(directory.path())
             .arg("-c")
@@ -1219,6 +1630,42 @@ mod tests {
         )
         .expect("read deployed runtime file");
         assert_eq!(deployed, runtime_file);
+    }
+
+    #[test]
+    fn whole_runtime_file_rejects_empty_required_values() {
+        let tools_available = ["bash", "node"].into_iter().all(|tool| {
+            Command::new(tool)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        });
+        if !tools_available {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("runtime directory");
+        fs::create_dir_all(directory.path().join(".deploydesk/runtime/staging"))
+            .expect("create runtime path");
+        let manifest = create_default_manifest(&inspection_fixture());
+        let script = runtime_env_script(
+            &manifest,
+            EnvironmentName::Staging,
+            ".deploydesk/runtime/staging",
+        )
+        .expect("render runtime script");
+        let status = Command::new("bash")
+            .current_dir(directory.path())
+            .arg("-c")
+            .arg(script)
+            .env("STAGING_RUNTIME_ENV_FILE", "DATABASE_URL=\n")
+            .stderr(Stdio::null())
+            .status()
+            .expect("run generated script");
+
+        assert!(!status.success());
     }
 
     #[test]

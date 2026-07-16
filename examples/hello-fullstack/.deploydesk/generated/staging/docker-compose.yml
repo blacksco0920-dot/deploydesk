@@ -11,6 +11,7 @@ services:
     networks:
       apps:
         aliases:
+        - abcdeploy-hello-fullstack-api
         - abcdeploy-hello-fullstack-staging-api
     labels:
       deploydesk.environment: staging
@@ -19,7 +20,7 @@ services:
     healthcheck:
       test:
       - CMD-SHELL
-      - node -e "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      - node -e "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
       interval: 10s
       timeout: 5s
       retries: 12
@@ -35,6 +36,7 @@ services:
       apps:
         aliases:
         - abcdeploy-hello-fullstack-staging-web
+        - abcdeploy-hello-fullstack-web
     labels:
       deploydesk.environment: staging
       deploydesk.project: abcdeploy-hello-fullstack
@@ -42,7 +44,7 @@ services:
     healthcheck:
       test:
       - CMD-SHELL
-      - wget -q --spider http://127.0.0.1:80/
+      - wget -Y off -q --spider http://127.0.0.1:80/
       interval: 10s
       timeout: 5s
       retries: 12

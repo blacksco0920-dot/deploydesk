@@ -2,15 +2,22 @@
 name: abcdeploy-hello-fullstack-development
 services:
   api:
-    image: ${DEPLOYDESK_API_IMAGE:?请填写不可变镜像地址}
-    restart: unless-stopped
+    build:
+      context: ../../..
+      dockerfile: apps/api/Dockerfile
+    restart: no
     env_file:
-    - .runtime.env
+    - ../../runtime/development.env
+    extra_hosts:
+    - host.docker.internal:host-gateway
+    ports:
+    - 127.0.0.1:3000:3000
     environment:
       DEPLOYDESK_ENV: development
     networks:
       apps:
         aliases:
+        - abcdeploy-hello-fullstack-api
         - abcdeploy-hello-fullstack-development-api
     labels:
       deploydesk.environment: development
@@ -19,22 +26,29 @@ services:
     healthcheck:
       test:
       - CMD-SHELL
-      - node -e "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      - node -e "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
       interval: 10s
       timeout: 5s
       retries: 12
       start_period: 20s
   web:
-    image: ${DEPLOYDESK_WEB_IMAGE:?请填写不可变镜像地址}
-    restart: unless-stopped
+    build:
+      context: ../../..
+      dockerfile: apps/web/Dockerfile
+    restart: no
     env_file:
-    - .runtime.env
+    - ../../runtime/development.env
+    extra_hosts:
+    - host.docker.internal:host-gateway
+    ports:
+    - 127.0.0.1:4174:80
     environment:
       DEPLOYDESK_ENV: development
     networks:
       apps:
         aliases:
         - abcdeploy-hello-fullstack-development-web
+        - abcdeploy-hello-fullstack-web
     labels:
       deploydesk.environment: development
       deploydesk.project: abcdeploy-hello-fullstack
@@ -42,12 +56,12 @@ services:
     healthcheck:
       test:
       - CMD-SHELL
-      - wget -q --spider http://127.0.0.1:80/
+      - wget -Y off -q --spider http://127.0.0.1:80/
       interval: 10s
       timeout: 5s
       retries: 12
       start_period: 20s
 networks:
   apps:
-    external: true
+    external: false
     name: deploydesk-abcdeploy-hello-fullstack-development

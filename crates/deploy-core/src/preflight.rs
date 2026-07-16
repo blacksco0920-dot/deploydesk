@@ -1,6 +1,5 @@
-use std::process::Command;
-
 use crate::model::{SystemPreflight, ToolStatus};
+use crate::system_command;
 
 #[must_use]
 pub fn system_preflight() -> SystemPreflight {
@@ -38,7 +37,7 @@ pub fn system_preflight() -> SystemPreflight {
 }
 
 fn docker_status() -> ToolStatus {
-    let version = Command::new("docker")
+    let version = system_command("docker")
         .args(["info", "--format", "{{.ServerVersion}}"])
         .output();
     match version {
@@ -73,7 +72,7 @@ fn tool_status(
     required_for: &str,
     resolution: &str,
 ) -> ToolStatus {
-    match Command::new(command).args(arguments).output() {
+    match system_command(command).args(arguments).output() {
         Ok(output) if output.status.success() => ToolStatus {
             name: name.to_string(),
             available: true,

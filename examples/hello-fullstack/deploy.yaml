@@ -8,7 +8,7 @@ project:
     verify:
     - corepack pnpm build
 source:
-  provider: github
+  provider: cnb
   repository: owner/abcdeploy-hello-fullstack
   release_branch: main
 services:

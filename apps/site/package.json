@@ -1,7 +1,7 @@
 {
   "name": "@abcdeploy/site",
   "private": true,
-  "version": "0.2.0-preview.3",
+  "version": "0.2.0-preview.4",
   "type": "module",
   "scripts": {
     "build": "vite build",

@@ -4,13 +4,14 @@ version = 4
 
 [[package]]
 name = "abcdeploy-desktop"
-version = "0.2.0-preview.3"
+version = "0.2.0-preview.4"
 dependencies = [
  "base64 0.22.1",
  "chrono",
  "deploy-core",
  "keyring",
  "rusqlite",
+ "security-framework",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -1228,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "deploy-core"
-version = "0.2.0-preview.3"
+version = "0.2.0-preview.4"
 dependencies = [
  "chrono",
  "dirs",
@@ -1253,7 +1254,7 @@ dependencies = [
 
 [[package]]
 name = "deployctl"
-version = "0.2.0-preview.3"
+version = "0.2.0-preview.4"
 dependencies = [
  "anyhow",
  "chrono",

@@ -16,3 +16,6 @@ apps/desktop/src-tauri/gen/
 .deploydesk/secrets/
 .deploydesk/runtime/
 coverage/
+
+# 本机真实项目验收现场，仅作私有审计留存，不进入公开仓库。
+docs/archive/2026-07-product-validation/

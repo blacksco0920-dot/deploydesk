@@ -1,0 +1,8840 @@
+import { openUrl } from "@tauri-apps/plugin-opener";
+import {
+  clear as clearClipboard,
+  readText,
+  writeText,
+} from "@tauri-apps/plugin-clipboard-manager";
+import {
+  AlertCircle,
+  ArrowUpRight,
+  Check,
+  CheckCircle2,
+  Circle,
+  Copy,
+  Database,
+  ExternalLink,
+  FolderGit2,
+  KeyRound,
+  LoaderCircle,
+  Play,
+  RefreshCw,
+  Rocket,
+  Server,
+  Square,
+  Tags,
+} from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { parseDocument } from "yaml";
+import {
+  bindProjectServer,
+  cancelLocalPreviewStart,
+  checkCnbRepositoryAccess,
+  checkCnbSecretRepositoryAccess,
+  checkRegistryCredentials,
+  checkSavedRegistryCredentials,
+  checkServer,
+  connectCnb,
+  detectDnsProvider,
+  discoverSshIdentities,
+  ensureCnbRepository,
+  generateSshIdentity,
+  getAppSetting,
+  getAppSettings,
+  getCnbAccount,
+  getLocalDevelopmentSupport,
+  getLocalInfrastructureStatus,
+  getLocalPreviewStatus,
+  getRuntimeConfigSyncStatus,
+  getSecretStatus,
+  inspectServerRouteConflicts,
+  installServerKeyWithPassword,
+  listServers,
+  loadRuntimeConfig,
+  openStagingPreviewTunnel,
+  prepareCnbSecretBundle,
+  prepareLocalDevelopment,
+  prepareLocalInfrastructure,
+  preparePipelineIdentity,
+  reapplyDeploymentRoutes,
+  selectPrivateKey,
+  setAppSetting,
+  setLocalInfrastructureService,
+  storeSecret,
+  startLocalPreview,
+  startLocalPreviewService,
+  stopManagedLocalPortOwner,
+  stopLocalPreview,
+  stopLocalPreviewService,
+  takeOverServerRoutes,
+} from "../api";
+import { issueFromProvider, issueFromUnknown } from "../lib/errors";
+import {
+  deploymentNeedsActionStatus,
+  deploymentVersionKey,
+  friendlyVersionTitle,
+  primaryVersionTitle,
+  verifiedVersionKeysFromSetting,
+  type ProjectSetupProgressStage,
+} from "../lib/projects";
+import type {
+  CnbAccount,
+  CnbSecretBundle,
+  DeploymentRun,
+  DnsProviderHint,
+  LocalInfrastructureStatus,
+  LocalDevelopmentSupport,
+  LocalPreviewStatus,
+  ProviderCheck,
+  RouteConflictCheck,
+  RuntimeConfigFile,
+  ServerForm,
+  ServerResource,
+  UserFacingIssue,
+  WorkspacePreview,
+} from "../types";
+import { parseEnvFields, RuntimeConfigFields } from "./RuntimeConfigFields";
+import { Button } from "./ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "./ui/dialog";
+import { Input } from "./ui/input";
+import { Label } from "./ui/label";
+import { Progress } from "./ui/progress";
+
+type ProjectScene = "local" | "versions" | "test" | "production";
+type LocalMilestone = "idle" | "success" | "warning";
+type StoredLocalIssue = {
+  code: string;
+  nextStep: string;
+  recordedAt: string;
+  summary?: string;
+  title: string;
+};
+
+const CNB_REQUIRED_PERMISSIONS = [
+  { code: "repo-code:rw", label: "读写项目代码" },
+  { code: "repo-cnb-history:r", label: "读取构建记录" },
+  { code: "repo-manage:rw", label: "管理仓库设置" },
+  { code: "repo-cnb-trigger:rw", label: "触发自动构建" },
+  { code: "group-resource:rw", label: "创建代码仓库" },
+] as const;
+type LocalStartRetry = { kind: "all" } | { kind: "service"; serviceId: string };
+type ManagedPortConflict = {
+  owner: string;
+  port: number;
+  retry: LocalStartRetry;
+};
+type VersionSetupStep = Extract<
+  ProjectSetupProgressStage,
+  "repository" | "registry" | "test-environment" | "remote"
+>;
+
+const EXTERNAL_STATUS_RECHECK_MS = 30_000;
+
+function CnbAuthorizationDialog({
+  description,
+  fieldId,
+  fieldLabel = "新的访问令牌",
+  onOpenChange,
+  onSubmit,
+  onTokenChange,
+  open,
+  submitDisabled = false,
+  submitLabel,
+  title,
+  token,
+  working,
+}: {
+  description: string;
+  fieldId: string;
+  fieldLabel?: string;
+  onOpenChange: (open: boolean) => void;
+  onSubmit: () => void;
+  onTokenChange: (token: string) => void;
+  open: boolean;
+  submitDisabled?: boolean;
+  submitLabel: string;
+  title: string;
+  token: string;
+  working: boolean;
+}) {
+  const [permissionsCopied, setPermissionsCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
+
+  useEffect(() => {
+    if (!open) {
+      setPermissionsCopied(false);
+      setCopyFailed(false);
+    }
+  }, [open]);
+
+  async function copyRequiredPermissions() {
+    try {
+      await copyText(
+        CNB_REQUIRED_PERMISSIONS.map((permission) => permission.code).join(
+          "\n",
+        ),
+      );
+      setPermissionsCopied(true);
+      setCopyFailed(false);
+    } catch {
+      setPermissionsCopied(false);
+      setCopyFailed(true);
+    }
+  }
+
+  return (
+    <Dialog onOpenChange={onOpenChange} open={open}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>{description}</DialogDescription>
+        </DialogHeader>
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-md bg-[var(--muted)]/45 px-3 py-2.5 text-sm">
+          <span className="text-[var(--muted-foreground)]">
+            还没有访问令牌？创建后回到这里粘贴。
+          </span>
+          <Button
+            onClick={() =>
+              void openUrl("https://cnb.cool/profile/token/create")
+            }
+            size="sm"
+            variant="secondary"
+          >
+            <ExternalLink />
+            前往 CNB 创建令牌
+          </Button>
+        </div>
+        <div className="space-y-2">
+          <div className="flex items-center justify-between gap-3">
+            <p className="m-0 text-xs font-medium text-[var(--muted-foreground)]">
+              在创建令牌页面勾选这 5 项
+            </p>
+            <Button
+              onClick={() => void copyRequiredPermissions()}
+              size="sm"
+              variant="ghost"
+            >
+              {permissionsCopied ? <Check /> : <Copy />}
+              {permissionsCopied ? "权限代码已复制" : "复制权限代码"}
+            </Button>
+          </div>
+          <ul className="m-0 grid list-none gap-1.5 rounded-md bg-[var(--muted)] px-3 py-2.5 text-xs">
+            {CNB_REQUIRED_PERMISSIONS.map((permission) => (
+              <li
+                className="flex items-center justify-between gap-3"
+                key={permission.code}
+              >
+                <span>{permission.label}</span>
+                <code className="text-[11px] text-[var(--muted-foreground)]">
+                  {permission.code}
+                </code>
+              </li>
+            ))}
+          </ul>
+          {copyFailed ? (
+            <p className="m-0 text-xs text-[var(--warning)]" role="alert">
+              没有复制成功，请按照上面的中文清单逐项勾选。
+            </p>
+          ) : null}
+        </div>
+        <p className="m-0 text-xs leading-5 text-[var(--muted-foreground)]">
+          令牌只保存在系统密钥库，并供所有项目复用。连接时不会为了测试权限创建仓库或触发构建；真正使用前仍会再次核对。
+        </p>
+        <div className="space-y-1.5">
+          <Label htmlFor={fieldId}>{fieldLabel}</Label>
+          <Input
+            autoComplete="off"
+            id={fieldId}
+            onChange={(event) => onTokenChange(event.target.value)}
+            type="password"
+            value={token}
+          />
+        </div>
+        <DialogFooter>
+          <Button
+            disabled={working}
+            onClick={() => onOpenChange(false)}
+            variant="secondary"
+          >
+            取消
+          </Button>
+          <Button
+            disabled={working || submitDisabled || !token.trim()}
+            onClick={onSubmit}
+          >
+            {working ? (
+              <LoaderCircle className="animate-spin-slow" />
+            ) : (
+              <KeyRound />
+            )}
+            {submitLabel}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function dnsHostRecord(host: string, providers: DnsProviderHint[]): string {
+  const normalizedHost = host.trim().toLowerCase();
+  const provider = [...providers]
+    .sort((left, right) => right.zone.length - left.zone.length)
+    .find((current) => {
+      const zone = current.zone.trim().toLowerCase();
+      return normalizedHost === zone || normalizedHost.endsWith(`.${zone}`);
+    });
+  if (!provider) return "";
+  const zone = provider.zone.trim().toLowerCase();
+  if (normalizedHost === zone) return "@";
+  return normalizedHost.slice(0, -(zone.length + 1));
+}
+
+export function dnsHostRecordLabel(
+  host: string,
+  providers: DnsProviderHint[],
+  checking: boolean,
+): string {
+  const record = dnsHostRecord(host, providers);
+  if (record) return `主机记录 ${record}`;
+  return checking
+    ? "正在识别主机记录"
+    : "主机记录暂未识别，请以域名平台显示为准";
+}
+
+export function versionSetupStep(
+  value: string | null,
+): VersionSetupStep | null {
+  return value === "repository" ||
+    value === "registry" ||
+    value === "test-environment" ||
+    value === "remote"
+    ? value
+    : null;
+}
+
+function storedLocalIssue(value: string | null): StoredLocalIssue | null {
+  if (!value?.trim()) return null;
+  try {
+    const parsed = JSON.parse(value) as Partial<StoredLocalIssue>;
+    if (
+      typeof parsed.code !== "string" ||
+      typeof parsed.title !== "string" ||
+      !parsed.title.trim() ||
+      typeof parsed.nextStep !== "string" ||
+      !parsed.nextStep.trim()
+    )
+      return null;
+    const normalized = issueFromUnknown(
+      `${parsed.code}：${typeof parsed.summary === "string" && parsed.summary.trim() ? parsed.summary : parsed.title}`,
+    );
+    const useNormalized = normalized.title !== "操作没有完成";
+    return {
+      code: parsed.code,
+      nextStep: useNormalized
+        ? (normalized.nextSteps[0] ?? parsed.nextStep)
+        : parsed.nextStep,
+      recordedAt:
+        typeof parsed.recordedAt === "string" ? parsed.recordedAt : "",
+      summary:
+        typeof parsed.summary === "string" && parsed.summary.trim()
+          ? parsed.summary.slice(0, 400)
+          : undefined,
+      title: useNormalized ? normalized.title : parsed.title,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function managedPortConflict(
+  code: string,
+  message: string,
+  retry: LocalStartRetry | undefined,
+): ManagedPortConflict | null {
+  if (code !== "AD-LOC-120" || !retry) return null;
+  const match = message.match(
+    /^项目 (.+) 正在使用本项目需要的 (\d{1,5}) 端口$/,
+  );
+  const port = Number(match?.[2]);
+  if (
+    !match?.[1]?.trim() ||
+    !Number.isInteger(port) ||
+    port < 1 ||
+    port > 65535
+  )
+    return null;
+  return { owner: match[1].trim(), port, retry };
+}
+
+interface ProductWorkspaceProps {
+  initialProductionVersionId?: string;
+  initialScene?: ProjectScene;
+  initialServer?: ServerForm;
+  onDeployTest: (
+    server: ServerForm,
+    repository: string,
+    useCommittedCode?: boolean,
+  ) => Promise<void>;
+  onError: (message: string) => void;
+  onPromote: (run: DeploymentRun, server: ServerForm) => Promise<void>;
+  onRefresh: (run: DeploymentRun) => Promise<DeploymentRun>;
+  onRecognitionDismiss?: () => void;
+  onReselectProject?: () => void;
+  onSaveManifest: (manifestYaml: string) => Promise<boolean>;
+  onSceneChange?: (scene: ProjectScene) => void;
+  onServerChange: (server: ServerForm) => void;
+  onSetupProgressChange?: () => void;
+  onSyncVersions?: () => Promise<void>;
+  path: string;
+  runs: DeploymentRun[];
+  saving: boolean;
+  showRecognitionSummary?: boolean;
+  workspace: WorkspacePreview;
+}
+
+export function ProductWorkspace({
+  initialProductionVersionId = "",
+  initialScene,
+  initialServer,
+  onDeployTest,
+  onError,
+  onPromote,
+  onRefresh,
+  onRecognitionDismiss,
+  onReselectProject,
+  onSaveManifest,
+  onSceneChange,
+  onServerChange,
+  onSetupProgressChange,
+  onSyncVersions,
+  path,
+  runs,
+  saving,
+  showRecognitionSummary = false,
+  workspace,
+}: ProductWorkspaceProps) {
+  const [scene, setScene] = useState<ProjectScene>(initialScene ?? "local");
+  // `initialScene` and `initialProductionVersionId` are navigation inputs for
+  // this mounted workspace. The parent mirrors later scene changes so it can
+  // restore them after a restart; those mirrored props must not reset a version
+  // the user has just selected for publishing or restoring.
+  const initialSceneRequest = useRef(initialScene);
+  const initialProductionVersionRequest = useRef(initialProductionVersionId);
+  const [verifiedRunIds, setVerifiedRunIds] = useState<string[]>([]);
+  const [storedVerifiedVersionKeys, setStoredVerifiedVersionKeys] = useState<
+    string[]
+  >([]);
+  const [selectedVersionId, setSelectedVersionId] = useState(
+    initialProductionVersionId,
+  );
+  const [localMilestone, setLocalMilestone] = useState<LocalMilestone>("idle");
+  const [projectSettingsLoaded, setProjectSettingsLoaded] = useState(false);
+  const [versionSetupComplete, setVersionSetupComplete] = useState<
+    boolean | null
+  >(null);
+  const [versionSetupStartRequested, setVersionSetupStartRequested] =
+    useState(false);
+  const [productionWebSavePending, setProductionWebSavePending] =
+    useState(false);
+  const stagingAttempts = runs.filter(
+    (run) =>
+      run.environment === "staging" && run.actionKind !== "production-approval",
+  );
+  const stagingRuns = collapseVersionRuns(stagingAttempts);
+  const staging = stagingAttempts[0];
+  const legacyVerifiedVersionKeys = stagingAttempts
+    .filter((run) => verifiedRunIds.includes(run.id))
+    .map(versionKey);
+  const verifiedVersionKeys = new Set([
+    ...storedVerifiedVersionKeys,
+    ...legacyVerifiedVersionKeys,
+  ]);
+  const stagingVerified = Boolean(
+    staging && verifiedVersionKeys.has(versionKey(staging)),
+  );
+  const liveStaging = stagingAttempts.find(isDeployedRun);
+  const production = runs.find((run) => run.environment === "production");
+  const liveProduction = runs.find(
+    (run) => run.environment === "production" && isDeployedRun(run),
+  );
+  const liveProductionSourceKey = versionKeyForSource(
+    liveProduction?.sourceRunId,
+    stagingAttempts,
+  );
+  const productionVersion = stagingRuns.find(
+    (run) =>
+      versionKey(run) ===
+      versionKeyForSource(production?.sourceRunId, stagingAttempts),
+  );
+  const activeProductionTask =
+    production && production.status !== "success" ? production : undefined;
+  const activeProductionSourceKey = versionKeyForSource(
+    activeProductionTask?.sourceRunId,
+    stagingAttempts,
+  );
+  const verifiedRuns = stagingRuns.filter(
+    (run) =>
+      run.status === "success" && verifiedVersionKeys.has(versionKey(run)),
+  );
+  const verifiedVersionRunIds = verifiedRuns.map((run) => run.id);
+  const verifiedRun =
+    verifiedRuns.find((run) => run.id === selectedVersionId) ??
+    productionVersion ??
+    verifiedRuns[0];
+  const verifiedRunVersionKey = verifiedRun ? versionKey(verifiedRun) : "";
+  const settingKey = useMemo(
+    () => `project.${encodeURIComponent(path)}`,
+    [path],
+  );
+  const productionWebProgressKey = `${settingKey}.cnb-secret-progress.production`;
+  const productionCandidateKey = `${settingKey}.production-pending-version`;
+
+  useEffect(() => {
+    setProjectSettingsLoaded(false);
+    setVersionSetupComplete(null);
+    setProductionWebSavePending(false);
+    const sceneKey = `${settingKey}.scene`;
+    const runKey = `${settingKey}.verified-run`;
+    const verifiedVersionSettingKey = `${settingKey}.verified-version`;
+    const milestoneKey = `${settingKey}.local-milestone`;
+    const setupKey = `${settingKey}.version-setup-complete`;
+    const keys = [
+      runKey,
+      verifiedVersionSettingKey,
+      milestoneKey,
+      setupKey,
+      productionWebProgressKey,
+      productionCandidateKey,
+    ];
+    if (!initialSceneRequest.current) keys.push(sceneKey);
+    getAppSettings(keys)
+      .then((settings) => {
+        const storedScene = settings[sceneKey] ?? null;
+        const storedRun = settings[runKey] ?? null;
+        const storedVersions = settings[verifiedVersionSettingKey] ?? null;
+        const storedLocalMilestone = settings[milestoneKey] ?? null;
+        const storedVersionSetup = settings[setupKey] ?? null;
+        const storedProductionWebProgress =
+          settings[productionWebProgressKey] ?? null;
+        const storedProductionCandidate =
+          settings[productionCandidateKey] ?? null;
+        if (initialSceneRequest.current) {
+          setScene(initialSceneRequest.current);
+        } else if (
+          storedScene &&
+          ["local", "versions", "test", "production"].includes(storedScene)
+        ) {
+          setScene(storedScene as ProjectScene);
+        }
+        if (storedRun) {
+          try {
+            const parsed = JSON.parse(storedRun) as unknown;
+            setVerifiedRunIds(
+              Array.isArray(parsed)
+                ? parsed.filter(
+                    (item): item is string => typeof item === "string",
+                  )
+                : [storedRun],
+            );
+          } catch {
+            setVerifiedRunIds([storedRun]);
+          }
+        } else {
+          setVerifiedRunIds([]);
+        }
+        setStoredVerifiedVersionKeys(
+          verifiedVersionKeysFromSetting(storedVersions),
+        );
+        // A version choice is not a durable project preference. Preserve it
+        // only while the user is paused at the external production web-save
+        // checkpoint; otherwise reopen on the version that is actually online
+        // instead of silently keeping an old rollback choice.
+        const pendingProductionCandidate =
+          storedProductionWebProgress === "save-page-opened" &&
+          storedProductionCandidate
+            ? stagingRuns.find(
+                (run) => versionKey(run) === storedProductionCandidate,
+              )
+            : undefined;
+        setSelectedVersionId(
+          pendingProductionCandidate?.id ??
+            initialProductionVersionRequest.current,
+        );
+        setLocalMilestone(
+          storedLocalMilestone === "success" ||
+            storedLocalMilestone === "warning"
+            ? storedLocalMilestone
+            : "idle",
+        );
+        setVersionSetupComplete(
+          storedVersionSetup === "true" || stagingAttempts.length > 0,
+        );
+        setProductionWebSavePending(
+          storedProductionWebProgress === "save-page-opened",
+        );
+      })
+      .catch(() => undefined)
+      .finally(() => setProjectSettingsLoaded(true));
+  }, [productionCandidateKey, productionWebProgressKey, settingKey]);
+
+  useEffect(() => {
+    if (stagingAttempts.length > 0) setVersionSetupComplete(true);
+  }, [stagingAttempts.length]);
+
+  useEffect(() => {
+    if (!projectSettingsLoaded || !legacyVerifiedVersionKeys.length) return;
+    const next = Array.from(
+      new Set([...storedVerifiedVersionKeys, ...legacyVerifiedVersionKeys]),
+    );
+    if (next.length === storedVerifiedVersionKeys.length) return;
+    setStoredVerifiedVersionKeys(next);
+    void setAppSetting(`${settingKey}.verified-version`, JSON.stringify(next));
+  }, [
+    legacyVerifiedVersionKeys.join("\u0000"),
+    projectSettingsLoaded,
+    settingKey,
+    storedVerifiedVersionKeys.join("\u0000"),
+  ]);
+
+  function switchScene(
+    next: ProjectScene,
+    selectedProductionVersion = "",
+    startVersionSetup = false,
+  ) {
+    if (next === "production") {
+      setSelectedVersionId(selectedProductionVersion);
+      const selectedRun = stagingRuns.find(
+        (run) => run.id === selectedProductionVersion,
+      );
+      if (selectedRun) {
+        void setAppSetting(productionCandidateKey, versionKey(selectedRun));
+      }
+    }
+    setVersionSetupStartRequested(
+      next === "versions" ? startVersionSetup : false,
+    );
+    setScene(next);
+    onSceneChange?.(next);
+    void setAppSetting(`${settingKey}.scene`, next);
+  }
+
+  async function verifyTest(run: DeploymentRun) {
+    const next = Array.from(new Set([run.id, ...verifiedRunIds]));
+    const nextVersions = Array.from(
+      new Set([versionKey(run), ...storedVerifiedVersionKeys]),
+    );
+    setVerifiedRunIds(next);
+    setStoredVerifiedVersionKeys(nextVersions);
+    setSelectedVersionId(run.id);
+    await Promise.all([
+      setAppSetting(`${settingKey}.verified-run`, JSON.stringify(next)),
+      setAppSetting(
+        `${settingKey}.verified-version`,
+        JSON.stringify(nextVersions),
+      ),
+    ]);
+    onSetupProgressChange?.();
+  }
+
+  function updateLocalMilestone(next: LocalMilestone) {
+    setLocalMilestone(next);
+    void setAppSetting(`${settingKey}.local-milestone`, next);
+  }
+
+  const refreshProductionWebSaveProgress = useCallback(() => {
+    void getAppSetting(productionWebProgressKey)
+      .then((value) =>
+        setProductionWebSavePending(value === "save-page-opened"),
+      )
+      .catch(() => undefined);
+    onSetupProgressChange?.();
+  }, [onSetupProgressChange, productionWebProgressKey]);
+
+  useEffect(() => {
+    if (
+      !projectSettingsLoaded ||
+      !productionWebSavePending ||
+      !verifiedRunVersionKey
+    )
+      return;
+    void setAppSetting(productionCandidateKey, verifiedRunVersionKey);
+  }, [
+    productionCandidateKey,
+    productionWebSavePending,
+    projectSettingsLoaded,
+    verifiedRunVersionKey,
+  ]);
+
+  const projectDisplayName =
+    workspace.inspection.project_name.trim() ||
+    path.split(/[\\/]/).filter(Boolean).slice(-1)[0] ||
+    "当前项目";
+  const projectServiceCount = workspace.inspection.services.length;
+  const projectIdentityLabel = `当前项目：${projectDisplayName}；项目路径：${path}；${projectServiceCount} 个项目服务`;
+
+  return (
+    <div className="grid h-full min-h-0 grid-rows-[58px_minmax(0,1fr)] bg-[var(--background)]">
+      <header
+        aria-label={projectIdentityLabel}
+        className="flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-6"
+        data-tauri-drag-region
+      >
+        <div aria-hidden="true" className="min-w-0">
+          <strong className="block truncate text-sm font-semibold">
+            {projectDisplayName}
+          </strong>
+          <span className="block max-w-[540px] truncate text-[11px] text-[var(--muted-foreground)]">
+            {path}
+          </span>
+        </div>
+        <span
+          aria-hidden="true"
+          className="text-[11px] text-[var(--muted-foreground)]"
+        >
+          {projectServiceCount} 个项目服务
+        </span>
+      </header>
+
+      <main className="min-h-0 overflow-auto">
+        <div className="mx-auto w-full max-w-[1060px] px-6 py-7">
+          <SceneTabs
+            localMilestone={localMilestone}
+            production={production}
+            productionWebSavePending={productionWebSavePending}
+            restoring={!projectSettingsLoaded}
+            scene={scene}
+            staging={staging}
+            stagingVerified={stagingVerified}
+            setupComplete={versionSetupComplete}
+            versionCount={availableVersionRuns(stagingRuns).length}
+            verifiedCount={verifiedRuns.length}
+            onChange={switchScene}
+          />
+          {!projectSettingsLoaded ? (
+            <ProjectSceneRestoring scene={scene} />
+          ) : scene === "local" ? (
+            <LocalScene
+              localMilestone={localMilestone}
+              onError={onError}
+              onMilestoneChange={updateLocalMilestone}
+              onPrepareDeployment={() => {
+                onRecognitionDismiss?.();
+                switchScene("versions", "", true);
+              }}
+              onReselectProject={onReselectProject}
+              onSaveManifest={onSaveManifest}
+              path={path}
+              settingsLoaded={projectSettingsLoaded}
+              showRecognitionSummary={showRecognitionSummary}
+              workspace={workspace}
+            />
+          ) : scene === "versions" ? (
+            <VersionScene
+              initialServer={initialServer}
+              initialStartRequested={versionSetupStartRequested}
+              onError={onError}
+              onOpenProduction={(run) => {
+                switchScene("production", run.id);
+              }}
+              onOpenTest={() => {
+                setVersionSetupComplete(true);
+                switchScene("test");
+              }}
+              onSaveManifest={onSaveManifest}
+              onServerChange={onServerChange}
+              onSetupProgressChange={onSetupProgressChange}
+              onSync={onSyncVersions ?? (async () => undefined)}
+              path={path}
+              productionRun={liveProduction}
+              productionSourceKey={liveProductionSourceKey}
+              productionWebSaveSourceKey={
+                productionWebSavePending ? verifiedRunVersionKey : ""
+              }
+              runs={stagingRuns}
+              saving={saving}
+              testSourceKey={liveStaging ? versionKey(liveStaging) : ""}
+              verifiedRunIds={verifiedVersionRunIds}
+              workspace={workspace}
+            />
+          ) : scene === "test" ? (
+            <TestScene
+              blockingProductionRun={
+                activeProductionTask &&
+                (!staging || activeProductionSourceKey !== versionKey(staging))
+                  ? activeProductionTask
+                  : undefined
+              }
+              initialServer={initialServer}
+              onDeploy={onDeployTest}
+              onError={onError}
+              onOpenProduction={() => {
+                if (productionWebSavePending && verifiedRun) {
+                  switchScene("production", verifiedRun.id);
+                } else if (activeProductionTask) {
+                  switchScene("production", productionVersion?.id ?? "");
+                } else if (staging) {
+                  switchScene("production", staging.id);
+                }
+              }}
+              onOpenSetup={() => switchScene("versions", "", true)}
+              onRefresh={onRefresh}
+              onVerify={verifyTest}
+              path={path}
+              productionRun={
+                staging &&
+                production &&
+                versionKeyForSource(production.sourceRunId, stagingAttempts) ===
+                  versionKey(staging)
+                  ? production
+                  : undefined
+              }
+              productionWebSaveVersionKey={
+                productionWebSavePending ? verifiedRunVersionKey : ""
+              }
+              run={staging}
+              setupComplete={versionSetupComplete}
+              verified={stagingVerified}
+              workspace={workspace}
+            />
+          ) : (
+            <ProductionScene
+              currentTestVersion={liveStaging}
+              initialWebSavePending={productionWebSavePending}
+              initialServer={initialServer}
+              key={
+                initialServer
+                  ? `${initialServer.user}@${initialServer.host}:${initialServer.port}`
+                  : "production-server-restoring"
+              }
+              onError={onError}
+              onPromote={onPromote}
+              onProgressChange={refreshProductionWebSaveProgress}
+              onRefresh={onRefresh}
+              onSaveManifest={onSaveManifest}
+              onShowVersions={() => switchScene("versions", "", true)}
+              onShowTest={() => switchScene("test")}
+              path={path}
+              production={production}
+              productionVersion={productionVersion}
+              saving={saving}
+              setupComplete={versionSetupComplete === true}
+              verifiedRun={verifiedRun}
+              verifiedRuns={verifiedRuns}
+              onSelectVersion={(runId) => {
+                setSelectedVersionId(runId);
+              }}
+              workspace={workspace}
+            />
+          )}
+        </div>
+      </main>
+    </div>
+  );
+}
+
+function SceneTabs({
+  localMilestone,
+  onChange,
+  production,
+  productionWebSavePending,
+  restoring,
+  scene,
+  staging,
+  stagingVerified,
+  setupComplete,
+  verifiedCount,
+  versionCount,
+}: {
+  localMilestone: LocalMilestone;
+  onChange: (scene: ProjectScene) => void;
+  production?: DeploymentRun;
+  productionWebSavePending: boolean;
+  restoring: boolean;
+  scene: ProjectScene;
+  staging?: DeploymentRun;
+  stagingVerified: boolean;
+  setupComplete: boolean | null;
+  verifiedCount: number;
+  versionCount: number;
+}) {
+  const items: Array<{
+    key: ProjectScene;
+    label: string;
+    status: string;
+    tone: "idle" | "active" | "success" | "warning";
+  }> = [
+    {
+      key: "local",
+      label: "在本机运行",
+      status:
+        localMilestone === "success"
+          ? "上次运行成功"
+          : localMilestone === "warning"
+            ? "上次启动未完成"
+            : "快捷启停与配置检核",
+      tone: localMilestone,
+    },
+    {
+      key: "versions",
+      label: "管理版本",
+      status: versionCount
+        ? `${versionCount} 个版本 · ${verifiedCount} 个测试通过`
+        : "等待生成版本",
+      tone: verifiedCount ? "success" : versionCount ? "active" : "idle",
+    },
+    {
+      key: "test",
+      label: "部署测试版",
+      status: stagingVerified
+        ? "测试已通过"
+        : staging
+          ? staging.status === "success"
+            ? "等待确认测试结果"
+            : deploymentStatus(staging)
+          : setupComplete === null
+            ? "正在确认"
+            : setupComplete
+              ? "等待首次部署"
+              : "还差上线设置",
+      tone: stagingVerified
+        ? "success"
+        : staging?.status === "success"
+          ? "active"
+          : staging?.status === "failed" || setupComplete === false
+            ? "warning"
+            : "idle",
+    },
+    {
+      key: "production",
+      label: "发布正式版",
+      status: production
+        ? production.status === "success"
+          ? "正式版可以访问"
+          : deploymentStatus(production)
+        : productionWebSavePending
+          ? "还差网页保存"
+          : verifiedCount
+            ? `${verifiedCount} 个测试通过版本`
+            : "尚未发布",
+      tone:
+        production?.status === "success"
+          ? "success"
+          : productionWebSavePending
+            ? "warning"
+            : verifiedCount
+              ? "active"
+              : "idle",
+    },
+  ];
+  const visibleItems = restoring
+    ? items.map((item) => ({
+        ...item,
+        status: "正在恢复",
+        tone: "idle" as const,
+      }))
+    : items;
+  return (
+    <nav
+      aria-label="项目场景"
+      className="mb-8 grid grid-cols-4 gap-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] p-1 max-[760px]:grid-cols-2"
+    >
+      {visibleItems.map((item) => (
+        <button
+          aria-current={scene === item.key ? "page" : undefined}
+          className={`flex min-h-[62px] items-center justify-between gap-3 rounded-md px-4 text-left outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus)] ${
+            scene === item.key
+              ? "bg-[var(--muted)] shadow-sm"
+              : "hover:bg-[var(--muted)]/60"
+          }`}
+          key={item.key}
+          onClick={() => onChange(item.key)}
+          type="button"
+        >
+          <span>
+            <strong className="block text-sm font-semibold">
+              {item.label}
+            </strong>
+            <span className="mt-1 block text-[11px] text-[var(--muted-foreground)]">
+              {item.status}
+            </span>
+          </span>
+          <span
+            data-status={item.tone}
+            aria-hidden="true"
+            className={`a11y-status-dot size-2 rounded-full ${
+              item.tone === "success"
+                ? "bg-[var(--success)]"
+                : item.tone === "warning"
+                  ? "bg-[var(--warning)]"
+                  : item.tone === "active"
+                    ? "bg-[var(--accent)]"
+                    : "bg-[var(--muted-strong)]"
+            }`}
+          />
+        </button>
+      ))}
+    </nav>
+  );
+}
+
+function ProjectSceneRestoring({ scene }: { scene: ProjectScene }) {
+  const copy: Record<ProjectScene, { description: string; title: string }> = {
+    local: {
+      title: "在本机运行",
+      description: "正在恢复上次运行状态和必要配置。",
+    },
+    versions: {
+      title: "管理版本",
+      description: "正在恢复测试结果和版本记录。",
+    },
+    test: {
+      title: "部署测试版",
+      description: "正在恢复测试版和你的验证结果。",
+    },
+    production: {
+      title: "发布正式版",
+      description: "正在恢复正式版和可发布版本。",
+    },
+  };
+  return (
+    <div>
+      <PageHeading {...copy[scene]} />
+      <div className="mt-6 flex items-center gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-5 py-5">
+        <LoaderCircle className="size-5 shrink-0 animate-spin-slow text-[var(--accent)]" />
+        <div>
+          <strong className="block text-sm">正在恢复项目状态</strong>
+          <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
+            只读取已经保存的信息，不会重新启动服务或执行部署。
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LocalScene({
+  localMilestone,
+  onError,
+  onMilestoneChange,
+  onPrepareDeployment,
+  onReselectProject,
+  onSaveManifest,
+  path,
+  settingsLoaded,
+  showRecognitionSummary,
+  workspace,
+}: {
+  localMilestone: LocalMilestone;
+  onError: (message: string) => void;
+  onMilestoneChange: (milestone: LocalMilestone) => void;
+  onPrepareDeployment: () => void;
+  onReselectProject?: () => void;
+  onSaveManifest: (manifestYaml: string) => Promise<boolean>;
+  path: string;
+  settingsLoaded: boolean;
+  showRecognitionSummary: boolean;
+  workspace: WorkspacePreview;
+}) {
+  const [preview, setPreview] = useState<LocalPreviewStatus | null>(null);
+  const [infrastructure, setInfrastructure] =
+    useState<LocalInfrastructureStatus | null>(null);
+  const [developmentSupport, setDevelopmentSupport] =
+    useState<LocalDevelopmentSupport | null>(null);
+  const [runMode, setRunMode] = useState<"stable" | "development">("stable");
+  const [runModeLoaded, setRunModeLoaded] = useState(false);
+  const [configReady, setConfigReady] = useState(false);
+  const [previewChecked, setPreviewChecked] = useState(false);
+  const [infrastructureChecked, setInfrastructureChecked] = useState(false);
+  const [working, setWorking] = useState("");
+  const [workingOperation, setWorkingOperation] = useState<
+    "idle" | "start" | "stop"
+  >("idle");
+  const [blocker, setBlocker] = useState("");
+  const [notice, setNotice] = useState("");
+  const [lastLocalIssue, setLastLocalIssue] = useState<StoredLocalIssue | null>(
+    null,
+  );
+  const [lastLocalIssueLoaded, setLastLocalIssueLoaded] = useState(false);
+  const [startStartedAt, setStartStartedAt] = useState<number | null>(null);
+  const [startElapsedSeconds, setStartElapsedSeconds] = useState(0);
+  const [cancellingStart, setCancellingStart] = useState(false);
+  const [portConflict, setPortConflict] = useState<ManagedPortConflict | null>(
+    null,
+  );
+  const statusRequest = useRef(0);
+  const requiredInfrastructure = useMemo(
+    () => localInfrastructureRequirements(workspace),
+    [workspace],
+  );
+  const lastLocalIssueKey = `project.${encodeURIComponent(path)}.local-last-issue`;
+
+  const clearLastLocalIssue = useCallback(() => {
+    setLastLocalIssue(null);
+    void setAppSetting(lastLocalIssueKey, "").catch(() => undefined);
+  }, [lastLocalIssueKey]);
+
+  useEffect(() => {
+    let active = true;
+    setLastLocalIssueLoaded(false);
+    void getAppSetting(lastLocalIssueKey)
+      .then((value) => {
+        if (active) setLastLocalIssue(storedLocalIssue(value));
+      })
+      .catch(() => {
+        if (active) setLastLocalIssue(null);
+      })
+      .finally(() => {
+        if (active) setLastLocalIssueLoaded(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, [lastLocalIssueKey]);
+
+  const refresh = useCallback(async () => {
+    const request = ++statusRequest.current;
+    const isLatest = () => request === statusRequest.current;
+    const modeKey = `project.${encodeURIComponent(path)}.local-run-mode`;
+    setRunModeLoaded(false);
+    setPreviewChecked(false);
+    setInfrastructureChecked(false);
+    setPreview(null);
+    setInfrastructure(null);
+    setDevelopmentSupport(null);
+    setBlocker("");
+
+    const previewRequest = getLocalPreviewStatus(path)
+      .then((next) => {
+        if (isLatest()) setPreview(next);
+        return next;
+      })
+      .catch((error) => {
+        if (isLatest()) {
+          setBlocker(
+            `本机状态没有完整读取：${issueFromUnknown(toMessage(error)).message}`,
+          );
+        }
+        return null;
+      })
+      .finally(() => {
+        if (isLatest()) setPreviewChecked(true);
+      });
+    const infrastructureRequest = requiredInfrastructure.length
+      ? getLocalInfrastructureStatus()
+          .then((next) => {
+            if (isLatest()) setInfrastructure(next);
+            return next;
+          })
+          .catch((error) => {
+            if (isLatest()) {
+              setBlocker(
+                (current) =>
+                  current ||
+                  `本机状态没有完整读取：${issueFromUnknown(toMessage(error)).message}`,
+              );
+            }
+            return null;
+          })
+          .finally(() => {
+            if (isLatest()) setInfrastructureChecked(true);
+          })
+      : Promise.resolve(null).then((next) => {
+          if (isLatest()) setInfrastructureChecked(true);
+          return next;
+        });
+    const supportRequest = getLocalDevelopmentSupport(path)
+      .then((next) => {
+        if (isLatest()) setDevelopmentSupport(next);
+        return next;
+      })
+      .catch(() => null);
+    const storedModeRequest = getAppSetting(modeKey).catch(() => null);
+    const [, , nextSupport, storedMode] = await Promise.all([
+      previewRequest,
+      infrastructureRequest,
+      supportRequest,
+      storedModeRequest,
+    ]);
+    if (isLatest()) {
+      setRunMode(
+        nextSupport?.available && storedMode === "development"
+          ? "development"
+          : "stable",
+      );
+      setRunModeLoaded(true);
+    }
+  }, [path, requiredInfrastructure.length]);
+
+  useEffect(() => {
+    void refresh();
+    return () => {
+      statusRequest.current += 1;
+    };
+  }, [refresh]);
+
+  useEffect(() => {
+    if (
+      settingsLoaded &&
+      localMilestone !== "success" &&
+      preview?.services.length &&
+      preview.services.every((service) => service.running)
+    ) {
+      onMilestoneChange("success");
+      clearLastLocalIssue();
+    }
+  }, [
+    clearLastLocalIssue,
+    localMilestone,
+    onMilestoneChange,
+    preview,
+    settingsLoaded,
+  ]);
+
+  useEffect(() => {
+    if (!configReady) return;
+    setBlocker((current) =>
+      current.startsWith("本机配置还没有保存") ||
+      current.startsWith("还有必填配置没有值")
+        ? ""
+        : current,
+    );
+  }, [configReady]);
+
+  useEffect(() => {
+    if (startStartedAt === null) return;
+    const updateElapsed = () => {
+      setStartElapsedSeconds(
+        Math.max(0, Math.floor((Date.now() - startStartedAt) / 1000)),
+      );
+    };
+    updateElapsed();
+    const interval = window.setInterval(updateElapsed, 1000);
+    return () => window.clearInterval(interval);
+  }, [startStartedAt]);
+
+  const statusLoaded =
+    previewChecked && (!requiredInfrastructure.length || infrastructureChecked);
+  const allServicesRunning = Boolean(
+    preview?.services.length &&
+    preview.services.every((service) => service.running),
+  );
+  const someServicesRunning = Boolean(
+    preview?.services.some((service) => service.running),
+  );
+  const runnableServices =
+    preview?.services.filter(
+      (service) => service.buildStrategy !== "needs_input",
+    ) ?? [];
+  const runnableServiceCount = runnableServices.length;
+  const blockedServiceCount =
+    (preview?.services.length ?? 0) - runnableServiceCount;
+  const allRunnableServicesRunning = Boolean(
+    runnableServiceCount &&
+    runnableServices.every((service) => service.running),
+  );
+  const retryingUnexplainedFailure = Boolean(
+    localMilestone === "warning" &&
+    lastLocalIssueLoaded &&
+    !lastLocalIssue &&
+    !someServicesRunning,
+  );
+  const bulkStartLabel = retryingUnexplainedFailure
+    ? blockedServiceCount
+      ? `重新启动可运行的 ${runnableServiceCount} 个服务`
+      : "重新启动并记录原因"
+    : blockedServiceCount
+      ? `启动可运行的 ${runnableServiceCount} 个服务`
+      : "一键启动全部";
+  const bulkStartHint = retryingUnexplainedFailure
+    ? blockedServiceCount
+      ? "可以逐个重试，也可以一次重新启动可运行服务；本轮失败会保留原因。"
+      : "可以逐个重试，也可以一次重新启动全部服务；本轮失败会保留原因。"
+    : "";
+  const infrastructureReady = requiredInfrastructure.every((service) =>
+    service === "postgres"
+      ? infrastructure?.postgresRunning
+      : infrastructure?.redisRunning,
+  );
+  const developmentMode = runMode === "development";
+
+  async function selectRunMode(next: "stable" | "development") {
+    if (preview?.services.some((service) => service.running)) {
+      setBlocker("请先停止全部项目服务，再切换运行方式。");
+      return;
+    }
+    setWorking("run-mode");
+    setBlocker("");
+    try {
+      if (next === "development") {
+        setDevelopmentSupport(await prepareLocalDevelopment(path));
+      }
+      setRunMode(next);
+      await setAppSetting(
+        `project.${encodeURIComponent(path)}.local-run-mode`,
+        next,
+      );
+    } catch (error) {
+      const message = `切换运行方式未完成：${toMessage(error)}`;
+      setBlocker(message);
+      onError(message);
+    } finally {
+      setWorking("");
+    }
+  }
+
+  async function runProjectAction(
+    id: string,
+    actionLabel: string,
+    action: () => Promise<LocalPreviewStatus>,
+    recordsStartResult = false,
+    retry?: LocalStartRetry,
+  ) {
+    setWorking(id);
+    setWorkingOperation(recordsStartResult ? "start" : "stop");
+    setBlocker("");
+    setNotice("");
+    setPortConflict(null);
+    if (recordsStartResult) {
+      setStartStartedAt(Date.now());
+      setStartElapsedSeconds(0);
+      setCancellingStart(false);
+    }
+    try {
+      const nextPreview = await action();
+      setPreview(nextPreview);
+      if (
+        recordsStartResult &&
+        nextPreview.services.some((service) => service.running)
+      ) {
+        onMilestoneChange(
+          nextPreview.services.every((service) => service.running)
+            ? "success"
+            : "idle",
+        );
+        clearLastLocalIssue();
+      }
+    } catch (error) {
+      const rawMessage = toMessage(error);
+      const issue = issueFromUnknown(rawMessage);
+      setPortConflict(managedPortConflict(issue.code, issue.message, retry));
+      if (issue.code === "AD-LOC-118") {
+        setNotice("已经停止这次启动，原来正在运行的其他服务不会受影响。");
+        return;
+      }
+      if (recordsStartResult) {
+        onMilestoneChange("warning");
+        const storedIssue: StoredLocalIssue = {
+          code: issue.code,
+          nextStep:
+            issue.nextSteps[0] || "处理上次提示的问题后，重新启动项目服务",
+          recordedAt: new Date().toISOString(),
+          summary:
+            issue.code === "AD-LOC-112"
+              ? issue.message.slice(0, 400)
+              : undefined,
+          title: issue.title,
+        };
+        setLastLocalIssue(storedIssue);
+        void setAppSetting(
+          lastLocalIssueKey,
+          JSON.stringify(storedIssue),
+        ).catch(() => undefined);
+      }
+      const message = `${actionLabel}未完成：${issue.message}`;
+      setBlocker(message);
+      onError(rawMessage);
+    } finally {
+      setWorking("");
+      setWorkingOperation("idle");
+      if (recordsStartResult) {
+        setStartStartedAt(null);
+        setCancellingStart(false);
+      }
+    }
+  }
+
+  async function cancelStart() {
+    setCancellingStart(true);
+    try {
+      const accepted = await cancelLocalPreviewStart(path);
+      if (!accepted) {
+        setBlocker("本次启动刚刚已经结束，正在刷新最新运行状态。");
+        setPreview(await getLocalPreviewStatus(path));
+        setWorking("");
+        setStartStartedAt(null);
+        setCancellingStart(false);
+      }
+    } catch (error) {
+      const rawMessage = toMessage(error);
+      setBlocker(`停止本次启动未完成：${issueFromUnknown(rawMessage).message}`);
+      onError(rawMessage);
+      setCancellingStart(false);
+    }
+  }
+
+  async function resolvePortConflict() {
+    const conflict = portConflict;
+    if (!conflict) return;
+    setWorking("port-conflict");
+    setBlocker("");
+    try {
+      await stopManagedLocalPortOwner(conflict.port);
+      setPortConflict(null);
+      if (conflict.retry.kind === "all") await startAll();
+      else await startService(conflict.retry.serviceId);
+    } catch (error) {
+      const rawMessage = toMessage(error);
+      const issue = issueFromUnknown(rawMessage);
+      setBlocker(`自动处理端口冲突未完成：${issue.message}`);
+      onError(rawMessage);
+    } finally {
+      setWorking("");
+    }
+  }
+
+  function scrollToNecessaryConfig() {
+    const section = document.getElementById("necessary-config");
+    if (typeof section?.scrollIntoView === "function") {
+      section.scrollIntoView({ behavior: "smooth" });
+    }
+  }
+
+  async function startAll() {
+    if (!configReady) {
+      setBlocker(
+        preview?.envReady === false
+          ? "本机配置还没有保存。先补齐必要配置并点击“保存本机配置”，系统会自动生成项目运行配置文件。"
+          : "还有必填配置没有值。先补齐必要配置，再启动项目服务。",
+      );
+      scrollToNecessaryConfig();
+      return;
+    }
+    if (!infrastructureReady && requiredInfrastructure.length) {
+      setBlocker(
+        "项目需要的运行依赖尚未启动。先准备运行依赖，再启动项目服务。",
+      );
+      return;
+    }
+    await runProjectAction(
+      "all",
+      retryingUnexplainedFailure ? "重新启动项目服务" : "启动全部项目服务",
+      () => startLocalPreview(path, developmentMode),
+      true,
+      { kind: "all" },
+    );
+  }
+
+  async function startService(serviceId: string) {
+    if (!configReady) {
+      setBlocker(
+        preview?.envReady === false
+          ? "本机配置还没有保存。先补齐必要配置并点击“保存本机配置”，系统会自动生成项目运行配置文件。"
+          : "还有必填配置没有值。先补齐必要配置，再启动这个服务。",
+      );
+      scrollToNecessaryConfig();
+      return;
+    }
+    if (!infrastructureReady && requiredInfrastructure.length) {
+      setBlocker(
+        "项目需要的运行依赖尚未启动。先准备运行依赖，再启动这个服务。",
+      );
+      return;
+    }
+    const index = workspace.inspection.services.findIndex(
+      (service) => service.id === serviceId,
+    );
+    const service = workspace.inspection.services[index];
+    const label = serviceDisplayName(
+      serviceId,
+      service?.kind ?? "",
+      Math.max(index, 0),
+      workspace.inspection.services.length,
+    );
+    await runProjectAction(
+      serviceId,
+      `启动${label}`,
+      () => startLocalPreviewService(path, serviceId, developmentMode),
+      true,
+      { kind: "service", serviceId },
+    );
+  }
+
+  async function toggleInfrastructure(
+    service: "postgres" | "redis",
+    running: boolean,
+  ) {
+    setWorking(service);
+    setBlocker("");
+    try {
+      setInfrastructure(await setLocalInfrastructureService(service, running));
+    } catch (error) {
+      const label = service === "postgres" ? "本地数据库" : "缓存服务";
+      const message = `${running ? "启动" : "停止"}${label}未完成：${toMessage(error)}`;
+      setBlocker(message);
+      onError(message);
+    } finally {
+      setWorking("");
+    }
+  }
+
+  async function prepareInfrastructure() {
+    setWorking("infrastructure");
+    setBlocker("");
+    try {
+      setInfrastructure(await prepareLocalInfrastructure());
+    } catch (error) {
+      const message = `准备运行依赖未完成：${toMessage(error)}`;
+      setBlocker(message);
+      onError(message);
+    } finally {
+      setWorking("");
+    }
+  }
+
+  async function copyProblem() {
+    const details = [
+      "请修复这个项目的本机启动问题。",
+      `项目目录：${path}`,
+      blocker ? `错误摘要：${blocker}` : "错误摘要：项目服务无法完整启动",
+      lastLocalIssue
+        ? `上次原因：${lastLocalIssue.summary || lastLocalIssue.title}`
+        : "",
+      lastLocalIssue?.nextStep ? `建议处理：${lastLocalIssue.nextStep}` : "",
+      `项目服务：${workspace.inspection.services.map((service) => service.id).join(", ")}`,
+      "请保留现有部署配置和环境变量名称，不要提交真实密钥。",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    try {
+      await writeText(details);
+    } catch {
+      onError("无法复制问题信息，请稍后重试");
+    }
+  }
+
+  const secretVariables = workspace.inspection.environment_variables
+    .filter((variable) => variable.secret)
+    .map((variable) => variable.name);
+  const runningServiceCount =
+    preview?.services.filter((service) => service.running).length ?? 0;
+  const localRetryHint = someServicesRunning
+    ? "可以在项目服务中继续启动未运行的服务。"
+    : `可以使用下方“${bulkStartLabel}”重新尝试。`;
+  const localRecoveryMessage = lastLocalIssue
+    ? `${runningServiceCount ? `当前 ${runningServiceCount}/${preview?.services.length ?? workspace.inspection.services.length} 个服务正在运行。` : "当前项目服务均未启动。"} 上次原因：${lastLocalIssue.summary || lastLocalIssue.title}。${lastLocalIssue.nextStep}`
+    : `${runningServiceCount ? `当前 ${runningServiceCount}/${preview?.services.length ?? workspace.inspection.services.length} 个服务正在运行。` : "当前项目服务均未启动。"} 上次没有留下可用原因。${someServicesRunning ? localRetryHint : `点击下方“${bulkStartLabel}”；如果仍然失败，页面会保留原因和下一步。`}`;
+  const lastIssueNeedsDevelopment = Boolean(
+    lastLocalIssue &&
+    ["AD-LOC-111", "AD-LOC-112", "AD-LOC-113", "AD-LOC-115"].includes(
+      lastLocalIssue.code,
+    ),
+  );
+  const recognizedServiceCount = workspace.inspection.services.length;
+  const visibleServices = preview?.services ?? workspace.inspection.services;
+
+  return (
+    <div>
+      <PageHeading
+        description="快捷启动、停止项目服务，并检查后续部署需要的配置。"
+        title="在本机运行"
+      />
+      {showRecognitionSummary ? (
+        <div
+          className={`mb-5 flex items-start justify-between gap-5 rounded-lg border px-4 py-3 ${recognizedServiceCount ? "border-[var(--success)]/25 bg-[var(--success-soft)]" : "border-[var(--warning)]/30 bg-[var(--warning-soft)]"}`}
+          role="status"
+        >
+          <div className="flex items-start gap-3">
+            {recognizedServiceCount ? (
+              <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-[var(--success)]" />
+            ) : (
+              <AlertCircle className="mt-0.5 size-4 shrink-0 text-[var(--warning)]" />
+            )}
+            <div>
+              <strong className="text-sm">
+                {recognizedServiceCount ? "项目识别完成" : "没有识别到项目服务"}
+              </strong>
+              <p className="mb-0 mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
+                {recognizedServiceCount
+                  ? `发现 ${recognizedServiceCount} 个项目服务。准备上线只需完成一次设置；本机运行不是上线前置条件。`
+                  : "这通常是文件夹层级不对。请选择包含前后端等完整代码的最外层文件夹。"}
+              </p>
+            </div>
+          </div>
+          <Button
+            onClick={
+              recognizedServiceCount ? onPrepareDeployment : onReselectProject
+            }
+            size="sm"
+            variant="secondary"
+          >
+            {recognizedServiceCount ? "准备上线" : "重新选择文件夹"}
+          </Button>
+        </div>
+      ) : null}
+      {!statusLoaded ? (
+        <div className="mb-5 flex items-center gap-2 rounded-md bg-[var(--muted)] px-3 py-2 text-xs text-[var(--muted-foreground)]">
+          <LoaderCircle className="size-3.5 shrink-0 animate-spin-slow text-[var(--accent)]" />
+          正在读取本机状态，项目内容已经可以查看
+        </div>
+      ) : null}
+      {runModeLoaded && developmentSupport?.available ? (
+        <section className="mb-5">
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <strong className="text-sm font-medium">运行方式</strong>
+            <span className="text-xs text-[var(--muted-foreground)]">
+              只影响本机
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <ChoiceCard
+              checked={runMode === "stable"}
+              description="接近正式环境，修改代码后需要重新启动"
+              label="稳定运行"
+              onClick={() => void selectRunMode("stable")}
+            />
+            <ChoiceCard
+              checked={runMode === "development"}
+              description="修改代码后自动重启或刷新页面"
+              label="开发调试"
+              onClick={() => void selectRunMode("development")}
+            />
+          </div>
+        </section>
+      ) : null}
+      {blocker ? (
+        <IssueBanner
+          action={
+            blocker.startsWith("本机状态没有完整读取") ? (
+              <Button
+                onClick={() => void refresh()}
+                size="sm"
+                variant="secondary"
+              >
+                <RefreshCw />
+                重新读取状态
+              </Button>
+            ) : blocker.startsWith("本机配置还没有保存") ? (
+              <Button
+                onClick={scrollToNecessaryConfig}
+                size="sm"
+                variant="secondary"
+              >
+                去保存配置
+              </Button>
+            ) : portConflict ? (
+              <Button
+                disabled={working === "port-conflict"}
+                onClick={() => void resolvePortConflict()}
+                size="sm"
+                variant="secondary"
+              >
+                {working === "port-conflict" ? (
+                  <LoaderCircle className="animate-spin-slow" />
+                ) : (
+                  <Square />
+                )}
+                停止 {portConflict.owner} 并继续
+              </Button>
+            ) : (
+              <Button
+                onClick={() => void copyProblem()}
+                size="sm"
+                variant="secondary"
+              >
+                <Copy />
+                {lastIssueNeedsDevelopment ? "复制给开发工具" : "复制问题信息"}
+              </Button>
+            )
+          }
+          message={blocker}
+          title="项目还没有完整运行"
+        />
+      ) : notice ? (
+        <NoticeBanner message={notice} title="已停止本次启动" />
+      ) : allServicesRunning && infrastructureReady && configReady ? (
+        <SuccessBanner
+          message="项目服务、运行依赖和必要配置均已准备。"
+          title="项目已经可以打开"
+        />
+      ) : localMilestone === "warning" && lastLocalIssueLoaded ? (
+        <IssueBanner
+          action={
+            lastIssueNeedsDevelopment ? (
+              <Button
+                onClick={() => void copyProblem()}
+                size="sm"
+                variant="secondary"
+              >
+                <Copy />
+                复制给开发工具
+              </Button>
+            ) : null
+          }
+          message={localRecoveryMessage}
+          title="上次启动没有完成"
+        />
+      ) : null}
+
+      <div id="project-services">
+        <Section
+          title="项目服务"
+          trailing={
+            visibleServices.length === 0 && previewChecked
+              ? "未识别"
+              : preview
+                ? `${preview.services.filter((service) => service.running).length}/${preview.services.length} 运行中`
+                : previewChecked
+                  ? "状态未知"
+                  : "正在读取"
+          }
+        >
+          <div className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
+            {visibleServices.length ? (
+              visibleServices.map((service, index, list) => {
+                const planned = "running" in service ? service : null;
+                const checking = planned === null && !previewChecked;
+                const unknown = planned === null && previewChecked;
+                const running = planned?.running ?? false;
+                const blocked = planned?.buildStrategy === "needs_input";
+                const displayName = serviceDisplayName(
+                  service.id,
+                  service.kind,
+                  index,
+                  list.length,
+                );
+                const starting =
+                  workingOperation === "start" &&
+                  (working === service.id || (working === "all" && !running));
+                const stopping =
+                  workingOperation === "stop" &&
+                  (working === service.id ||
+                    (working === "stop-all" && running));
+                return (
+                  <StatusRow
+                    action={
+                      checking || unknown ? undefined : blocked ? (
+                        <Button
+                          aria-label={`把${displayName}交给开发工具`}
+                          onClick={() => void copyProblem()}
+                          size="sm"
+                          variant="secondary"
+                        >
+                          交给开发工具
+                        </Button>
+                      ) : running ? (
+                        <>
+                          {planned?.url ? (
+                            <Button
+                              aria-label={`打开${displayName}`}
+                              onClick={() => openUrl(planned.url ?? "")}
+                              size="sm"
+                              variant="ghost"
+                            >
+                              <ArrowUpRight />
+                              打开
+                            </Button>
+                          ) : null}
+                          <Button
+                            aria-label={
+                              stopping
+                                ? `正在停止${displayName}`
+                                : `停止${displayName}`
+                            }
+                            disabled={Boolean(working)}
+                            onClick={() =>
+                              void runProjectAction(
+                                service.id,
+                                `停止${displayName}`,
+                                () => stopLocalPreviewService(path, service.id),
+                              )
+                            }
+                            size="sm"
+                            variant="secondary"
+                          >
+                            {stopping ? (
+                              <LoaderCircle className="animate-spin-slow" />
+                            ) : null}
+                            {stopping ? "正在停止" : "停止"}
+                          </Button>
+                          <Button
+                            aria-label={`重新启动${displayName}`}
+                            disabled={Boolean(working)}
+                            onClick={() =>
+                              void runProjectAction(
+                                service.id,
+                                `重新启动${displayName}`,
+                                () =>
+                                  startLocalPreviewService(
+                                    path,
+                                    service.id,
+                                    developmentMode,
+                                  ),
+                                true,
+                              )
+                            }
+                            size="sm"
+                            variant="secondary"
+                          >
+                            重新启动
+                          </Button>
+                        </>
+                      ) : (
+                        <Button
+                          aria-label={
+                            starting
+                              ? `正在启动${displayName}`
+                              : `启动${displayName}`
+                          }
+                          disabled={Boolean(working)}
+                          onClick={() => void startService(service.id)}
+                          size="sm"
+                          variant="secondary"
+                        >
+                          {starting ? (
+                            <LoaderCircle className="animate-spin-slow" />
+                          ) : (
+                            <Play />
+                          )}
+                          {starting ? "正在启动" : "启动"}
+                        </Button>
+                      )
+                    }
+                    detail={
+                      checking
+                        ? "正在读取上次运行状态"
+                        : unknown
+                          ? "暂时没有读取到这个服务的运行状态"
+                          : starting
+                            ? `正在构建并启动 · 已等待 ${formatElapsed(startElapsedSeconds)}`
+                            : stopping
+                              ? "正在停止，只影响当前选择的项目服务"
+                              : blocked
+                                ? "项目缺少可靠运行配置，需要回到开发工具修复"
+                                : running
+                                  ? developmentMode
+                                    ? "正在监听代码修改"
+                                    : "上次启动成功"
+                                  : developmentMode
+                                    ? "启动后自动刷新"
+                                    : localMilestone === "success"
+                                      ? "上次随全部服务启动成功"
+                                      : "等待启动"
+                    }
+                    key={service.id}
+                    label={displayName}
+                    state={
+                      checking
+                        ? "active"
+                        : unknown
+                          ? "warning"
+                          : starting
+                            ? "active"
+                            : stopping
+                              ? "active"
+                              : blocked
+                                ? "warning"
+                                : running
+                                  ? "success"
+                                  : "idle"
+                    }
+                    status={
+                      checking
+                        ? "正在读取"
+                        : unknown
+                          ? "状态未知"
+                          : starting
+                            ? "正在准备"
+                            : stopping
+                              ? "正在停止"
+                              : blocked
+                                ? "需要开发处理"
+                                : running
+                                  ? "运行中"
+                                  : "未启动"
+                    }
+                  />
+                );
+              })
+            ) : (
+              <div className="px-4 py-6 text-sm text-[var(--muted-foreground)]">
+                没有找到可管理的项目服务。请重新选择包含完整项目代码的最外层文件夹。
+              </div>
+            )}
+            {visibleServices.length ? (
+              <div className="flex items-center justify-between gap-3 border-t border-[var(--border)] bg-[var(--muted)]/35 px-4 py-3 max-[760px]:flex-col max-[760px]:items-stretch">
+                <span className="text-[11px] text-[var(--muted-foreground)]">
+                  {startStartedAt === null
+                    ? preview
+                      ? retryingUnexplainedFailure
+                        ? bulkStartHint
+                        : blockedServiceCount
+                          ? runnableServiceCount === 0
+                            ? `当前 ${blockedServiceCount} 个服务都需要开发工具补齐运行配置；处理后回到这里启动。`
+                            : allRunnableServicesRunning
+                              ? `可运行的 ${runnableServiceCount} 个服务已经启动；另有 ${blockedServiceCount} 个需要开发工具处理。`
+                              : `可以逐个启动，也可以一次启动 ${runnableServiceCount} 个可运行服务；另有 ${blockedServiceCount} 个需要开发工具处理。`
+                          : allRunnableServicesRunning
+                            ? "全部项目服务正在运行，也可以逐个或一次停止。"
+                            : someServicesRunning
+                              ? "可以逐个控制，也可以一次启动未运行的服务或停止全部服务。"
+                              : "可以逐个启动，也可以一次启动全部服务。"
+                      : previewChecked
+                        ? "重新读取状态后即可启动或停止服务。"
+                        : "状态读取完成后即可启动或停止服务。"
+                    : `首次构建可能需要几分钟，已有进展会继续等待 · ${formatElapsed(startElapsedSeconds)}`}
+                </span>
+                <div className="flex flex-wrap justify-end gap-2">
+                  {startStartedAt !== null ? (
+                    <Button
+                      disabled={cancellingStart}
+                      onClick={() => void cancelStart()}
+                      size="sm"
+                      variant="secondary"
+                    >
+                      {cancellingStart ? (
+                        <LoaderCircle className="animate-spin-slow" />
+                      ) : (
+                        <Square />
+                      )}
+                      {cancellingStart ? "正在停止" : "停止本次启动"}
+                    </Button>
+                  ) : null}
+                  {startStartedAt === null && preview && someServicesRunning ? (
+                    <Button
+                      disabled={Boolean(working)}
+                      onClick={() =>
+                        void runProjectAction(
+                          "stop-all",
+                          "停止全部项目服务",
+                          () => stopLocalPreview(path),
+                        )
+                      }
+                      size="sm"
+                      variant="secondary"
+                    >
+                      <Square />
+                      全部停止
+                    </Button>
+                  ) : null}
+                  {startStartedAt === null &&
+                  preview &&
+                  runnableServiceCount > 0 &&
+                  !allRunnableServicesRunning ? (
+                    <Button
+                      disabled={Boolean(working)}
+                      onClick={() => void startAll()}
+                      size="sm"
+                    >
+                      {working === "all" ? (
+                        <LoaderCircle className="animate-spin-slow" />
+                      ) : (
+                        <Play />
+                      )}
+                      {working === "all"
+                        ? blockedServiceCount
+                          ? "正在启动可运行服务"
+                          : "正在启动全部"
+                        : bulkStartLabel}
+                    </Button>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </Section>
+      </div>
+
+      <Section
+        title="运行依赖"
+        trailing={
+          requiredInfrastructure.length
+            ? infrastructure
+              ? `${requiredInfrastructure.filter((service) => (service === "postgres" ? infrastructure.postgresRunning : infrastructure.redisRunning)).length}/${requiredInfrastructure.length} 运行中`
+              : infrastructureChecked
+                ? "状态未知"
+                : "正在读取"
+            : "项目未声明"
+        }
+      >
+        <div className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
+          {requiredInfrastructure.length ? (
+            requiredInfrastructure.map((service) => {
+              const displayName =
+                service === "postgres" ? "本地数据库" : "缓存服务";
+              const checking =
+                infrastructure === null && !infrastructureChecked;
+              const unknown = infrastructure === null && infrastructureChecked;
+              const running =
+                service === "postgres"
+                  ? infrastructure?.postgresRunning
+                  : infrastructure?.redisRunning;
+              return (
+                <StatusRow
+                  action={
+                    checking || unknown ? undefined : infrastructure?.state ===
+                        "not_prepared" || running ? undefined : (
+                      <Button
+                        aria-label={`启动${displayName}`}
+                        disabled={Boolean(working)}
+                        onClick={() => void toggleInfrastructure(service, true)}
+                        size="sm"
+                        variant="secondary"
+                      >
+                        启动
+                      </Button>
+                    )
+                  }
+                  detail={
+                    checking
+                      ? "正在读取运行依赖状态"
+                      : unknown
+                        ? "暂时没有读取到运行依赖状态"
+                        : running
+                          ? "已启动，可以连接；由 ABCDeploy 统一维护"
+                          : "项目服务启动前需要先运行"
+                  }
+                  key={service}
+                  label={displayName}
+                  state={
+                    checking
+                      ? "active"
+                      : unknown
+                        ? "warning"
+                        : running
+                          ? "success"
+                          : "idle"
+                  }
+                  status={
+                    checking
+                      ? "正在读取"
+                      : unknown
+                        ? "状态未知"
+                        : running
+                          ? "运行正常"
+                          : "未启动"
+                  }
+                />
+              );
+            })
+          ) : (
+            <div className="px-4 py-5 text-sm text-[var(--muted-foreground)]">
+              项目没有声明需要单独启动的数据库或缓存服务。
+            </div>
+          )}
+          {requiredInfrastructure.length &&
+          infrastructure?.state === "not_prepared" ? (
+            <div className="flex justify-end border-t border-[var(--border)] px-4 py-3">
+              <Button
+                disabled={Boolean(working)}
+                onClick={() => void prepareInfrastructure()}
+                size="sm"
+              >
+                {working === "infrastructure" ? (
+                  <LoaderCircle className="animate-spin-slow" />
+                ) : (
+                  <Database />
+                )}
+                自动准备运行依赖
+              </Button>
+            </div>
+          ) : null}
+        </div>
+      </Section>
+
+      <section className="mt-7" id="necessary-config">
+        <RuntimeConfigFields
+          environment="development"
+          onError={(message) => setBlocker(message)}
+          onMarkOptional={(key) =>
+            onSaveManifest(
+              runtimeVariableOptionalManifest(workspace.manifestYaml, key),
+            )
+          }
+          onReadyChange={setConfigReady}
+          path={path}
+          secretVariables={secretVariables}
+        />
+      </section>
+    </div>
+  );
+}
+
+function VersionScene({
+  initialServer,
+  initialStartRequested,
+  onError,
+  onOpenProduction,
+  onOpenTest,
+  onSaveManifest,
+  onServerChange,
+  onSetupProgressChange,
+  onSync,
+  path,
+  productionRun,
+  productionSourceKey,
+  productionWebSaveSourceKey,
+  runs,
+  saving,
+  testSourceKey,
+  verifiedRunIds,
+  workspace,
+}: {
+  initialServer?: ServerForm;
+  initialStartRequested: boolean;
+  onError: (message: string) => void;
+  onOpenProduction: (run: DeploymentRun) => void;
+  onOpenTest: () => void;
+  onSaveManifest: (manifestYaml: string) => Promise<boolean>;
+  onServerChange: (server: ServerForm) => void;
+  onSetupProgressChange?: () => void;
+  onSync: () => Promise<void>;
+  path: string;
+  productionRun?: DeploymentRun;
+  productionSourceKey: string;
+  productionWebSaveSourceKey: string;
+  runs: DeploymentRun[];
+  saving: boolean;
+  testSourceKey: string;
+  verifiedRunIds: string[];
+  workspace: WorkspacePreview;
+}) {
+  const [showSetup, setShowSetup] = useState(true);
+  const [setupLoaded, setSetupLoaded] = useState(false);
+  const [setupStarted, setSetupStarted] = useState(false);
+  const [openStep, setOpenStep] = useState<VersionSetupStep | "">("repository");
+  const [repository, setRepository] = useState(() => {
+    const configured = readRepository(workspace.manifestYaml);
+    return usableRepository(configured)
+      ? configured
+      : (runs[0]?.repository ?? configured);
+  });
+  const [repositoryReady, setRepositoryReady] = useState(() =>
+    usableRepository(repository),
+  );
+  const [registryReady, setRegistryReady] = useState(false);
+  const [registryChecking, setRegistryChecking] = useState(true);
+  const [server, setServer] = useState<ServerForm | undefined>(initialServer);
+  const [runtimeConfigFieldChecking, setRuntimeConfigFieldChecking] =
+    useState(false);
+  const {
+    addressReady,
+    cloudConfigReady,
+    runtimeConfigReady,
+    setAddressReady,
+    setCloudConfigReady,
+    setRuntimeConfigReady,
+  } = useStagingPreparationStatus(path, server, workspace);
+  const [syncing, setSyncing] = useState(false);
+  const [syncBlocker, setSyncBlocker] = useState("");
+  const [lastSyncedAt, setLastSyncedAt] = useState("");
+  const [foundationsExpanded, setFoundationsExpanded] = useState(false);
+  const [testEnvironmentReviewResolved, setTestEnvironmentReviewResolved] =
+    useState(false);
+  const [detailRun, setDetailRun] = useState<DeploymentRun | null>(null);
+  const [incompleteOpen, setIncompleteOpen] = useState(false);
+  const syncedProject = useRef("");
+  const automaticRegistryReuseStarted = useRef(false);
+  const automaticSetupFinishStarted = useRef(false);
+  const setupOpenStepAligned = useRef("");
+  const setupKey = `project.${encodeURIComponent(path)}.version-setup-complete`;
+  const setupActiveKey = `project.${encodeURIComponent(path)}.version-setup-active`;
+  const setupStepKey = `project.${encodeURIComponent(path)}.version-setup-step`;
+  const hasDeploymentHistory = runs.length > 0;
+
+  useEffect(() => setServer(initialServer), [initialServer]);
+  useEffect(() => {
+    const configured = readRepository(workspace.manifestYaml);
+    const next = usableRepository(configured)
+      ? configured
+      : (runs[0]?.repository ?? configured);
+    setRepository(next);
+    setRepositoryReady(usableRepository(next));
+  }, [runs, workspace.manifestYaml]);
+  useEffect(() => {
+    const registry = readRegistry(workspace.manifestYaml);
+    if (registry.kind === "cnb") {
+      // CNB stores images alongside the real code repository. A placeholder
+      // such as `owner/project` is only a template value, not a usable version
+      // location, so it must not make the second setup step look complete.
+      setRegistryReady(repositoryReady);
+      setRegistryChecking(false);
+      return;
+    }
+    let active = true;
+    setRegistryChecking(true);
+    const prefix = registry.kind === "tcr" ? "registry.tcr.v2" : "registry.oci";
+    Promise.all([
+      getSecretStatus(`${prefix}.username`),
+      getSecretStatus(`${prefix}.password`),
+      getAppSetting(registryVerificationKey(prefix)),
+    ])
+      .then(([username, password, verifiedEndpoint]) => {
+        const ready =
+          username.stored &&
+          password.stored &&
+          verifiedEndpoint === registry.endpoint;
+        if (active) setRegistryReady(ready);
+        if (ready && registry.kind === "tcr") {
+          void rememberTcrPreference(registry.namespace).catch(() => undefined);
+        }
+      })
+      .catch(() => {
+        if (active) setRegistryReady(false);
+      })
+      .finally(() => {
+        if (active) setRegistryChecking(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [repositoryReady, workspace.manifestYaml]);
+  useEffect(() => {
+    const registry = readRegistry(workspace.manifestYaml);
+    if (
+      !setupStarted ||
+      registry.kind !== "cnb" ||
+      workspace.manifestExists ||
+      automaticRegistryReuseStarted.current
+    )
+      return;
+    automaticRegistryReuseStarted.current = true;
+    let active = true;
+    Promise.all([
+      getAppSetting("registry.mode"),
+      getAppSetting("registry.tcr.namespace"),
+      getSecretStatus("registry.tcr.v2.username"),
+      getSecretStatus("registry.tcr.v2.password"),
+      getAppSetting(registryVerificationKey("registry.tcr.v2")),
+    ])
+      .then(([mode, namespace, user, secret, verifiedEndpoint]) => {
+        if (
+          !active ||
+          mode !== "tcr" ||
+          !namespace?.trim() ||
+          !user.stored ||
+          !secret.stored ||
+          verifiedEndpoint !== "ccr.ccs.tencentyun.com"
+        )
+          return;
+        return checkSavedRegistryCredentials(
+          "ccr.ccs.tencentyun.com",
+          "registry.tcr.v2",
+        ).then(async (check) => {
+          if (!active) return;
+          if (!check.ok) {
+            if (check.retryable === false) {
+              await setAppSetting(
+                registryVerificationKey("registry.tcr.v2"),
+                "",
+              );
+            }
+            return;
+          }
+          return onSaveManifest(
+            tcrRegistryManifest(workspace.manifestYaml, namespace.trim()),
+          );
+        });
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [
+    onSaveManifest,
+    setupStarted,
+    workspace.manifestExists,
+    workspace.manifestYaml,
+  ]);
+  useEffect(() => {
+    Promise.all([getAppSetting(setupKey), getAppSetting(setupActiveKey)])
+      .then(([value, activeSetup]) => {
+        setShowSetup(value !== "true" && runs.length === 0);
+        setSetupStarted(initialStartRequested || activeSetup === "true");
+      })
+      .catch(() => {
+        setShowSetup(true);
+        setSetupStarted(initialStartRequested);
+      })
+      .finally(() => setSetupLoaded(true));
+  }, [initialStartRequested, runs.length, setupActiveKey, setupKey]);
+  useEffect(() => {
+    if (!setupLoaded || showSetup || syncedProject.current === path) return;
+    syncedProject.current = path;
+    void onSync().catch((error) => setSyncBlocker(toMessage(error)));
+  }, [onSync, path, setupLoaded, showSetup]);
+  const testEnvironmentReady =
+    Boolean(server) && runtimeConfigReady === true && addressReady;
+  const hasSuccessfulTestDeployment = runs.some(
+    (run) => run.environment === "staging" && run.status === "success",
+  );
+  const hasTrustedTestEnvironment =
+    hasSuccessfulTestDeployment ||
+    verifiedRunIds.length > 0 ||
+    Boolean(productionSourceKey);
+  const testEnvironmentRestoring =
+    Boolean(server) && runtimeConfigReady === null;
+  const testEnvironmentChecking =
+    runtimeConfigFieldChecking || testEnvironmentRestoring;
+  const displayedTestEnvironmentReady = testEnvironmentDisplayReady(
+    testEnvironmentReady,
+    testEnvironmentChecking,
+    hasTrustedTestEnvironment,
+    testEnvironmentReviewResolved,
+  );
+  const previousTestEnvironmentReady = useRef(testEnvironmentReady);
+  useEffect(() => {
+    const becameReady =
+      testEnvironmentReady && !previousTestEnvironmentReady.current;
+    previousTestEnvironmentReady.current = testEnvironmentReady;
+    if (
+      becameReady &&
+      setupStarted &&
+      showSetup &&
+      !hasDeploymentHistory &&
+      openStep === "test-environment"
+    )
+      setOpenStep("remote");
+  }, [
+    hasDeploymentHistory,
+    openStep,
+    setupStarted,
+    showSetup,
+    testEnvironmentReady,
+  ]);
+  const handleRuntimeConfigReady = useCallback(
+    (next: boolean, checking: boolean) => {
+      setRuntimeConfigFieldChecking(checking);
+      if (!checking) {
+        setRuntimeConfigReady(next);
+        setTestEnvironmentReviewResolved(true);
+      }
+    },
+    [setRuntimeConfigReady],
+  );
+  const ready =
+    repositoryReady &&
+    registryReady &&
+    testEnvironmentReady &&
+    cloudConfigReady;
+  const completed = [
+    repositoryReady,
+    registryReady,
+    displayedTestEnvironmentReady,
+    cloudConfigReady,
+  ].filter(Boolean).length;
+  const pendingSetupStep: VersionSetupStep = !repositoryReady
+    ? "repository"
+    : !registryReady
+      ? "registry"
+      : !displayedTestEnvironmentReady
+        ? "test-environment"
+        : "remote";
+  const remainingSetupSteps = 4 - completed;
+  const setupChecking = registryChecking || testEnvironmentChecking;
+  const setupProgressLabel = setupChecking
+    ? `${completed} 项已准备 · 后台确认中`
+    : remainingSetupSteps
+      ? `已准备 ${completed} 项 · 还差 ${remainingSetupSteps} 项`
+      : "4 项已准备";
+  const foundationsCollapsed =
+    repositoryReady &&
+    registryReady &&
+    displayedTestEnvironmentReady &&
+    openStep === "remote" &&
+    !foundationsExpanded;
+  useEffect(() => {
+    if (
+      !setupLoaded ||
+      !setupStarted ||
+      !showSetup ||
+      hasDeploymentHistory ||
+      (repositoryReady && registryChecking) ||
+      setupOpenStepAligned.current === path
+    )
+      return;
+    setupOpenStepAligned.current = path;
+    setOpenStep(pendingSetupStep);
+  }, [
+    hasDeploymentHistory,
+    path,
+    pendingSetupStep,
+    registryChecking,
+    repositoryReady,
+    setupLoaded,
+    setupStarted,
+    showSetup,
+  ]);
+  useEffect(() => {
+    if (
+      !setupLoaded ||
+      !setupStarted ||
+      !showSetup ||
+      hasDeploymentHistory ||
+      (repositoryReady && registryChecking)
+    )
+      return;
+    let active = true;
+    void Promise.all([
+      setAppSetting(setupActiveKey, "true"),
+      setAppSetting(setupStepKey, pendingSetupStep),
+    ])
+      .then(() => {
+        if (active) onSetupProgressChange?.();
+      })
+      .catch((error) => {
+        if (!active) return;
+        setSetupStarted(false);
+        onError(`没有保存上线设置进度：${toMessage(error)}`);
+      });
+    return () => {
+      active = false;
+    };
+  }, [
+    hasDeploymentHistory,
+    onError,
+    onSetupProgressChange,
+    pendingSetupStep,
+    registryChecking,
+    repositoryReady,
+    setupActiveKey,
+    setupLoaded,
+    setupStarted,
+    setupStepKey,
+    showSetup,
+  ]);
+  useEffect(() => {
+    if (
+      !setupLoaded ||
+      !setupStarted ||
+      !showSetup ||
+      hasDeploymentHistory ||
+      setupChecking ||
+      !ready ||
+      automaticSetupFinishStarted.current
+    )
+      return;
+    automaticSetupFinishStarted.current = true;
+    void Promise.all([
+      setAppSetting(setupKey, "true"),
+      setAppSetting(setupActiveKey, "false"),
+    ])
+      .then(() => {
+        setShowSetup(false);
+        onSetupProgressChange?.();
+        onOpenTest();
+      })
+      .catch((error) => {
+        automaticSetupFinishStarted.current = false;
+        onError(toMessage(error));
+      });
+  }, [
+    hasDeploymentHistory,
+    onError,
+    onOpenTest,
+    ready,
+    setupChecking,
+    setupActiveKey,
+    setupKey,
+    setupLoaded,
+    setupStarted,
+    showSetup,
+  ]);
+  const previousRegistryChecking = useRef(registryChecking);
+  useEffect(() => {
+    const checkFinished = previousRegistryChecking.current && !registryChecking;
+    previousRegistryChecking.current = registryChecking;
+    if (
+      checkFinished &&
+      setupStarted &&
+      showSetup &&
+      !hasDeploymentHistory &&
+      openStep !== "repository"
+    ) {
+      if (registryReady && openStep === "registry") {
+        setOpenStep(
+          !repositoryReady
+            ? "repository"
+            : testEnvironmentReady
+              ? "remote"
+              : "test-environment",
+        );
+      } else if (!registryReady) {
+        setOpenStep("registry");
+      }
+    }
+  }, [
+    hasDeploymentHistory,
+    openStep,
+    registryChecking,
+    registryReady,
+    repositoryReady,
+    setupStarted,
+    showSetup,
+    testEnvironmentReady,
+  ]);
+
+  async function finishSetup() {
+    if (hasDeploymentHistory) {
+      setShowSetup(false);
+      return;
+    }
+    if (!ready) return;
+    await Promise.all([
+      setAppSetting(setupKey, "true"),
+      setAppSetting(setupActiveKey, "false"),
+    ]);
+    setShowSetup(false);
+    onSetupProgressChange?.();
+    onOpenTest();
+  }
+
+  async function sync() {
+    setSyncing(true);
+    setSyncBlocker("");
+    setLastSyncedAt("");
+    try {
+      await onSync();
+      setLastSyncedAt(
+        new Intl.DateTimeFormat("zh-CN", {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          hour12: false,
+        }).format(new Date()),
+      );
+    } catch (error) {
+      setSyncBlocker(toMessage(error));
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  const syncIssue = syncBlocker ? issueFromUnknown(syncBlocker) : null;
+
+  if (!setupLoaded) {
+    return (
+      <div className="flex min-h-64 items-center justify-center text-sm text-[var(--muted-foreground)]">
+        <LoaderCircle className="mr-2 size-4 animate-spin-slow" />
+        正在读取版本设置
+      </div>
+    );
+  }
+
+  if (showSetup && !hasDeploymentHistory && !setupStarted) {
+    return (
+      <div>
+        <PageHeading
+          description="这里保存每次可以测试或发布的项目版本。首次只需完成一遍设置。"
+          title="管理版本"
+        />
+        <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-6 py-12 text-center">
+          <Tags className="mx-auto size-9 text-[var(--subtle-foreground)]" />
+          <h2 className="mb-0 mt-4 text-lg font-semibold">
+            还没有可部署的版本
+          </h2>
+          <p className="mx-auto mb-5 mt-2 max-w-lg text-sm leading-6 text-[var(--muted-foreground)]">
+            设置完成后，把准备上线的代码合并到项目主分支，系统会自动生成新版本并更新测试版；不会直接发布正式版。
+          </p>
+          <Button onClick={() => setSetupStarted(true)}>
+            <Rocket />
+            准备自动生成版本
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (showSetup) {
+    return (
+      <div>
+        <PageHeading
+          description={
+            hasDeploymentHistory
+              ? "这些设置通常只做一次；修改后，后续版本仍会自动生成。"
+              : "完成后，把准备上线的代码合并到项目主分支，系统会自动生成版本并更新测试版。"
+          }
+          title={hasDeploymentHistory ? "上线设置" : "完成一次上线设置"}
+        />
+        <div className="mb-4 flex justify-end">
+          <span className="rounded-full bg-[var(--muted)] px-3 py-1 text-xs text-[var(--muted-foreground)]">
+            <span className="flex items-center gap-1.5">
+              {setupChecking ? (
+                <LoaderCircle className="size-3 animate-spin-slow" />
+              ) : null}
+              {setupProgressLabel}
+            </span>
+          </span>
+        </div>
+        <div className="space-y-3">
+          {foundationsCollapsed ? (
+            <button
+              className="flex min-h-[56px] w-full items-center justify-between gap-4 rounded-lg border border-[var(--success)]/20 bg-[var(--success-soft)] px-4 text-left outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus)]"
+              onClick={() => setFoundationsExpanded(true)}
+              type="button"
+            >
+              <span className="flex min-w-0 items-center gap-3">
+                <CheckCircle2 className="size-5 shrink-0 text-[var(--success)]" />
+                <span>
+                  <strong className="block text-sm">前 3 项已准备</strong>
+                  <span className="mt-0.5 block text-xs text-[var(--muted-foreground)]">
+                    代码平台、版本文件和测试环境
+                  </span>
+                </span>
+              </span>
+              <span className="shrink-0 text-xs text-[var(--success)]">
+                查看设置 ›
+              </span>
+            </button>
+          ) : (
+            <>
+              <PreparationStep
+                current={pendingSetupStep === "repository"}
+                description="保存项目代码，并自动发现准备上线的更新"
+                done={repositoryReady}
+                index={1}
+                name="连接代码平台"
+                onOpen={() => setOpenStep("repository")}
+                open={openStep === "repository"}
+              >
+                <RepositoryPreparation
+                  onError={onError}
+                  onReady={(next) => {
+                    if (next) setRepository(next);
+                    if (next && !repositoryReady && openStep === "repository")
+                      setOpenStep(
+                        registryReady ||
+                          readRegistry(workspace.manifestYaml).kind === "cnb"
+                          ? testEnvironmentReady
+                            ? "remote"
+                            : "test-environment"
+                          : "registry",
+                      );
+                    setRepositoryReady(Boolean(next));
+                  }}
+                  onSaveManifest={onSaveManifest}
+                  repository={repository}
+                  workspace={workspace}
+                />
+              </PreparationStep>
+              <PreparationStep
+                checking={registryChecking}
+                current={pendingSetupStep === "registry"}
+                description="保存每次可以部署的项目版本"
+                done={registryReady}
+                index={2}
+                name="保存项目版本"
+                onOpen={() => setOpenStep("registry")}
+                open={openStep === "registry"}
+              >
+                {registryChecking ? (
+                  <div className="flex min-h-20 items-center justify-center gap-2 text-sm text-[var(--muted-foreground)]">
+                    <LoaderCircle className="size-4 animate-spin-slow" />
+                    正在确认项目版本保存位置
+                  </div>
+                ) : (
+                  <RegistryPreparation
+                    onError={onError}
+                    onReady={(next) => {
+                      if (next && !registryReady && openStep === "registry")
+                        setOpenStep(
+                          !repositoryReady
+                            ? "repository"
+                            : testEnvironmentReady
+                              ? "remote"
+                              : "test-environment",
+                        );
+                      setRegistryReady(next);
+                    }}
+                    onSaveManifest={onSaveManifest}
+                    readyFromParent={registryReady}
+                    workspace={workspace}
+                  />
+                )}
+              </PreparationStep>
+              <PreparationStep
+                checking={testEnvironmentChecking}
+                current={pendingSetupStep === "test-environment"}
+                description="复用服务器并补齐测试配置"
+                done={displayedTestEnvironmentReady}
+                index={3}
+                name="准备测试环境"
+                onOpen={() => {
+                  setTestEnvironmentReviewResolved(false);
+                  setOpenStep("test-environment");
+                }}
+                open={openStep === "test-environment"}
+              >
+                {!repositoryReady || !registryReady ? (
+                  <SetupDependencyNotice
+                    message="连接代码平台后，系统会自动准备项目版本，再带你连接测试服务器。"
+                    title="先完成前面的项目设置"
+                  />
+                ) : testEnvironmentRestoring ? (
+                  <div className="flex min-h-24 items-center justify-center gap-2 text-sm text-[var(--muted-foreground)]">
+                    <LoaderCircle className="size-4 animate-spin-slow" />
+                    正在恢复已保存的测试环境
+                  </div>
+                ) : (
+                  <div className="space-y-5">
+                    <ServerPreparation
+                      initialServer={server}
+                      onError={onError}
+                      onReady={(next) => {
+                        setServer(next);
+                        onServerChange(next);
+                      }}
+                      path={path}
+                    />
+                    {server ? (
+                      <div className="border-t border-[var(--border)] pt-4">
+                        <RuntimeConfigFields
+                          environment="staging"
+                          onError={onError}
+                          onMarkOptional={(key) =>
+                            onSaveManifest(
+                              runtimeVariableOptionalManifest(
+                                workspace.manifestYaml,
+                                key,
+                              ),
+                            )
+                          }
+                          onReadyChange={handleRuntimeConfigReady}
+                          path={path}
+                          server={server}
+                          secretVariables={workspace.inspection.environment_variables
+                            .filter((item) => item.secret)
+                            .map((item) => item.name)}
+                          verifiedReady={runtimeConfigReady === true}
+                        />
+                      </div>
+                    ) : null}
+                    {server && runtimeConfigReady === true ? (
+                      <div className="border-t border-[var(--border)] pt-4">
+                        <TestAddressPreparation
+                          onReadyChange={setAddressReady}
+                          onSaveManifest={onSaveManifest}
+                          saving={saving}
+                          server={server}
+                          workspace={workspace}
+                        />
+                      </div>
+                    ) : null}
+                  </div>
+                )}
+              </PreparationStep>
+            </>
+          )}
+          <PreparationStep
+            activeLabel="需要你完成"
+            current={pendingSetupStep === "remote"}
+            description="代码合并到主分支后，自动生成版本并更新测试版"
+            done={cloudConfigReady}
+            index={4}
+            name="开启自动部署"
+            onOpen={() => setOpenStep("remote")}
+            open={openStep === "remote"}
+          >
+            {!repositoryReady ||
+            !registryReady ||
+            !displayedTestEnvironmentReady ? (
+              <SetupDependencyNotice
+                message="系统会依次带你完成代码平台、项目版本和测试环境；准备好后再开启自动部署。"
+                title="先完成前面的上线设置"
+              />
+            ) : (
+              <CnbSecretSetup
+                environment="staging"
+                onError={onError}
+                onProgressChange={onSetupProgressChange}
+                onReadyChange={setCloudConfigReady}
+                onSaveManifest={onSaveManifest}
+                path={path}
+                runtimeReady={runtimeConfigReady === true && registryReady}
+                server={server}
+                workspace={workspace}
+              />
+            )}
+          </PreparationStep>
+        </div>
+        <div className="mt-6 flex justify-end border-t border-[var(--border)] pt-5">
+          {hasDeploymentHistory ? (
+            <Button onClick={() => void finishSetup()}>
+              <Check />
+              返回版本列表
+            </Button>
+          ) : ready ? (
+            <span className="flex items-center gap-2 text-sm text-[var(--muted-foreground)]">
+              <LoaderCircle className="size-4 animate-spin-slow" />
+              设置完成，正在打开测试版
+            </span>
+          ) : (
+            <span className="text-sm text-[var(--muted-foreground)]">
+              系统会依次带你完成剩余设置，全部完成后自动进入测试版
+            </span>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  const versions = availableVersionRuns(runs);
+  const productionVersion = versions.find(
+    (run) => versionKey(run) === productionSourceKey,
+  );
+  // 只有最新一次部署仍未完成时才需要用户继续处理。更早的失败已经被
+  // 后续部署替代，继续把它们显示成“需要处理”会让用户误以为项目仍有
+  // 十几项故障，尤其是在当前测试版已经正常运行的情况下。
+  const latestRun = runs[0];
+  const currentIncompleteDeployment =
+    latestRun && ["failed", "needs_action"].includes(latestRun.status)
+      ? latestRun
+      : null;
+  const currentProgressDeployment =
+    latestRun && ["queued", "running"].includes(latestRun.status)
+      ? latestRun
+      : null;
+  const historicalIncompleteDeployments = runs.filter(
+    (run) =>
+      run.status !== "success" &&
+      run.id !== currentIncompleteDeployment?.id &&
+      run.id !== currentProgressDeployment?.id,
+  );
+  const detailIsHistorical = Boolean(
+    detailRun &&
+    detailRun.status !== "success" &&
+    detailRun.id !== currentIncompleteDeployment?.id,
+  );
+  const detailIssue =
+    detailRun && detailRun.status !== "success"
+      ? issueFromUnknown(
+          detailRun.issueCode
+            ? `${detailRun.issueCode}：${deploymentStateMessage(detailRun)}`
+            : deploymentStateMessage(detailRun),
+          "这次部署没有完成",
+        )
+      : null;
+
+  function catalogRow(
+    run: DeploymentRun,
+    incompleteKind?: "current" | "historical",
+  ) {
+    const incomplete = Boolean(incompleteKind);
+    const historical = incompleteKind === "historical";
+    const verified = verifiedRunIds.includes(run.id);
+    const currentInTest = !incomplete && testSourceKey === versionKey(run);
+    const currentInProduction =
+      !incomplete && productionSourceKey === versionKey(run);
+    const currentProductionWebSavePending =
+      !incomplete &&
+      !currentInProduction &&
+      productionWebSaveSourceKey === versionKey(run);
+    const restoring =
+      !incomplete &&
+      Boolean(productionVersion) &&
+      isOlderVersion(run, productionVersion);
+    const canPublish =
+      !incomplete &&
+      verified &&
+      !currentInProduction &&
+      !currentProductionWebSavePending;
+    const canContinueProduction = Boolean(
+      currentInProduction && productionRun?.status === "needs_action",
+    );
+    const rowTitle = incomplete
+      ? deploymentAttemptLabel(run)
+      : versionTitle(run);
+    const rowMeta = run.commitSha ? versionMeta(run) : "尚未生成代码版本";
+    const detailAction = historical
+      ? "查看记录"
+      : incomplete
+        ? "查看处理方法"
+        : "技术信息";
+    const publishAction = restoring ? "用此版本恢复正式版" : "发布正式版";
+    const continueProductionAction =
+      productionRun?.actionKind === "route-check"
+        ? "继续设置正式地址"
+        : productionRun?.actionKind === "route-repair"
+          ? "继续修复正式地址"
+          : "继续完成正式发布";
+    return (
+      <div
+        className="flex items-center justify-between gap-5 px-5 py-4 max-[760px]:flex-col max-[760px]:items-stretch"
+        key={run.id}
+      >
+        <div className="min-w-0">
+          <strong className="block truncate text-sm">
+            {incomplete ? deploymentAttemptLabel(run) : versionTitle(run)}
+          </strong>
+          <span
+            className="mt-1 block truncate text-xs text-[var(--muted-foreground)]"
+            title={rowMeta}
+          >
+            {run.commitSha ? versionMeta(run) : "尚未生成代码版本"}
+          </span>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            <span
+              className={`rounded-full px-2 py-0.5 text-[10px] ${historical ? "bg-[var(--muted)] text-[var(--muted-foreground)]" : incomplete ? "bg-[var(--warning-soft)] text-[var(--warning)]" : verified ? "bg-[var(--success-soft)] text-[var(--success)]" : "bg-[var(--muted)] text-[var(--muted-foreground)]"}`}
+            >
+              {historical
+                ? "已被后续部署替代"
+                : incomplete
+                  ? deploymentStatus(run)
+                  : verified
+                    ? "测试通过"
+                    : currentInTest
+                      ? "等待确认测试结果"
+                      : "未完成测试 · 不可发布"}
+            </span>
+            {currentInTest ? (
+              <span className="rounded-full bg-[var(--info-soft)] px-2 py-0.5 text-[10px] text-[var(--accent)]">
+                测试环境当前版本
+              </span>
+            ) : null}
+            {currentInProduction ? (
+              <span
+                className={`rounded-full px-2 py-0.5 text-[10px] ${productionRun?.status === "success" ? "bg-[var(--success-soft)] text-[var(--success)]" : "bg-[var(--warning-soft)] text-[var(--warning)]"}`}
+              >
+                {productionRun?.status === "success"
+                  ? "正式版可以访问"
+                  : productionRun?.status === "needs_action"
+                    ? deploymentNeedsActionStatus(
+                        "production",
+                        productionRun.actionKind,
+                      )
+                    : "正式环境运行中"}
+              </span>
+            ) : null}
+            {currentProductionWebSavePending ? (
+              <span className="rounded-full bg-[var(--warning-soft)] px-2 py-0.5 text-[10px] text-[var(--warning)]">
+                正式版还差网页保存
+              </span>
+            ) : null}
+          </div>
+        </div>
+        <div className="flex shrink-0 flex-wrap justify-end gap-2">
+          <Button
+            aria-label={`${detailAction}：${rowTitle}，${rowMeta}`}
+            onClick={() => setDetailRun(run)}
+            size="sm"
+            variant="ghost"
+          >
+            {detailAction}
+          </Button>
+          {!incomplete && testSourceKey === versionKey(run) && !verified ? (
+            <Button
+              aria-label={`前往验证：${rowTitle}，${rowMeta}`}
+              onClick={onOpenTest}
+              size="sm"
+            >
+              前往验证
+            </Button>
+          ) : null}
+          {canContinueProduction ? (
+            <Button
+              aria-label={`${continueProductionAction}：${rowTitle}，${rowMeta}`}
+              onClick={() => onOpenProduction(run)}
+              size="sm"
+              variant="secondary"
+            >
+              {continueProductionAction}
+            </Button>
+          ) : null}
+          {currentProductionWebSavePending ? (
+            <Button
+              aria-label={`继续网页保存：${rowTitle}，${rowMeta}`}
+              onClick={() => onOpenProduction(run)}
+              size="sm"
+              variant="secondary"
+            >
+              继续网页保存
+            </Button>
+          ) : null}
+          {canPublish ? (
+            <Button
+              aria-label={`${publishAction}：${rowTitle}，${rowMeta}`}
+              onClick={() => onOpenProduction(run)}
+              size="sm"
+              variant="secondary"
+            >
+              {publishAction}
+            </Button>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <PageHeading
+        action={
+          <div className="flex flex-col items-end gap-1.5">
+            <Button
+              disabled={syncing}
+              onClick={() => void sync()}
+              variant="secondary"
+            >
+              <RefreshCw className={syncing ? "animate-spin-slow" : ""} />
+              {syncing ? "正在刷新版本记录" : "刷新版本记录"}
+            </Button>
+            {lastSyncedAt ? (
+              <span
+                aria-live="polite"
+                className="text-[11px] text-[var(--muted-foreground)]"
+              >
+                版本记录已于 {lastSyncedAt} 更新
+              </span>
+            ) : null}
+          </div>
+        }
+        description="查看版本是否通过测试，以及正在测试或正式使用的版本。"
+        title="管理版本"
+      />
+      <div className="mb-5 flex items-center justify-between rounded-lg border border-[var(--accent)]/20 bg-[var(--info-soft)] px-4 py-3">
+        <div>
+          <strong className="text-sm">
+            {syncBlocker
+              ? "上线设置需要更新"
+              : runs.length
+                ? "自动部署测试版已开启"
+                : "等待首次测试部署"}
+          </strong>
+          <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
+            {syncBlocker
+              ? "先处理下面的问题，再继续同步版本"
+              : runs.length
+                ? "代码合并后 → 生成版本 → 更新测试版"
+                : "完成首次设置后，主分支更新会自动部署测试版"}
+          </span>
+        </div>
+        <Button
+          onClick={() => {
+            setOpenStep("");
+            setShowSetup(true);
+          }}
+          size="sm"
+          variant="ghost"
+        >
+          查看设置
+        </Button>
+      </div>
+      {syncBlocker ? (
+        <IssueBanner
+          action={
+            syncBlocker.includes("AD-CNB-103") ? (
+              <Button
+                onClick={() => {
+                  setShowSetup(true);
+                  setOpenStep("repository");
+                }}
+                size="sm"
+              >
+                <KeyRound />
+                更新 CNB 授权
+              </Button>
+            ) : (
+              <Button onClick={() => void sync()} size="sm" variant="secondary">
+                重新检查
+              </Button>
+            )
+          }
+          message={syncIssue?.message ?? syncBlocker}
+          technicalCode={syncIssue?.code}
+          technicalDetails={syncIssue?.technicalDetails}
+          title="暂时无法刷新版本记录"
+        />
+      ) : null}
+      <Section
+        title="版本记录"
+        trailing={`${versions.length} 个版本 · ${verifiedRunIds.length} 个测试通过`}
+      >
+        {versions.length ? (
+          <div className="-mx-5 -my-4 divide-y divide-[var(--border)]">
+            {versions.map((run) => catalogRow(run))}
+          </div>
+        ) : (
+          <div className="py-10 text-center">
+            <Tags className="mx-auto size-8 text-[var(--subtle-foreground)]" />
+            <strong className="mt-3 block text-sm">正在等待第一个版本</strong>
+            <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
+              把准备上线的代码合并到项目主分支后，新版本会自动出现在这里并更新测试版。
+            </span>
+          </div>
+        )}
+      </Section>
+      {currentIncompleteDeployment ? (
+        <div className="mt-6 overflow-hidden rounded-lg border border-[var(--warning)]/35 bg-[var(--warning-soft)]">
+          <div className="flex items-center justify-between gap-5 px-5 py-4">
+            <div>
+              <strong className="block text-sm">最新一次部署没有完成</strong>
+              <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
+                查看停止原因，然后前往测试版继续处理。
+              </span>
+            </div>
+            <Button
+              onClick={() => setDetailRun(currentIncompleteDeployment)}
+              size="sm"
+            >
+              查看处理方法
+            </Button>
+          </div>
+        </div>
+      ) : null}
+      {currentProgressDeployment ? (
+        <div className="mt-6 overflow-hidden rounded-lg border border-[var(--accent)]/20 bg-[var(--info-soft)]">
+          <div className="flex items-center justify-between gap-5 px-5 py-4">
+            <div>
+              <strong className="block text-sm">新版本正在自动部署</strong>
+              <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
+                可以离开当前页面，系统会继续更新进度。
+              </span>
+            </div>
+            <Button onClick={onOpenTest} size="sm" variant="secondary">
+              查看部署进度
+            </Button>
+          </div>
+        </div>
+      ) : null}
+      {historicalIncompleteDeployments.length ? (
+        <details
+          className="mt-6 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]"
+          onToggle={(event) => setIncompleteOpen(event.currentTarget.open)}
+          open={incompleteOpen}
+        >
+          <summary className="cursor-pointer px-5 py-4 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus)]">
+            {historicalIncompleteDeployments.length} 条历史部署记录
+            <span className="ml-2 text-xs font-normal text-[var(--muted-foreground)]">
+              已被后续部署替代，无需处理
+            </span>
+          </summary>
+          <div className="divide-y divide-[var(--border)] border-t border-[var(--border)]">
+            {historicalIncompleteDeployments.map((run) =>
+              catalogRow(run, "historical"),
+            )}
+          </div>
+        </details>
+      ) : null}
+      <Dialog
+        onOpenChange={(open) => !open && setDetailRun(null)}
+        open={Boolean(detailRun)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {detailRun
+                ? detailRun.status === "success"
+                  ? versionTitle(detailRun)
+                  : deploymentAttemptLabel(detailRun)
+                : "版本详情"}
+            </DialogTitle>
+            <DialogDescription>
+              {detailRun?.status === "success"
+                ? "这些技术信息用于排查和确认版本，一般不需要处理。"
+                : detailIsHistorical
+                  ? "这次部署没有完成，但已经被后续部署替代。"
+                  : "这里记录当前部署停止的位置和继续方法。"}
+            </DialogDescription>
+          </DialogHeader>
+          {detailRun ? (
+            <div className="space-y-3">
+              {detailRun.status !== "success" ? (
+                detailIsHistorical ? (
+                  <div className="rounded-md border border-[var(--success)]/25 bg-[var(--success-soft)] px-4 py-3">
+                    <strong className="text-sm">这条记录不需要处理</strong>
+                    <p className="mb-0 mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
+                      后续部署已经接替了这次操作，不会影响当前测试版或正式版。
+                    </p>
+                  </div>
+                ) : (
+                  <div className="rounded-md border border-[var(--warning)]/30 bg-[var(--warning-soft)] px-4 py-3">
+                    <strong className="text-sm">{detailIssue?.title}</strong>
+                    <p className="mb-0 mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
+                      {detailIssue?.message}
+                    </p>
+                    {detailIssue?.nextSteps[0] ? (
+                      <p className="mb-0 mt-2 text-xs font-medium">
+                        下一步：{detailIssue.nextSteps[0]}
+                      </p>
+                    ) : null}
+                  </div>
+                )
+              ) : null}
+              {detailIsHistorical && detailIssue ? (
+                <details className="rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2.5 text-xs">
+                  <summary className="cursor-pointer font-medium">
+                    查看当时停止的原因
+                  </summary>
+                  <div className="mt-2 space-y-1 text-[var(--muted-foreground)]">
+                    <strong className="block text-[var(--foreground)]">
+                      {detailIssue.title}
+                    </strong>
+                    <p className="mb-0 leading-5">{detailIssue.message}</p>
+                  </div>
+                </details>
+              ) : null}
+              <div className="grid grid-cols-[88px_1fr] gap-3 text-sm">
+                <span className="text-[var(--muted-foreground)]">构建编号</span>
+                <span className="text-xs">
+                  {detailRun.buildSerial || "未记录"}
+                </span>
+                <span className="text-[var(--muted-foreground)]">代码提交</span>
+                <code className="break-all text-xs">
+                  {detailRun.commitSha || "未生成"}
+                </code>
+                <span className="text-[var(--muted-foreground)]">
+                  {detailIsHistorical ? "当时结果" : "测试结果"}
+                </span>
+                <span>
+                  {verifiedRunIds.includes(detailRun.id)
+                    ? "业务测试通过"
+                    : deploymentStatus(detailRun)}
+                </span>
+              </div>
+              <div className="divide-y divide-[var(--border)] overflow-hidden rounded-md border border-[var(--border)]">
+                {detailRun.artifacts.length ? (
+                  detailRun.artifacts.map((artifact) => (
+                    <div className="px-3 py-2.5" key={artifact.service}>
+                      <strong className="block text-xs">
+                        {artifact.service}
+                      </strong>
+                      <code className="mt-1 block break-all text-[10px] text-[var(--muted-foreground)]">
+                        {artifact.image}@{artifact.digest}
+                      </code>
+                    </div>
+                  ))
+                ) : (
+                  <div className="px-3 py-4 text-xs text-[var(--muted-foreground)]">
+                    {detailRun.status === "success"
+                      ? "版本文件会在测试部署完成后自动核对。"
+                      : "这次部署还没有完成版本文件核对。"}
+                  </div>
+                )}
+              </div>
+              {detailRun.status !== "success" && detailRun.issueCode ? (
+                <details className="rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2.5 text-xs">
+                  <summary className="cursor-pointer text-[var(--muted-foreground)]">
+                    技术详情
+                  </summary>
+                  <div className="mt-2 space-y-2">
+                    <p className="mb-0 text-[var(--muted-foreground)]">
+                      错误编号：{detailRun.issueCode}
+                    </p>
+                    <code className="block max-h-32 overflow-auto whitespace-pre-wrap break-all text-[10px] text-[var(--muted-foreground)]">
+                      {detailRun.message}
+                    </code>
+                  </div>
+                </details>
+              ) : null}
+            </div>
+          ) : null}
+          <DialogFooter>
+            <Button onClick={() => setDetailRun(null)} variant="secondary">
+              关闭
+            </Button>
+            {detailRun &&
+            detailRun.status !== "success" &&
+            !detailIsHistorical ? (
+              <Button
+                onClick={() => {
+                  setDetailRun(null);
+                  onOpenTest();
+                }}
+              >
+                前往部署测试版
+              </Button>
+            ) : null}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+async function rememberTcrPreference(namespace: string) {
+  const reusableNamespace = namespace.trim();
+  if (!reusableNamespace) return;
+  await Promise.all([
+    setAppSetting("registry.mode", "tcr"),
+    setAppSetting("registry.tcr.namespace", reusableNamespace),
+  ]);
+}
+
+function registryVerificationKey(secretPrefix: string) {
+  return `${secretPrefix}.verified-endpoint`;
+}
+
+function registryCredentialError(error: unknown): UserFacingIssue {
+  const issue = issueFromUnknown(error, "这次没有完成登录验证");
+  if (issue.code !== "AD-APP-001") return issue;
+  return {
+    ...issue,
+    message: "系统暂时无法读取或验证已保存的登录信息。",
+    nextSteps: [
+      "关闭可能存在的系统授权提示后重新验证；仍失败时重新填写登录信息",
+    ],
+    title: "这次没有完成登录验证",
+  };
+}
+
+function registryCredentialIssue(check: ProviderCheck): UserFacingIssue {
+  return issueFromProvider(
+    {
+      ...check,
+      code:
+        check.code ?? (check.retryable === false ? "AD-REG-102" : "AD-REG-103"),
+    },
+    "登录信息还不能使用",
+  );
+}
+
+function RegistryPreparation({
+  onError,
+  onReady,
+  onSaveManifest,
+  readyFromParent,
+  workspace,
+}: {
+  onError: (message: string) => void;
+  onReady: (ready: boolean) => void;
+  onSaveManifest: (manifestYaml: string) => Promise<boolean>;
+  readyFromParent: boolean;
+  workspace: WorkspacePreview;
+}) {
+  const registry = readRegistry(workspace.manifestYaml);
+  const needsCredentials = registry.kind !== "cnb";
+  // Fresh app-owned entries avoid stale access control left by old ad-hoc
+  // signed test builds in the macOS Keychain.
+  const prefix = registry.kind === "tcr" ? "registry.tcr.v2" : "registry.oci";
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [ready, setReady] = useState(readyFromParent);
+  const [working, setWorking] = useState(false);
+  const [credentialIssue, setCredentialIssue] =
+    useState<UserFacingIssue | null>(null);
+  const [preferredTcrNamespace, setPreferredTcrNamespace] = useState("");
+
+  useEffect(() => {
+    setReady(readyFromParent);
+  }, [readyFromParent]);
+
+  useEffect(() => {
+    if (registry.kind !== "cnb") {
+      setPreferredTcrNamespace("");
+      return;
+    }
+    let active = true;
+    Promise.all([
+      getAppSetting("registry.mode"),
+      getAppSetting("registry.tcr.namespace"),
+    ])
+      .then(([mode, namespace]) => {
+        if (!active || mode !== "tcr" || !namespace?.trim()) return;
+        setPreferredTcrNamespace(namespace.trim());
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [registry.kind]);
+
+  async function save() {
+    if (!username.trim() || !password) return;
+    setWorking(true);
+    setCredentialIssue(null);
+    try {
+      const check = await checkRegistryCredentials(
+        registry.endpoint,
+        username.trim(),
+        password,
+      );
+      if (!check.ok) {
+        setCredentialIssue(registryCredentialIssue(check));
+        setReady(false);
+        onReady(false);
+        return;
+      }
+      // macOS Keychain writes must be serialized. Parallel writes can trigger
+      // two authorization requests and leave both operations waiting forever.
+      await storeSecret(`${prefix}.username`, username.trim());
+      await storeSecret(`${prefix}.password`, password);
+      await setAppSetting(registryVerificationKey(prefix), registry.endpoint);
+      if (registry.kind === "tcr") {
+        await rememberTcrPreference(registry.namespace);
+      }
+      setUsername("");
+      setPassword("");
+      setReady(true);
+      onReady(true);
+    } catch (error) {
+      const issue = registryCredentialError(error);
+      setCredentialIssue(issue);
+      onError(issue.message);
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function authorizeSavedCredentials() {
+    setWorking(true);
+    setCredentialIssue(null);
+    try {
+      const check = await checkSavedRegistryCredentials(
+        registry.endpoint,
+        prefix,
+      );
+      if (!check.ok) {
+        if (check.retryable === false) {
+          await setAppSetting(registryVerificationKey(prefix), "");
+        }
+        setCredentialIssue(registryCredentialIssue(check));
+        setReady(false);
+        onReady(false);
+        return;
+      }
+      await setAppSetting(registryVerificationKey(prefix), registry.endpoint);
+      if (registry.kind === "tcr") {
+        await rememberTcrPreference(registry.namespace);
+      }
+      setReady(true);
+      onReady(true);
+    } catch (error) {
+      const issue = registryCredentialError(error);
+      setCredentialIssue(issue);
+      onError(issue.message);
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function usePreferredTcr() {
+    if (!preferredTcrNamespace) return;
+    setWorking(true);
+    setCredentialIssue(null);
+    try {
+      const check = await checkSavedRegistryCredentials(
+        "ccr.ccs.tencentyun.com",
+        "registry.tcr.v2",
+      );
+      if (!check.ok) {
+        if (check.retryable === false) {
+          await setAppSetting(registryVerificationKey("registry.tcr.v2"), "");
+        }
+        setCredentialIssue(registryCredentialIssue(check));
+        return;
+      }
+      await setAppSetting(
+        registryVerificationKey("registry.tcr.v2"),
+        "ccr.ccs.tencentyun.com",
+      );
+      if (
+        await onSaveManifest(
+          tcrRegistryManifest(workspace.manifestYaml, preferredTcrNamespace),
+        )
+      ) {
+        setReady(false);
+        onReady(false);
+      }
+    } catch (error) {
+      const issue = registryCredentialError(error);
+      setCredentialIssue(issue);
+      onError(issue.message);
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  if (!needsCredentials) {
+    return (
+      <div className="space-y-3">
+        {readyFromParent ? (
+          <div className="flex items-center gap-3">
+            <CheckCircle2 className="size-4 text-[var(--success)]" />
+            <div>
+              <strong className="block text-sm">项目版本保存在 CNB</strong>
+              <span className="text-xs text-[var(--muted-foreground)]">
+                {registry.repository || "跟随代码仓库"}
+              </span>
+            </div>
+          </div>
+        ) : (
+          <div className="flex items-start gap-3 rounded-md border border-[var(--border)] bg-[var(--muted)]/35 px-3 py-3">
+            <Circle className="mt-0.5 size-4 shrink-0 text-[var(--subtle-foreground)]" />
+            <div>
+              <strong className="block text-sm">跟随代码仓库保存</strong>
+              <span className="mt-1 block text-xs leading-5 text-[var(--muted-foreground)]">
+                先完成“连接代码平台”，系统会自动准备项目版本位置，不需要再次填写。
+              </span>
+            </div>
+          </div>
+        )}
+        {preferredTcrNamespace ? (
+          <>
+            <div className="flex items-center justify-between gap-4 rounded-md border border-[var(--border)] bg-[var(--muted)]/35 px-3 py-2.5">
+              <div>
+                <strong className="block text-sm">已保存的项目版本位置</strong>
+                <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
+                  腾讯云 TCR · ccr.ccs.tencentyun.com/
+                  {preferredTcrNamespace} · 使用前会先检查登录信息
+                </span>
+              </div>
+              <Button
+                disabled={working}
+                onClick={() => void usePreferredTcr()}
+                size="sm"
+                variant="secondary"
+              >
+                {working ? (
+                  <LoaderCircle className="animate-spin-slow" />
+                ) : null}
+                {working ? "正在检查" : "检查并使用"}
+              </Button>
+            </div>
+            {credentialIssue ? (
+              <IssueBanner
+                message={`${credentialIssue.message} 原来的项目版本保存位置没有改变。`}
+                nextStep={credentialIssue.nextSteps[0]}
+                technicalCode={credentialIssue.code}
+                technicalDetails={credentialIssue.technicalDetails}
+                title={credentialIssue.title}
+              />
+            ) : null}
+          </>
+        ) : null}
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div className="mb-4">
+        <strong className="block text-sm">项目版本保存位置</strong>
+        <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
+          {registry.kind === "tcr" ? "腾讯云 TCR · " : null}
+          {registry.endpoint}/{registry.namespace}
+        </span>
+      </div>
+      {ready ? (
+        <div className="flex items-center justify-between gap-4 rounded-md bg-[var(--success-soft)] px-3 py-2.5">
+          <span className="text-sm text-[var(--success)]">
+            登录信息已安全保存
+            <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
+              再次使用时如果已经失效，系统会在当前步骤提示更新
+            </span>
+          </span>
+          <Button
+            onClick={() => {
+              setCredentialIssue(null);
+              setReady(false);
+              onReady(false);
+            }}
+            size="sm"
+            variant="ghost"
+          >
+            更换登录信息
+          </Button>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <div className="flex items-center justify-between rounded-md bg-[var(--muted)]/35 px-3 py-2.5">
+            <span className="text-xs text-[var(--muted-foreground)]">
+              以前保存过登录信息？验证通过后可以直接复用。
+            </span>
+            <Button
+              disabled={working}
+              onClick={() => void authorizeSavedCredentials()}
+              size="sm"
+              variant="secondary"
+            >
+              {working ? <LoaderCircle className="animate-spin-slow" /> : null}
+              验证已保存登录信息
+            </Button>
+          </div>
+          {registry.kind === "tcr" ? (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-md bg-[var(--muted)]/35 px-3 py-2.5">
+              <span className="text-xs leading-5 text-[var(--muted-foreground)]">
+                还没有登录信息？个人版初始化密码，企业版创建长期访问凭证。
+              </span>
+              <Button
+                onClick={() =>
+                  void openUrl("https://console.cloud.tencent.com/tcr")
+                }
+                size="sm"
+                variant="secondary"
+              >
+                <ExternalLink />
+                前往腾讯云获取凭据
+              </Button>
+            </div>
+          ) : null}
+          {credentialIssue ? (
+            <IssueBanner
+              message={`${credentialIssue.message} 未通过验证的信息不会保存，也不会标记为已准备。`}
+              nextStep={credentialIssue.nextSteps[0]}
+              technicalCode={credentialIssue.code}
+              technicalDetails={credentialIssue.technicalDetails}
+              title={credentialIssue.title}
+            />
+          ) : null}
+          <div className="grid gap-3 md:grid-cols-[1fr_1fr_auto] md:items-end">
+            <div className="space-y-1.5">
+              <Label htmlFor="registry-username">登录用户名</Label>
+              <Input
+                id="registry-username"
+                onChange={(event) => {
+                  setUsername(event.target.value);
+                  setCredentialIssue(null);
+                }}
+                value={username}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="registry-password">访问密码</Label>
+              <Input
+                id="registry-password"
+                onChange={(event) => {
+                  setPassword(event.target.value);
+                  setCredentialIssue(null);
+                }}
+                type="password"
+                value={password}
+              />
+            </div>
+            <Button
+              className="w-full md:w-auto"
+              disabled={working || !username.trim() || !password}
+              onClick={() => void save()}
+            >
+              {working ? (
+                <LoaderCircle className="animate-spin-slow" />
+              ) : (
+                <KeyRound />
+              )}
+              {working ? "正在验证" : "验证并安全保存"}
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TestScene({
+  blockingProductionRun,
+  initialServer,
+  onDeploy,
+  onError,
+  onOpenProduction,
+  onOpenSetup,
+  onRefresh,
+  onVerify,
+  path,
+  productionRun,
+  productionWebSaveVersionKey,
+  run,
+  setupComplete,
+  verified,
+  workspace,
+}: {
+  blockingProductionRun?: DeploymentRun;
+  initialServer?: ServerForm;
+  onDeploy: (
+    server: ServerForm,
+    repository: string,
+    useCommittedCode?: boolean,
+  ) => Promise<void>;
+  onError: (message: string) => void;
+  onOpenProduction: () => void;
+  onOpenSetup: () => void;
+  onRefresh: (run: DeploymentRun) => Promise<DeploymentRun>;
+  onVerify: (run: DeploymentRun) => Promise<void>;
+  path: string;
+  productionRun?: DeploymentRun;
+  productionWebSaveVersionKey: string;
+  run?: DeploymentRun;
+  setupComplete: boolean | null;
+  verified: boolean;
+  workspace: WorkspacePreview;
+}) {
+  const repository = readRepository(workspace.manifestYaml);
+  const setupServer = setupComplete ? initialServer : undefined;
+  const { addressReady, cloudConfigReady, runtimeConfigReady } =
+    useStagingPreparationStatus(path, setupServer, workspace);
+  const [deploying, setDeploying] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState("");
+  const [deploymentBlocker, setDeploymentBlocker] = useState("");
+  const [showPreparation, setShowPreparation] = useState(!run);
+  const [cnbAuthorizationDialog, setCnbAuthorizationDialog] = useState(false);
+  const [cnbToken, setCnbToken] = useState("");
+  const [authorizingCnb, setAuthorizingCnb] = useState(false);
+
+  const checkingSetup =
+    setupComplete === null ||
+    (setupComplete && Boolean(initialServer) && runtimeConfigReady === null);
+  const ready = Boolean(
+    setupComplete &&
+    usableRepository(repository) &&
+    initialServer &&
+    runtimeConfigReady === true &&
+    cloudConfigReady &&
+    addressReady,
+  );
+  const address = testAddress(workspace, initialServer);
+  const productionWebSavePending = Boolean(productionWebSaveVersionKey);
+  const productionWebSaveForCurrentVersion = Boolean(
+    run && productionWebSaveVersionKey === versionKey(run),
+  );
+  const productionTaskPending = Boolean(
+    productionWebSavePending ||
+    (productionRun && productionRun.status !== "success") ||
+    blockingProductionRun,
+  );
+
+  async function deploy(useCommittedCode = false) {
+    if (!ready || !initialServer) return;
+    setDeploying(true);
+    setDeploymentBlocker("");
+    try {
+      await onDeploy(initialServer, repository, useCommittedCode);
+      setShowPreparation(false);
+    } catch (error) {
+      setDeploymentBlocker(toMessage(error));
+    } finally {
+      setDeploying(false);
+    }
+  }
+
+  async function openSecurePreview(currentRun: DeploymentRun) {
+    setPreviewing(true);
+    try {
+      const preview = await openStagingPreviewTunnel(currentRun.id);
+      setPreviewUrl(preview.url);
+      await openUrl(preview.url);
+      await onRefresh(currentRun);
+    } catch (error) {
+      onError(toMessage(error));
+    } finally {
+      setPreviewing(false);
+    }
+  }
+
+  async function authorizeCnbAndContinue(currentRun: DeploymentRun) {
+    if (!cnbToken.trim()) return;
+    setAuthorizingCnb(true);
+    try {
+      await connectCnb(cnbToken, true, currentRun.repository);
+      await onRefresh(currentRun);
+      setCnbToken("");
+      setCnbAuthorizationDialog(false);
+    } catch (error) {
+      onError(toMessage(error));
+    } finally {
+      setAuthorizingCnb(false);
+    }
+  }
+
+  if (run && !showPreparation) {
+    const usesSecurePreview = run.actionKind === "local-preview";
+    const displayAddress = previewUrl || (usesSecurePreview ? "" : address);
+    return (
+      <div>
+        <PageHeading
+          action={
+            run.status === "success" && !productionTaskPending ? (
+              <Button
+                onClick={() => setShowPreparation(true)}
+                variant="secondary"
+              >
+                <Rocket />
+                手动部署测试版
+              </Button>
+            ) : undefined
+          }
+          description={
+            run.status === "success"
+              ? verified
+                ? "测试结果已保存，不会因为关闭应用而丢失。"
+                : usesSecurePreview
+                  ? "测试版仍在服务器运行，可以从这台电脑直接打开确认。"
+                  : "打开测试地址，确认主要功能是否符合预期。"
+              : "部署状态会自动保存，可以关闭应用后再回来。"
+          }
+          title={
+            run.status === "success"
+              ? verified
+                ? "测试版已通过验证"
+                : "验证测试版"
+              : deploymentTitle(run)
+          }
+        />
+        <CurrentVersionBanner label="当前测试版本" run={run} />
+        <DeploymentState
+          action={
+            run.status === "needs_action" && run.issueCode === "AD-CNB-103" ? (
+              <Button onClick={() => setCnbAuthorizationDialog(true)} size="sm">
+                <KeyRound />
+                更新 CNB 授权
+              </Button>
+            ) : run.status === "needs_action" &&
+              run.issueCode === "AD-CNB-202" ? (
+              <Button onClick={() => setShowPreparation(true)} size="sm">
+                <Rocket />
+                重新部署当前代码
+              </Button>
+            ) : run.status === "needs_action" &&
+              ["cloud-config", "cloud-setup"].includes(run.actionKind ?? "") ? (
+              <Button onClick={onOpenSetup} size="sm">
+                <Tags />
+                继续完成上线设置
+              </Button>
+            ) : run.status === "needs_action" &&
+              run.environment === "staging" &&
+              run.actionKind === "route-check" ? (
+              <Button
+                disabled={previewing}
+                onClick={() => void openSecurePreview(run)}
+                size="sm"
+              >
+                {previewing ? (
+                  <LoaderCircle className="animate-spin-slow" />
+                ) : (
+                  <ExternalLink />
+                )}
+                打开测试版
+              </Button>
+            ) : undefined
+          }
+          messageOverride={
+            run.status === "success" && verified
+              ? "测试版正在服务器运行"
+              : undefined
+          }
+          onError={onError}
+          run={run}
+          onRefresh={onRefresh}
+        />
+        {run.status === "success" && displayAddress.startsWith("http") ? (
+          <div className="mt-5 rounded-lg border border-[var(--border)] bg-[var(--surface)] p-6 text-center">
+            <a
+              className="text-lg font-semibold text-[var(--accent)]"
+              href={displayAddress}
+              onClick={(event) => {
+                event.preventDefault();
+                void openUrl(displayAddress);
+              }}
+            >
+              {displayAddress}
+            </a>
+            <div className="mt-4">
+              <Button
+                onClick={() => void openUrl(displayAddress)}
+                variant="secondary"
+              >
+                <ExternalLink />
+                打开测试版
+              </Button>
+            </div>
+            <TestVerificationPrompt
+              onModify={() => setShowPreparation(true)}
+              onOpenProduction={onOpenProduction}
+              onVerify={() => void onVerify(run)}
+              blockingProductionRun={blockingProductionRun}
+              productionRun={productionRun}
+              productionWebSaveForCurrentVersion={
+                productionWebSaveForCurrentVersion
+              }
+              productionWebSavePending={productionWebSavePending}
+              verified={verified}
+            />
+          </div>
+        ) : run.status === "success" && usesSecurePreview ? (
+          <div className="mt-5">
+            <IssueBanner
+              action={
+                <Button
+                  disabled={previewing}
+                  onClick={() => void openSecurePreview(run)}
+                  size="sm"
+                  variant={verified ? "secondary" : "default"}
+                >
+                  {previewing ? (
+                    <LoaderCircle className="animate-spin-slow" />
+                  ) : (
+                    <ExternalLink />
+                  )}
+                  重新打开测试版
+                </Button>
+              }
+              message="只会重新打开测试地址，不会重新部署项目。"
+              title={verified ? "复查测试版" : "下一步：重新打开测试版"}
+            />
+            {verified ? (
+              <TestVerificationPrompt
+                onModify={() => setShowPreparation(true)}
+                onOpenProduction={onOpenProduction}
+                onVerify={() => void onVerify(run)}
+                blockingProductionRun={blockingProductionRun}
+                productionRun={productionRun}
+                productionWebSaveForCurrentVersion={
+                  productionWebSaveForCurrentVersion
+                }
+                productionWebSavePending={productionWebSavePending}
+                verified
+              />
+            ) : previewUrl ? (
+              <TestVerificationPrompt
+                onModify={() => setShowPreparation(true)}
+                onOpenProduction={onOpenProduction}
+                onVerify={() => void onVerify(run)}
+                blockingProductionRun={blockingProductionRun}
+                productionRun={productionRun}
+                productionWebSaveForCurrentVersion={
+                  productionWebSaveForCurrentVersion
+                }
+                productionWebSavePending={productionWebSavePending}
+                verified={false}
+              />
+            ) : (
+              <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-5 py-4">
+                <strong className="text-sm">还差一次业务确认</strong>
+                <p className="mb-0 mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
+                  先重新打开测试版，确认主要功能符合预期后，才能标记测试通过。
+                </p>
+              </div>
+            )}
+          </div>
+        ) : run.status === "success" ? (
+          <div className="mt-5">
+            <IssueBanner
+              action={
+                <Button
+                  onClick={() => setShowPreparation(true)}
+                  size="sm"
+                  variant="secondary"
+                >
+                  检查运行服务器
+                </Button>
+              }
+              message="部署已经完成，但当前项目的测试服务器信息没有恢复，暂时无法生成可点击地址。"
+              title="还不能打开测试地址"
+            />
+            {verified ? (
+              <TestVerificationPrompt
+                onModify={() => setShowPreparation(true)}
+                onOpenProduction={onOpenProduction}
+                onVerify={() => void onVerify(run)}
+                blockingProductionRun={blockingProductionRun}
+                productionRun={productionRun}
+                productionWebSaveForCurrentVersion={
+                  productionWebSaveForCurrentVersion
+                }
+                productionWebSavePending={productionWebSavePending}
+                verified
+              />
+            ) : null}
+          </div>
+        ) : run.status === "failed" ? (
+          <div className="mt-5 flex justify-end">
+            <Button
+              onClick={() => setShowPreparation(true)}
+              variant="secondary"
+            >
+              检查后重新部署
+            </Button>
+          </div>
+        ) : null}
+        <CnbAuthorizationDialog
+          description="保存新授权后会继续检查这次测试部署，已经生成并启动的版本不会重做。"
+          fieldId="test-cnb-token"
+          onOpenChange={setCnbAuthorizationDialog}
+          onSubmit={() => void authorizeCnbAndContinue(run)}
+          onTokenChange={setCnbToken}
+          open={cnbAuthorizationDialog}
+          submitLabel="保存授权并继续"
+          title="更新 CNB 授权"
+          token={cnbToken}
+          working={authorizingCnb}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <PageHeading
+        description={
+          setupComplete
+            ? "使用已经保存的上线设置，不需要重新填写服务器、配置或地址。"
+            : "一次性设置统一在“管理版本”完成，这里不重复要求填写。"
+        }
+        title={run ? "手动部署测试版" : "部署测试版"}
+      />
+      {deploymentBlocker ? (
+        <DeploymentBlockerBanner
+          deploying={deploying}
+          message={deploymentBlocker}
+          onDeployCommitted={() => void deploy(true)}
+          onOpenSetup={onOpenSetup}
+          onRetry={() => void deploy()}
+        />
+      ) : null}
+      {checkingSetup ? (
+        <div className="flex min-h-40 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] text-sm text-[var(--muted-foreground)]">
+          <LoaderCircle className="size-4 animate-spin-slow" />
+          正在确认已保存的上线设置
+        </div>
+      ) : !setupComplete ? (
+        <IssueBanner
+          action={
+            <Button onClick={onOpenSetup} size="sm">
+              <Tags />
+              继续完成设置
+            </Button>
+          }
+          message="系统会直接打开当前还没完成的一项；全部完成后会自动进入测试版。"
+          title="上线设置还没有完成"
+        />
+      ) : !ready ? (
+        <IssueBanner
+          action={
+            <Button onClick={onOpenSetup} size="sm" variant="secondary">
+              检查上线设置
+            </Button>
+          }
+          message="已保存的服务器、测试配置或地址发生了变化。检查后可以从这里继续，不需要重新生成已经完成的版本。"
+          title="上线设置需要检查"
+        />
+      ) : !deploymentBlocker ? (
+        <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] p-5">
+          <div className="flex items-start justify-between gap-5">
+            <div className="flex min-w-0 gap-3">
+              <CheckCircle2 className="mt-0.5 size-5 shrink-0 text-[var(--success)]" />
+              <div>
+                <strong className="block text-sm font-semibold">
+                  上线设置已准备
+                </strong>
+                <p className="mb-0 mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
+                  以后把准备上线的代码合并到项目主分支，系统会自动生成版本并更新测试版；现在也可以立即部署当前代码。
+                </p>
+              </div>
+            </div>
+            <div className="flex shrink-0 gap-2">
+              <Button onClick={onOpenSetup} size="sm" variant="ghost">
+                查看上线设置
+              </Button>
+              <Button
+                disabled={deploying}
+                onClick={() => void deploy()}
+                size="sm"
+              >
+                {deploying ? (
+                  <LoaderCircle className="animate-spin-slow" />
+                ) : (
+                  <Rocket />
+                )}
+                {deploying ? "正在开始部署" : "立即部署测试版"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function TestVerificationPrompt({
+  blockingProductionRun,
+  onModify,
+  onOpenProduction,
+  onVerify,
+  productionRun,
+  productionWebSaveForCurrentVersion,
+  productionWebSavePending,
+  verified,
+}: {
+  blockingProductionRun?: DeploymentRun;
+  onModify: () => void;
+  onOpenProduction: () => void;
+  onVerify: () => void;
+  productionRun?: DeploymentRun;
+  productionWebSaveForCurrentVersion: boolean;
+  productionWebSavePending: boolean;
+  verified: boolean;
+}) {
+  if (verified) {
+    const productionComplete = productionRun?.status === "success";
+    const activeProductionRun =
+      productionRun && !productionComplete
+        ? productionRun
+        : blockingProductionRun;
+    const activeProductionForCurrentVersion =
+      activeProductionRun === productionRun;
+    const productionWebSaveNeedsAction = Boolean(
+      !productionRun && !blockingProductionRun && productionWebSavePending,
+    );
+    let activeProductionAction = "继续完成正式发布";
+    let activeProductionTitle = activeProductionForCurrentVersion
+      ? "正式发布还需要处理"
+      : "另一个版本的正式发布需要处理";
+    let activeProductionMessage = activeProductionForCurrentVersion
+      ? "这个测试通过的版本已经开始正式发布；打开后会回到保留的步骤。"
+      : "另一个测试通过的版本正在正式发布；先完成那次任务，再决定是否发布当前版本。";
+    if (activeProductionRun?.status === "failed") {
+      activeProductionAction = "查看处理方法";
+      activeProductionTitle = activeProductionForCurrentVersion
+        ? "正式发布没有完成"
+        : "另一个版本发布没有完成";
+      activeProductionMessage = activeProductionForCurrentVersion
+        ? "这次正式发布没有完成；打开后可以查看已经保留的原因和处理方法。"
+        : "另一个测试通过的版本发布没有完成；先处理那次发布，再决定是否发布当前版本。";
+    } else if (
+      activeProductionRun?.status === "queued" ||
+      activeProductionRun?.status === "running"
+    ) {
+      activeProductionAction = "查看正式发布进度";
+      activeProductionTitle = activeProductionForCurrentVersion
+        ? "正式版正在发布"
+        : "另一个版本正在发布";
+      activeProductionMessage = activeProductionForCurrentVersion
+        ? "系统正在发布这个测试通过的版本；可以打开查看当前进度。"
+        : "系统正在发布另一个测试通过的版本；先等待那次任务完成，再决定是否发布当前版本。";
+    } else if (activeProductionRun?.actionKind === "route-check") {
+      activeProductionAction = "继续设置正式地址";
+      activeProductionTitle = activeProductionForCurrentVersion
+        ? "正式版还差设置地址"
+        : "另一个版本还差设置正式地址";
+      activeProductionMessage = activeProductionForCurrentVersion
+        ? "这个测试通过的版本已经在正式服务器运行，但正式地址还不能访问；继续完成地址设置即可。"
+        : "另一个测试通过的版本已经在正式服务器运行，但正式地址还不能访问；先完成那次地址设置，再决定是否发布当前版本。";
+    } else if (activeProductionRun?.actionKind === "route-repair") {
+      activeProductionAction = "继续修复正式地址";
+      activeProductionTitle = activeProductionForCurrentVersion
+        ? "正式版还差修复地址"
+        : "另一个版本还差修复正式地址";
+      activeProductionMessage = activeProductionForCurrentVersion
+        ? "这个测试通过的版本已经在正式服务器运行，但正式地址需要修复；打开后会回到原任务。"
+        : "另一个测试通过的版本已经在正式服务器运行，但正式地址需要修复；先完成那次任务，再决定是否发布当前版本。";
+    }
+    return (
+      <SuccessBanner
+        action={
+          productionComplete ? undefined : (
+            <Button onClick={onOpenProduction} size="sm">
+              {productionWebSaveNeedsAction ? (
+                <ExternalLink />
+              ) : activeProductionRun?.status === "failed" ? (
+                <AlertCircle />
+              ) : (
+                <Rocket />
+              )}
+              {productionWebSaveNeedsAction
+                ? "继续网页保存"
+                : activeProductionRun
+                  ? activeProductionAction
+                  : "准备发布正式版"}
+            </Button>
+          )
+        }
+        message={
+          productionComplete
+            ? "正式环境正在使用这个版本，正式地址可以访问。"
+            : productionWebSaveNeedsAction
+              ? productionWebSaveForCurrentVersion
+                ? "这个测试通过的版本已经开始准备正式版；完成网页保存后会继续原任务，不会重新构建。"
+                : "另一个测试通过的版本正在准备正式版；先完成那次网页保存，再决定是否发布当前版本。"
+              : activeProductionRun
+                ? activeProductionMessage
+                : "发布时会继续使用这个测试版本，不会重新构建。"
+        }
+        title={
+          productionComplete
+            ? "当前版本已完成正式发布"
+            : productionWebSaveNeedsAction
+              ? productionWebSaveForCurrentVersion
+                ? "正式版还差网页保存"
+                : "已有正式发布等待网页保存"
+              : activeProductionRun
+                ? activeProductionTitle
+                : "下一步：准备正式版"
+        }
+      />
+    );
+  }
+  return (
+    <div className="mt-7 border-t border-[var(--border)] pt-6 text-center">
+      <h2 className="m-0 text-base font-semibold">测试结果符合你的预期吗？</h2>
+      <p className="mb-5 mt-2 text-sm text-[var(--muted-foreground)]">
+        如果还需要修改，请回到开发工具处理后重新部署。
+      </p>
+      <div className="flex justify-center gap-2">
+        <Button onClick={onModify} variant="secondary">
+          还需要修改
+        </Button>
+        <Button onClick={onVerify}>
+          <Check />
+          测试通过
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function ProductionScene({
+  currentTestVersion,
+  initialWebSavePending,
+  initialServer,
+  onError,
+  onPromote,
+  onProgressChange,
+  onRefresh,
+  onSaveManifest,
+  onSelectVersion,
+  onShowVersions,
+  onShowTest,
+  path,
+  production,
+  productionVersion,
+  saving,
+  setupComplete,
+  verifiedRun,
+  verifiedRuns,
+  workspace,
+}: {
+  currentTestVersion?: DeploymentRun;
+  initialWebSavePending: boolean;
+  initialServer?: ServerForm;
+  onError: (message: string) => void;
+  onPromote: (run: DeploymentRun, server: ServerForm) => Promise<void>;
+  onProgressChange?: () => void;
+  onRefresh: (run: DeploymentRun) => Promise<DeploymentRun>;
+  onSaveManifest: (manifestYaml: string) => Promise<boolean>;
+  onSelectVersion: (runId: string) => void;
+  onShowVersions: () => void;
+  onShowTest: () => void;
+  path: string;
+  production?: DeploymentRun;
+  productionVersion?: DeploymentRun;
+  saving: boolean;
+  setupComplete: boolean;
+  verifiedRun?: DeploymentRun;
+  verifiedRuns: DeploymentRun[];
+  workspace: WorkspacePreview;
+}) {
+  const restoreWebSaveSnapshot = Boolean(
+    initialServer && initialWebSavePending,
+  );
+  const runtimeReadyKey = initialServer
+    ? runtimeConfigReadyCacheKey(path, "production", initialServer)
+    : "";
+  const [runtimeConfigReady, setRuntimeConfigReady] = useState<boolean | null>(
+    restoreWebSaveSnapshot ? true : null,
+  );
+  const [runtimeConfigChecking, setRuntimeConfigChecking] = useState(
+    Boolean(initialServer) && !restoreWebSaveSnapshot,
+  );
+  const [runtimeReadyCacheLoaded, setRuntimeReadyCacheLoaded] = useState(
+    !initialServer || restoreWebSaveSnapshot,
+  );
+  const [runtimeConfigVerifiedReady, setRuntimeConfigVerifiedReady] = useState(
+    restoreWebSaveSnapshot,
+  );
+  const [cloudConfigReady, setCloudConfigReady] = useState<boolean | null>(
+    restoreWebSaveSnapshot ? false : null,
+  );
+  const [domainReady, setDomainReady] = useState(
+    productionDomainsReady(workspace),
+  );
+  const [publishing, setPublishing] = useState(false);
+  const [publishConfirmationOpen, setPublishConfirmationOpen] = useState(false);
+  const [editingConfig, setEditingConfig] = useState(false);
+  const [editingDomains, setEditingDomains] = useState(false);
+  const [selectingVersion, setSelectingVersion] = useState(false);
+  const [dnsTargetCopied, setDnsTargetCopied] = useState(false);
+  const [dnsProviders, setDnsProviders] = useState<DnsProviderHint[]>([]);
+  const [dnsProviderChecking, setDnsProviderChecking] = useState(false);
+  const [cnbAuthorizationDialog, setCnbAuthorizationDialog] = useState(false);
+  const [cnbToken, setCnbToken] = useState("");
+  const [authorizingCnb, setAuthorizingCnb] = useState(false);
+  const [routeCheck, setRouteCheck] = useState<RouteConflictCheck | null>(null);
+  const [checkingRoutes, setCheckingRoutes] = useState(false);
+  const [takeoverDialog, setTakeoverDialog] = useState(false);
+  const [takingOver, setTakingOver] = useState(false);
+  const [reapplyingRoutes, setReapplyingRoutes] = useState(false);
+  const [checkingProduction, setCheckingProduction] = useState(false);
+  const [productionCheckedAt, setProductionCheckedAt] = useState("");
+  const [productionCheckFailed, setProductionCheckFailed] = useState(false);
+  const [productionCheckLoaded, setProductionCheckLoaded] = useState(false);
+  const [
+    productionCheckCompletedThisSession,
+    setProductionCheckCompletedThisSession,
+  ] = useState(false);
+  const cloudConfigPendingKey = `project.${encodeURIComponent(path)}.cnb-secret-pending.production`;
+  const productionHealthCheckKey = production?.id
+    ? `project.${encodeURIComponent(path)}.production-health-check.${production.id}`
+    : "";
+  const productionSecretReferenceReady = secretReferenceReady(
+    workspace,
+    "production",
+  );
+  async function copyDnsTarget() {
+    if (!initialServer?.host) return;
+    try {
+      await copyText(initialServer.host);
+      setDnsTargetCopied(true);
+    } catch (error) {
+      onError(toMessage(error));
+    }
+  }
+  useEffect(() => setDnsTargetCopied(false), [initialServer?.host]);
+  useEffect(() => {
+    let active = true;
+    setProductionCheckedAt("");
+    setProductionCheckFailed(false);
+    setProductionCheckCompletedThisSession(false);
+    setProductionCheckLoaded(!productionHealthCheckKey);
+    if (productionHealthCheckKey) {
+      void getAppSetting(productionHealthCheckKey)
+        .then((value) => {
+          if (active && value && !Number.isNaN(new Date(value).getTime())) {
+            setProductionCheckedAt(value);
+          }
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          if (active) setProductionCheckLoaded(true);
+        });
+    }
+    return () => {
+      active = false;
+    };
+  }, [productionHealthCheckKey]);
+  useEffect(() => {
+    let active = true;
+    if (!initialServer || !runtimeReadyKey) {
+      setRuntimeConfigReady(null);
+      setRuntimeConfigChecking(false);
+      setRuntimeConfigVerifiedReady(false);
+      setRuntimeReadyCacheLoaded(true);
+      return () => {
+        active = false;
+      };
+    }
+    if (restoreWebSaveSnapshot) {
+      // Reopening an interrupted web handoff must immediately show the exact
+      // saved next step. Rechecking the runtime file here would temporarily
+      // replace it with a generic checking page even though reaching this
+      // checkpoint already proved that the server-side configuration exists.
+      setRuntimeConfigReady(true);
+      setRuntimeConfigChecking(false);
+      setRuntimeConfigVerifiedReady(true);
+      setRuntimeReadyCacheLoaded(true);
+      return () => {
+        active = false;
+      };
+    }
+    setRuntimeConfigReady(null);
+    setRuntimeConfigChecking(true);
+    setRuntimeConfigVerifiedReady(false);
+    setRuntimeReadyCacheLoaded(false);
+    // `RuntimeConfigFields` owns the real file and server check. This layer only
+    // restores a previous success while that single check runs; duplicating the
+    // same API/SSH work here caused a fast `false` result to overwrite the
+    // child's still-running check and briefly render the wrong next step.
+    void getAppSetting(runtimeReadyKey)
+      .then((cached) => {
+        if (!active) return;
+        const previouslyVerified = cached === "true";
+        setRuntimeConfigVerifiedReady(previouslyVerified);
+        if (previouslyVerified) setRuntimeConfigReady(true);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (active) setRuntimeReadyCacheLoaded(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, [initialServer, path, restoreWebSaveSnapshot, runtimeReadyKey]);
+  useEffect(() => {
+    let active = true;
+    if (restoreWebSaveSnapshot) {
+      setCloudConfigReady(false);
+      return () => {
+        active = false;
+      };
+    }
+    setCloudConfigReady(null);
+    if (!productionSecretReferenceReady) {
+      setCloudConfigReady(false);
+      return () => {
+        active = false;
+      };
+    }
+    void getAppSetting(cloudConfigPendingKey)
+      .then((pending) => {
+        if (active) setCloudConfigReady(pending !== "true");
+      })
+      .catch(() => {
+        if (active) setCloudConfigReady(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [
+    cloudConfigPendingKey,
+    productionSecretReferenceReady,
+    restoreWebSaveSnapshot,
+  ]);
+  const handleRuntimeConfigReady = useCallback(
+    (next: boolean, checking: boolean) => {
+      setRuntimeConfigChecking(checking);
+      if (checking) return;
+      setRuntimeConfigReady(next);
+      setRuntimeConfigVerifiedReady(next);
+      if (runtimeReadyKey)
+        void setAppSetting(runtimeReadyKey, String(next)).catch(
+          () => undefined,
+        );
+    },
+    [runtimeReadyKey],
+  );
+  // 服务器尚未恢复，或刚从另一个服务器切换过来时，不能沿用上一轮
+  // `false` 先渲染“需要保存”。组件会按服务器身份重新挂载，此处只在
+  // 当前服务器存在时采用它自己的核对结果。
+  const visibleRuntimeConfigReady = initialServer ? runtimeConfigReady : null;
+  const productionConfigChecking =
+    !initialServer ||
+    !runtimeReadyCacheLoaded ||
+    runtimeConfigChecking ||
+    visibleRuntimeConfigReady === null ||
+    cloudConfigReady === null;
+  const displayedRuntimeConfigReady = productionConfigChecking
+    ? null
+    : visibleRuntimeConfigReady;
+  const displayedCloudConfigReady = productionConfigChecking
+    ? null
+    : cloudConfigReady;
+  // 正式配置需要同时存在于云端密钥仓库和目标服务器。
+  const configReady =
+    cloudConfigReady === true && visibleRuntimeConfigReady === true;
+  const productionAddresses = useMemo(
+    () => environmentAddresses(workspace, "production"),
+    [workspace.manifestYaml],
+  );
+  const dnsRecordType = dnsRecordTypeForTarget(initialServer?.host);
+  useEffect(() => {
+    const hosts = Array.from(
+      new Set(productionAddresses.map((address) => address.host)),
+    );
+    if (production?.actionKind !== "route-check" || !hosts.length) {
+      setDnsProviders([]);
+      setDnsProviderChecking(false);
+      return;
+    }
+    let active = true;
+    setDnsProviderChecking(true);
+    void (async () => {
+      const discovered: DnsProviderHint[] = [];
+      const inspectedZones: string[] = [];
+      for (const host of hosts) {
+        const normalizedHost = host.toLowerCase();
+        if (
+          inspectedZones.some(
+            (zone) =>
+              normalizedHost === zone || normalizedHost.endsWith(`.${zone}`),
+          )
+        )
+          continue;
+        const provider = await detectDnsProvider(host).catch(() => null);
+        if (provider) inspectedZones.push(provider.zone);
+        if (
+          provider?.managementUrl &&
+          !discovered.some(
+            (current) => current.managementUrl === provider.managementUrl,
+          )
+        ) {
+          discovered.push(provider);
+          if (active) setDnsProviders([...discovered]);
+        }
+      }
+      if (active && !discovered.length) setDnsProviders([]);
+    })().finally(() => {
+      if (active) setDnsProviderChecking(false);
+    });
+    return () => {
+      active = false;
+    };
+  }, [production?.actionKind, productionAddresses]);
+  useEffect(() => {
+    if (!initialServer || !domainReady) {
+      setRouteCheck(null);
+      return;
+    }
+    let active = true;
+    setCheckingRoutes(true);
+    inspectServerRouteConflicts(path, "production", initialServer)
+      .then((result) => {
+        if (active) setRouteCheck(result);
+      })
+      .catch(() => {
+        if (active) setRouteCheck(null);
+      })
+      .finally(() => {
+        if (active) setCheckingRoutes(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [domainReady, initialServer, path, workspace.manifestYaml]);
+  const showingCurrentProduction = Boolean(
+    production &&
+    productionVersion &&
+    (!verifiedRun || versionKey(verifiedRun) === versionKey(productionVersion)),
+  );
+  if (production && productionVersion && showingCurrentProduction) {
+    const currentProduction = production;
+    const verifiedCandidate = productionVersion;
+    const addresses = productionAddresses;
+    const needsCnbAuthorization = production.issueCode === "AD-CNB-103";
+    const needsNewTestVersion = production.issueCode === "AD-REL-204";
+    const needsRouteTakeover = production.issueCode === "AD-SRV-206";
+    const needsRouteRepair = production.issueCode === "AD-SRV-209";
+    const canRetry = Boolean(
+      initialServer &&
+      (production.issueCode === "AD-CNB-202" ||
+        (production.status === "failed" &&
+          !needsCnbAuthorization &&
+          !needsNewTestVersion &&
+          !needsRouteTakeover &&
+          !needsRouteRepair)),
+    );
+    async function authorizeAndRetry() {
+      if (!initialServer || !cnbToken.trim()) return;
+      setAuthorizingCnb(true);
+      try {
+        await connectCnb(cnbToken, true, currentProduction.repository);
+        await onPromote(verifiedCandidate, initialServer);
+        setCnbToken("");
+        setCnbAuthorizationDialog(false);
+      } catch (error) {
+        onError(toMessage(error));
+      } finally {
+        setAuthorizingCnb(false);
+      }
+    }
+    async function takeOverAndRetry() {
+      if (!initialServer) return;
+      setTakingOver(true);
+      try {
+        const latestCheck = await inspectServerRouteConflicts(
+          path,
+          "production",
+          initialServer,
+        );
+        setRouteCheck(latestCheck);
+        if (!latestCheck.conflicts.length) {
+          await onRefresh(currentProduction);
+        } else if (!latestCheck.takeoverAvailable) {
+          throw new Error(
+            "这些地址属于另一个受管项目，不能自动接管，请先调整正式地址",
+          );
+        } else {
+          await takeOverServerRoutes(path, "production", initialServer);
+          // 镜像和容器已经发布完成，这里只切换统一 Caddy 路由并复核，
+          // 不再重复触发一次 CNB 生产部署。
+          await onRefresh(currentProduction);
+        }
+        setTakeoverDialog(false);
+      } catch (error) {
+        onError(toMessage(error));
+      } finally {
+        setTakingOver(false);
+      }
+    }
+    async function reapplyRoutes() {
+      setReapplyingRoutes(true);
+      try {
+        await reapplyDeploymentRoutes(currentProduction.id);
+        await onRefresh(currentProduction);
+      } catch (error) {
+        onError(toMessage(error));
+      } finally {
+        setReapplyingRoutes(false);
+      }
+    }
+    async function checkProduction() {
+      if (checkingProduction) return;
+      setCheckingProduction(true);
+      setProductionCheckFailed(false);
+      try {
+        const checked = await onRefresh(currentProduction);
+        if (checked.status !== "success") {
+          setProductionCheckCompletedThisSession(false);
+          return;
+        }
+        const checkedAt = new Date().toISOString();
+        setProductionCheckedAt(checkedAt);
+        setProductionCheckCompletedThisSession(true);
+        if (productionHealthCheckKey) {
+          void setAppSetting(productionHealthCheckKey, checkedAt).catch(
+            () => undefined,
+          );
+        }
+      } catch {
+        setProductionCheckFailed(true);
+        setProductionCheckCompletedThisSession(false);
+        onError("运行状态检查没有完成，当前页面仍保留上一次可信结果");
+      } finally {
+        setCheckingProduction(false);
+      }
+    }
+    return (
+      <div>
+        <PageHeading
+          action={
+            production.status === "success" ? (
+              <div className="flex flex-wrap justify-end gap-2">
+                <Button
+                  disabled={checkingProduction}
+                  onClick={() => void checkProduction()}
+                  variant="ghost"
+                >
+                  <RefreshCw
+                    className={checkingProduction ? "animate-spin-slow" : ""}
+                  />
+                  {checkingProduction ? "正在检查" : "检查运行状态"}
+                </Button>
+                <Button onClick={onShowVersions} variant="secondary">
+                  <Tags />
+                  发布或更换版本
+                </Button>
+              </div>
+            ) : undefined
+          }
+          description={
+            production.actionKind === "redeploy-test"
+              ? "项目增加了新服务，先部署并验证一个新的测试版本。"
+              : production.actionKind === "route-check"
+                ? "服务已经在服务器运行，现在只需要设置正式地址。"
+                : production.actionKind === "route-repair"
+                  ? "服务已经在服务器运行，现在只需要重新应用正式地址。"
+                  : production.status === "success"
+                    ? addresses.length
+                      ? "当前使用测试通过的同一版本，正式地址可以访问。"
+                      : "当前使用测试通过的同一版本，服务运行正常。"
+                    : "正式版使用测试通过的同一版本。"
+          }
+          title={
+            production.status === "success"
+              ? "正式版已上线"
+              : deploymentTitle(production)
+          }
+        />
+        {production.status === "success" ? (
+          <p
+            aria-live="polite"
+            className={`-mt-4 mb-5 text-xs ${productionCheckFailed ? "font-medium text-[var(--warning)]" : "text-[var(--muted-foreground)]"}`}
+          >
+            {productionCheckFailed
+              ? productionCheckedAt
+                ? `这次检查没有完成，仍显示上次可信结果；上次成功检查：${deploymentUpdatedAtLabel(productionCheckedAt)}。`
+                : "这次检查没有完成，仍显示最近一次部署结果。"
+              : !productionCheckLoaded
+                ? "正在读取上次检查记录"
+                : productionCheckedAt
+                  ? `${productionCheckCompletedThisSession ? "最近检查" : "上次成功检查"}：${deploymentUpdatedAtLabel(productionCheckedAt)} · 正式版仍可访问`
+                  : "还没有在这台电脑检查过运行状态 · 页面显示最近一次部署结果"}
+          </p>
+        ) : null}
+        <CurrentVersionBanner label="当前正式版本" run={verifiedCandidate} />
+        {production.status !== "success" ? (
+          <DeploymentState
+            compactMessage={
+              production.actionKind === "route-check"
+                ? "服务已经启动，不会重复部署。新增或确认下方解析记录后，点击“检查并完成发布”。"
+                : undefined
+            }
+            compactTitle={
+              production.actionKind === "route-check"
+                ? "还差设置正式地址"
+                : undefined
+            }
+            secondaryAction={
+              production.actionKind === "route-check" && initialServer ? (
+                <Button
+                  onClick={() => void copyDnsTarget()}
+                  size="sm"
+                  variant="secondary"
+                >
+                  <Copy />
+                  {dnsTargetCopied ? "记录值已复制" : "复制记录值"}
+                </Button>
+              ) : undefined
+            }
+            action={
+              needsNewTestVersion ? (
+                <Button onClick={onShowTest} size="sm">
+                  <Rocket />
+                  重新部署测试版
+                </Button>
+              ) : needsCnbAuthorization ? (
+                <Button
+                  onClick={() => setCnbAuthorizationDialog(true)}
+                  size="sm"
+                >
+                  <KeyRound />
+                  更新 CNB 授权
+                </Button>
+              ) : needsRouteTakeover ? (
+                <Button
+                  disabled={!initialServer || checkingRoutes}
+                  onClick={() => setTakeoverDialog(true)}
+                  size="sm"
+                >
+                  <ArrowUpRight />
+                  接管现有地址
+                </Button>
+              ) : needsRouteRepair ? (
+                <Button
+                  disabled={reapplyingRoutes}
+                  onClick={() => void reapplyRoutes()}
+                  size="sm"
+                >
+                  {reapplyingRoutes ? (
+                    <LoaderCircle className="animate-spin-slow" />
+                  ) : (
+                    <RefreshCw />
+                  )}
+                  重新应用地址
+                </Button>
+              ) : canRetry ? (
+                <Button
+                  disabled={publishing}
+                  onClick={async () => {
+                    if (!initialServer) return;
+                    setPublishing(true);
+                    try {
+                      await onPromote(verifiedCandidate, initialServer);
+                    } finally {
+                      setPublishing(false);
+                    }
+                  }}
+                  size="sm"
+                >
+                  {publishing ? (
+                    <LoaderCircle className="animate-spin-slow" />
+                  ) : (
+                    <Rocket />
+                  )}
+                  重新发布同一版本
+                </Button>
+              ) : undefined
+            }
+            onError={onError}
+            run={production}
+            onRefresh={onRefresh}
+          />
+        ) : null}
+        {production.actionKind === "route-check" &&
+        initialServer &&
+        addresses.length ? (
+          <Section
+            title="设置正式访问地址"
+            trailing={`${addresses.length} 个地址`}
+          >
+            <div className="mb-3 flex flex-col items-start gap-3 min-[760px]:flex-row min-[760px]:items-center min-[760px]:justify-between">
+              <p className="m-0 text-xs leading-5 text-[var(--muted-foreground)]">
+                在域名平台新增以下记录；若记录已存在，确认记录值一致即可。
+              </p>
+              {dnsProviders.length ? (
+                <div className="flex flex-wrap gap-2">
+                  {dnsProviders.map((provider) => (
+                    <Button
+                      key={provider.managementUrl}
+                      onClick={() => void openUrl(provider.managementUrl!)}
+                      size="sm"
+                      variant="secondary"
+                    >
+                      <ExternalLink />
+                      打开{provider.provider}
+                      {dnsProviders.length > 1 ? ` · ${provider.zone}` : ""}
+                    </Button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+            <div className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
+              {addresses.map((item) => (
+                <StatusRow
+                  detail={`${dnsHostRecordLabel(item.host, dnsProviders, dnsProviderChecking)} · 类型 ${dnsRecordType} · 记录值 ${initialServer.host}`}
+                  key={item.service}
+                  label={item.host}
+                  state="warning"
+                  status="待添加或生效"
+                />
+              ))}
+            </div>
+          </Section>
+        ) : null}
+        {production.status === "success" && addresses.length ? (
+          <Section
+            title="正式访问地址"
+            trailing={`${addresses.length} 个服务可访问`}
+          >
+            <div className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
+              {addresses.map((item, index) => (
+                <StatusRow
+                  action={
+                    <Button
+                      onClick={() => void openUrl(item.url)}
+                      size="sm"
+                      variant={index === 0 ? "secondary" : "ghost"}
+                    >
+                      <ExternalLink />
+                      打开{item.label}
+                    </Button>
+                  }
+                  detail={item.url}
+                  key={item.service}
+                  label={item.label}
+                  state="success"
+                  status="可以访问"
+                />
+              ))}
+            </div>
+          </Section>
+        ) : null}
+        <CnbAuthorizationDialog
+          description="保存新授权后会继续发布当前选中的测试通过版本，不会重新构建镜像。"
+          fieldId="production-cnb-token"
+          onOpenChange={setCnbAuthorizationDialog}
+          onSubmit={() => void authorizeAndRetry()}
+          onTokenChange={setCnbToken}
+          open={cnbAuthorizationDialog}
+          submitDisabled={!initialServer}
+          submitLabel="保存授权并继续发布"
+          title="更新 CNB 授权"
+          token={cnbToken}
+          working={authorizingCnb}
+        />
+        <Dialog onOpenChange={setTakeoverDialog} open={takeoverDialog}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>把现有地址切换到新版本？</DialogTitle>
+              <DialogDescription>
+                新版本已经在服务器启动。系统会先备份原地址设置，再一次性切换并校验；任何一步失败都会恢复原设置。
+              </DialogDescription>
+            </DialogHeader>
+            <div className="rounded-md border border-[var(--border)] bg-[var(--muted)] px-4 py-3 text-sm">
+              {(routeCheck?.conflicts ?? []).length ? (
+                <>
+                  <div className="font-medium">将接管以下地址</div>
+                  <div className="mt-1 text-[var(--muted-foreground)]">
+                    {routeCheck?.conflicts.map((item) => item.host).join("、")}
+                  </div>
+                </>
+              ) : (
+                <div className="text-[var(--muted-foreground)]">
+                  确认时会再次检查服务器上的实际占用情况。
+                </div>
+              )}
+            </div>
+            <DialogFooter>
+              <Button
+                disabled={takingOver}
+                onClick={() => setTakeoverDialog(false)}
+                variant="secondary"
+              >
+                取消
+              </Button>
+              <Button
+                disabled={takingOver || !initialServer}
+                onClick={() => void takeOverAndRetry()}
+              >
+                {takingOver ? (
+                  <LoaderCircle className="animate-spin-slow" />
+                ) : (
+                  <Rocket />
+                )}
+                接管并完成发布
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      </div>
+    );
+  }
+  if (!verifiedRun) {
+    const needsInitialSetup = !setupComplete;
+    return (
+      <div>
+        <PageHeading
+          description="把测试通过的版本发布给真实用户。"
+          title="发布正式版"
+        />
+        <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-6 py-12 text-center">
+          <Circle className="mx-auto size-9 text-[var(--subtle-foreground)]" />
+          <h2 className="mb-0 mt-4 text-lg font-semibold">
+            {needsInitialSetup ? "先完成一次上线设置" : "还没有测试通过的版本"}
+          </h2>
+          <p className="mx-auto mb-5 mt-2 max-w-lg text-sm leading-6 text-[var(--muted-foreground)]">
+            {needsInitialSetup
+              ? "完成后系统会生成并部署测试版；只有你确认通过的版本才能发布给真实用户。"
+              : "正式版必须使用你已经验证过的测试版本，不会重新生成另一个版本。"}
+          </p>
+          <Button onClick={needsInitialSetup ? onShowVersions : onShowTest}>
+            {needsInitialSetup ? "继续完成设置" : "前往测试版"}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+  const candidate = verifiedRun;
+  const currentProductionVersion = production?.sourceRunId
+    ? verifiedRuns.find((run) => run.id === production.sourceRunId)
+    : undefined;
+  const restoring = isOlderVersion(candidate, currentProductionVersion);
+  const activePreparation =
+    productionConfigChecking || !configReady || editingConfig
+      ? "config"
+      : !domainReady || editingDomains
+        ? "domain"
+        : "publish";
+  const cloudWebSavePending =
+    !productionConfigChecking &&
+    !editingConfig &&
+    displayedRuntimeConfigReady === true &&
+    displayedCloudConfigReady === false;
+  const preparationTitle = productionConfigChecking
+    ? "正在确认正式发布条件"
+    : activePreparation === "config"
+      ? cloudWebSavePending
+        ? "在网页保存正式配置"
+        : "先完成正式配置"
+      : activePreparation === "domain"
+        ? "还需要填写正式地址"
+        : restoring
+          ? "可以恢复正式版"
+          : "可以发布正式版";
+  async function publish() {
+    if (!initialServer || !configReady || !domainReady) return;
+    setPublishing(true);
+    try {
+      await onPromote(candidate, initialServer);
+      setPublishConfirmationOpen(false);
+    } finally {
+      setPublishing(false);
+    }
+  }
+  return (
+    <div>
+      <PageHeading
+        description={
+          restoring
+            ? "系统会使用测试通过的历史版本，不会重新构建。"
+            : "系统会使用测试通过的同一版本，不会重新构建。"
+        }
+        title={preparationTitle}
+      />
+      <div className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
+        <StatusRow
+          action={
+            verifiedRuns.length > 1 ? (
+              <Button
+                onClick={() => setSelectingVersion((current) => !current)}
+                size="sm"
+                variant="ghost"
+              >
+                {selectingVersion ? "收起版本" : "更换版本"}
+              </Button>
+            ) : (
+              <Button onClick={onShowVersions} size="sm" variant="ghost">
+                查看版本记录
+              </Button>
+            )
+          }
+          detail={`${versionTitle(candidate)} · ${versionMeta(candidate)}`}
+          label={restoring ? "准备恢复的版本" : "准备发布的版本"}
+          state="success"
+          status="测试通过"
+        />
+        <StatusRow
+          action={
+            configReady ? (
+              <Button
+                onClick={() => {
+                  setEditingConfig(true);
+                  setEditingDomains(false);
+                }}
+                size="sm"
+                variant="ghost"
+              >
+                修改
+              </Button>
+            ) : undefined
+          }
+          detail={productionConfigDetail(
+            displayedRuntimeConfigReady,
+            displayedCloudConfigReady,
+          )}
+          label="正式配置"
+          state={
+            productionConfigChecking
+              ? "idle"
+              : configReady
+                ? "success"
+                : "warning"
+          }
+          status={
+            productionConfigChecking
+              ? "正在确认"
+              : configReady
+                ? "已准备"
+                : productionConfigStatus(
+                    displayedRuntimeConfigReady,
+                    displayedCloudConfigReady,
+                  )
+          }
+        />
+        <StatusRow
+          action={
+            domainReady && configReady ? (
+              <Button
+                onClick={() => {
+                  setEditingDomains(true);
+                  setEditingConfig(false);
+                }}
+                size="sm"
+                variant="ghost"
+              >
+                修改
+              </Button>
+            ) : undefined
+          }
+          detail={
+            domainReady
+              ? productionAddress(workspace) || "所有服务地址均已填写"
+              : productionConfigChecking
+                ? "确认正式配置后再填写"
+                : configReady
+                  ? "填写用户最终访问项目的地址"
+                  : "完成正式配置后再填写"
+          }
+          label="正式地址"
+          state={domainReady ? "success" : configReady ? "warning" : "idle"}
+          status={
+            domainReady ? "已准备" : configReady ? "需要填写" : "随后处理"
+          }
+        />
+      </div>
+      {selectingVersion ? (
+        <Section
+          title="更换测试通过的版本"
+          trailing={`${verifiedRuns.length} 个可发布`}
+        >
+          <div className="divide-y divide-[var(--border)] overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
+            {verifiedRuns.map((run) => (
+              <button
+                aria-pressed={run.id === candidate.id}
+                className={`flex w-full items-center justify-between gap-4 px-4 py-3 text-left outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus)] ${run.id === candidate.id ? "bg-[var(--info-soft)]" : "hover:bg-[var(--muted)]/50"}`}
+                key={run.id}
+                onClick={() => {
+                  onSelectVersion(run.id);
+                  setSelectingVersion(false);
+                }}
+                type="button"
+              >
+                <span className="min-w-0">
+                  <strong className="block truncate text-sm">
+                    {versionTitle(run)}
+                  </strong>
+                  <span
+                    className="mt-1 block truncate text-xs text-[var(--muted-foreground)]"
+                    title={versionMeta(run)}
+                  >
+                    {versionMeta(run)}
+                  </span>
+                </span>
+                <span className="text-xs text-[var(--success)]">
+                  {currentTestVersion &&
+                  versionKey(run) === versionKey(currentTestVersion)
+                    ? run.id === candidate.id
+                      ? "当前测试版 · 已选择"
+                      : "当前测试版 · 推荐"
+                    : run.id === candidate.id
+                      ? "已选择"
+                      : "测试通过"}
+                </span>
+              </button>
+            ))}
+          </div>
+        </Section>
+      ) : null}
+      {activePreparation === "config" ? (
+        <Section
+          title={
+            productionConfigChecking
+              ? "正在确认正式配置"
+              : cloudWebSavePending
+                ? "在代码平台网页保存"
+                : "配置内容"
+          }
+          trailing={
+            cloudWebSavePending
+              ? undefined
+              : productionConfigStatus(
+                  displayedRuntimeConfigReady,
+                  displayedCloudConfigReady,
+                )
+          }
+        >
+          <div className="mb-3 flex items-center justify-between gap-4">
+            <p className="m-0 text-xs leading-5 text-[var(--muted-foreground)]">
+              {cloudWebSavePending
+                ? "打开网页，粘贴已经准备好的文件名和配置内容并保存；完成后返回这里继续。"
+                : "有需要填写的内容会列在下面；没有时直接使用当前配置继续。"}
+            </p>
+            {configReady && editingConfig ? (
+              <Button
+                onClick={() => setEditingConfig(false)}
+                size="sm"
+                variant="ghost"
+              >
+                完成查看
+              </Button>
+            ) : null}
+          </div>
+          {runtimeReadyCacheLoaded && !cloudWebSavePending ? (
+            <RuntimeConfigFields
+              environment="production"
+              onError={onError}
+              onMarkOptional={(key) =>
+                onSaveManifest(
+                  runtimeVariableOptionalManifest(workspace.manifestYaml, key),
+                )
+              }
+              onReadyChange={handleRuntimeConfigReady}
+              path={path}
+              server={initialServer}
+              secretVariables={workspace.inspection.environment_variables
+                .filter((item) => item.secret)
+                .map((item) => item.name)}
+              verifiedReady={runtimeConfigVerifiedReady}
+            />
+          ) : !runtimeReadyCacheLoaded ? (
+            <div className="flex min-h-28 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] text-sm text-[var(--muted-foreground)]">
+              <LoaderCircle className="size-4 animate-spin-slow" />
+              正在恢复已确认的正式配置
+            </div>
+          ) : null}
+          {productionConfigChecking ? (
+            <div className="mt-3 flex items-center gap-2 rounded-md bg-[var(--muted)] px-3 py-2 text-xs text-[var(--muted-foreground)]">
+              <LoaderCircle className="size-3.5 shrink-0 animate-spin-slow text-[var(--accent)]" />
+              正在确认已保存的正式配置，完成后会显示准确下一步
+            </div>
+          ) : (
+            <CnbSecretSetup
+              environment="production"
+              onError={onError}
+              onProgressChange={onProgressChange}
+              onReadyChange={setCloudConfigReady}
+              onSaveManifest={onSaveManifest}
+              path={path}
+              runtimeReady={visibleRuntimeConfigReady === true}
+              server={initialServer}
+              workspace={workspace}
+            />
+          )}
+        </Section>
+      ) : activePreparation === "domain" ? (
+        <Section title="下一步：填写正式地址" trailing="最后一项准备">
+          <p className="mb-4 mt-0 text-xs leading-5 text-[var(--muted-foreground)]">
+            填写用户最终访问项目的地址，系统会自动配置服务器访问和 HTTPS。
+          </p>
+          {initialServer?.host ? (
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-md bg-[var(--muted)]/45 px-3 py-2.5">
+              <div className="min-w-0">
+                <strong className="block text-sm">
+                  域名需要指向这台服务器
+                </strong>
+                <span className="mt-1 block text-xs leading-5 text-[var(--muted-foreground)]">
+                  在域名服务商添加 {dnsRecordType} 记录，目标填写{" "}
+                  {initialServer.host}。发布后系统会自动检查是否生效。
+                </span>
+              </div>
+              <Button
+                onClick={() => void copyDnsTarget()}
+                size="sm"
+                variant="secondary"
+              >
+                {dnsTargetCopied ? <Check /> : <Copy />}
+                {dnsTargetCopied ? "服务器 IP 已复制" : "复制服务器 IP"}
+              </Button>
+            </div>
+          ) : null}
+          <DomainFields
+            environment="production"
+            onReadyChange={setDomainReady}
+            onSaveManifest={onSaveManifest}
+            saving={saving}
+            workspace={workspace}
+          />
+          {domainReady && editingDomains ? (
+            <div className="mt-3 flex justify-end">
+              <Button
+                onClick={() => setEditingDomains(false)}
+                size="sm"
+                variant="ghost"
+              >
+                完成查看
+              </Button>
+            </div>
+          ) : null}
+        </Section>
+      ) : (
+        <SuccessBanner
+          message={
+            restoring && currentProductionVersion
+              ? `正式网站将从“${versionComparisonTitle(currentProductionVersion)}”恢复到“${versionComparisonTitle(candidate)}”。`
+              : `“${versionTitle(candidate)}”的配置和地址均已准备。`
+          }
+          title={restoring ? "恢复条件已经准备完成" : "发布条件已经准备完成"}
+        />
+      )}
+      {routeCheck?.conflicts.length ? (
+        <IssueBanner
+          message={`服务器上的旧版本正在使用 ${routeCheck.conflicts
+            .map((item) => item.host)
+            .join(
+              "、",
+            )}。系统不会直接覆盖；新版本启动成功后，会请你确认是否接管这些地址。`}
+          title="正式地址正在被旧版本使用"
+        />
+      ) : checkingRoutes ? (
+        <div className="mt-4 flex items-center gap-2 text-sm text-[var(--muted-foreground)]">
+          <LoaderCircle className="size-4 animate-spin-slow" />
+          正在确认正式地址是否可以安全切换
+        </div>
+      ) : null}
+      {!initialServer ? (
+        <IssueBanner
+          message="测试服务器信息未恢复，请回到测试版重新确认运行服务器。"
+          title={restoring ? "还不能恢复正式版" : "还不能发布正式版"}
+        />
+      ) : null}
+      {activePreparation === "publish" ? (
+        <div className="mt-6 flex items-center justify-between gap-5 border-t border-[var(--border)] pt-5">
+          <span className="text-xs text-[var(--muted-foreground)]">
+            发布前还会让你最后确认一次
+          </span>
+          <Button
+            disabled={!initialServer || publishing}
+            onClick={() => setPublishConfirmationOpen(true)}
+          >
+            {publishing ? (
+              <LoaderCircle className="animate-spin-slow" />
+            ) : (
+              <Rocket />
+            )}
+            {restoring ? "恢复正式版" : "发布正式版"}
+          </Button>
+        </div>
+      ) : null}
+      <Dialog
+        onOpenChange={setPublishConfirmationOpen}
+        open={publishConfirmationOpen}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {restoring ? "恢复这个正式版本？" : "发布这个正式版本？"}
+            </DialogTitle>
+            <DialogDescription>
+              {productionConfirmationMessage({
+                candidateTitle: versionComparisonTitle(candidate),
+                currentTitle: currentProductionVersion
+                  ? versionComparisonTitle(currentProductionVersion)
+                  : undefined,
+                restoring,
+                target: productionAddress(workspace),
+              })}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              disabled={publishing}
+              onClick={() => setPublishConfirmationOpen(false)}
+              variant="secondary"
+            >
+              取消
+            </Button>
+            <Button disabled={publishing} onClick={() => void publish()}>
+              {publishing ? (
+                <LoaderCircle className="animate-spin-slow" />
+              ) : (
+                <Rocket />
+              )}
+              {restoring ? "确认恢复" : "确认发布"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+export function CnbSecretSetup({
+  environment,
+  onError,
+  onProgressChange,
+  onReadyChange,
+  onSaveManifest,
+  path,
+  runtimeReady,
+  server,
+  workspace,
+}: {
+  environment: "staging" | "production";
+  onError: (message: string) => void;
+  onProgressChange?: () => void;
+  onReadyChange: (ready: boolean) => void;
+  onSaveManifest: (manifestYaml: string) => Promise<boolean>;
+  path: string;
+  runtimeReady: boolean;
+  server?: ServerForm;
+  workspace: WorkspacePreview;
+}) {
+  const pendingKey = `project.${encodeURIComponent(path)}.cnb-secret-pending.${environment}`;
+  const repositoryKey = `project.${encodeURIComponent(path)}.cnb-secret-repository`;
+  const progressKey = `project.${encodeURIComponent(path)}.cnb-secret-progress.${environment}`;
+  const [ready, setReady] = useState(false);
+  const [repository, setRepository] = useState(() =>
+    suggestedSecretRepository(workspace),
+  );
+  const [repositoryPreviouslyUsed, setRepositoryPreviouslyUsed] =
+    useState(false);
+  const [repositoryLoaded, setRepositoryLoaded] = useState(false);
+  const [repositoryAvailability, setRepositoryAvailability] = useState<
+    "idle" | "checking" | "available" | "missing" | "error"
+  >("idle");
+  const [resumeStage, setResumeStage] = useState<
+    | "loading"
+    | "creation-page-opened"
+    | "repository-ready"
+    | "save-page-opened"
+    | null
+  >("loading");
+  const [bundle, setBundle] = useState<CnbSecretBundle | null>(null);
+  const [copyStatus, setCopyStatus] = useState("");
+  const [saveConfirmationOpen, setSaveConfirmationOpen] = useState(false);
+  const [creationHint, setCreationHint] = useState("");
+  const [repositoryEditorOpen, setRepositoryEditorOpen] = useState(false);
+  const [savePageOpened, setSavePageOpened] = useState(false);
+  const [redoingSave, setRedoingSave] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [working, setWorking] = useState(false);
+  const automaticResumeStarted = useRef(false);
+  const verifiedRepository = useRef("");
+  const repositoryCheckRequest = useRef<{
+    promise: ReturnType<typeof checkCnbSecretRepositoryAccess>;
+    repository: string;
+  } | null>(null);
+  const repositoryRecorded = recordedSecretRepository(
+    workspace,
+    environment,
+    repository,
+  );
+  const reusableRepositoryReady = repositoryAvailability === "available";
+  const resumingSave = resumeStage === "save-page-opened";
+  const contentCopied = copyStatus.startsWith("配置内容已复制");
+  const resumedSaveChoice = resumingSave && !redoingSave && !contentCopied;
+
+  function requestRepositoryAccess(repositoryName: string) {
+    const existing = repositoryCheckRequest.current;
+    if (existing?.repository === repositoryName) return existing.promise;
+    const promise = checkCnbSecretRepositoryAccess(repositoryName).finally(
+      () => {
+        if (repositoryCheckRequest.current?.promise === promise) {
+          repositoryCheckRequest.current = null;
+        }
+      },
+    );
+    repositoryCheckRequest.current = {
+      promise,
+      repository: repositoryName,
+    };
+    return promise;
+  }
+
+  useEffect(() => {
+    let active = true;
+    if (!secretReferenceReady(workspace, environment)) {
+      setReady(false);
+      onReadyChange(false);
+      return () => {
+        active = false;
+      };
+    }
+    getAppSetting(pendingKey)
+      .then((pending) => {
+        if (!active) return;
+        const next = pending !== "true";
+        setReady(next);
+        onReadyChange(next);
+      })
+      .catch(() => {
+        if (!active) return;
+        setReady(false);
+        onReadyChange(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [environment, onReadyChange, pendingKey, workspace]);
+
+  useEffect(() => {
+    let active = true;
+    setRepositoryLoaded(false);
+    const existing =
+      secretRepositoryFromManifest(workspace, environment) ||
+      secretRepositoryFromManifest(workspace, "staging");
+    if (existing) {
+      setRepository(existing);
+      setRepositoryPreviouslyUsed(true);
+      setRepositoryLoaded(true);
+      void setAppSetting("cnb.secret-repository", existing).catch(
+        () => undefined,
+      );
+      return () => {
+        active = false;
+      };
+    }
+    Promise.all([
+      getAppSetting(repositoryKey),
+      getAppSetting("cnb.secret-repository"),
+    ])
+      .then(([savedForProject, savedForAccount]) => {
+        if (!active) return;
+        // A verified account-level location is intentionally reusable across
+        // projects. A project-scoped value can be a suggested name left by an
+        // interrupted handoff, so it must not override the reusable location.
+        const saved = savedForAccount?.includes("/")
+          ? savedForAccount
+          : savedForProject?.includes("/")
+            ? savedForProject
+            : "";
+        if (saved) {
+          setRepository(saved);
+          setRepositoryPreviouslyUsed(saved === savedForAccount);
+        } else {
+          setRepositoryPreviouslyUsed(false);
+        }
+        setRepositoryLoaded(true);
+      })
+      .catch(() => {
+        if (active) setRepositoryLoaded(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, [environment, repositoryKey, workspace]);
+
+  useEffect(() => {
+    let active = true;
+    setResumeStage("loading");
+    getAppSetting(progressKey)
+      .then((saved) => {
+        if (!active) return;
+        setResumeStage(
+          saved === "creation-page-opened" ||
+            saved === "repository-ready" ||
+            saved === "save-page-opened"
+            ? saved
+            : null,
+        );
+      })
+      .catch(() => {
+        if (active) setResumeStage(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [progressKey]);
+
+  useEffect(() => {
+    let active = true;
+    // Opening CNB is an explicit handoff. Keep the recovery actions visible
+    // until the user returns and asks us to verify, otherwise a background
+    // check can replace the explicit "created, open configuration" recovery
+    // action before the user has a chance to use it.
+    if (resumeStage === "creation-page-opened") {
+      setRepositoryAvailability("idle");
+      return () => {
+        active = false;
+      };
+    }
+    if (
+      !repositoryLoaded ||
+      resumeStage === "loading" ||
+      !repository.includes("/") ||
+      (!repositoryPreviouslyUsed &&
+        !repositoryRecorded &&
+        resumeStage !== "repository-ready" &&
+        resumeStage !== "save-page-opened")
+    ) {
+      setRepositoryAvailability("idle");
+      return () => {
+        active = false;
+      };
+    }
+    const normalizedRepository = repository.trim();
+    if (verifiedRepository.current === normalizedRepository) {
+      setRepositoryAvailability("available");
+      return () => {
+        active = false;
+      };
+    }
+    setRepositoryAvailability("checking");
+    requestRepositoryAccess(normalizedRepository)
+      .then((result) => {
+        if (!active) return;
+        if (result.ok) verifiedRepository.current = normalizedRepository;
+        setRepositoryAvailability(result.ok ? "available" : "missing");
+        if (!result.ok) {
+          setRepositoryPreviouslyUsed(false);
+          setCreationHint(
+            "CNB 网页上还没有找到这个安全位置。可能上次没有完成创建，重新创建即可。",
+          );
+        }
+      })
+      .catch(() => {
+        if (active) setRepositoryAvailability("error");
+      });
+    return () => {
+      active = false;
+    };
+  }, [
+    repository,
+    repositoryLoaded,
+    repositoryPreviouslyUsed,
+    repositoryRecorded,
+    resumeStage,
+  ]);
+
+  async function saveResumeStage(
+    next:
+      "creation-page-opened" | "repository-ready" | "save-page-opened" | null,
+  ) {
+    await setAppSetting(progressKey, next ?? "");
+    setResumeStage(next);
+    onProgressChange?.();
+  }
+
+  async function verifyRepository(): Promise<boolean> {
+    const normalizedRepository = repository.trim();
+    if (verifiedRepository.current === normalizedRepository) {
+      setRepositoryAvailability("available");
+      return true;
+    }
+    setRepositoryAvailability("checking");
+    try {
+      const result = await requestRepositoryAccess(normalizedRepository);
+      if (!result.ok) {
+        setRepositoryAvailability("missing");
+        setRepositoryPreviouslyUsed(false);
+        setCreationHint(
+          "CNB 网页上还没有找到这个安全位置。请先完成创建，再回到这里继续。",
+        );
+        return false;
+      }
+      verifiedRepository.current = normalizedRepository;
+      setRepositoryAvailability("available");
+      setRepositoryPreviouslyUsed(true);
+      setCreationHint("");
+      return true;
+    } catch (error) {
+      setRepositoryAvailability("error");
+      onError(toMessage(error));
+      return false;
+    }
+  }
+
+  async function generate(resumeSavePage = false, openAfterGenerate = false) {
+    if (!server || !repository.includes("/")) return;
+    setGenerating(true);
+    setWorking(true);
+    try {
+      // A persisted `save-page-opened` checkpoint lets the remote location
+      // check and safe local bundle regeneration run in parallel. The check
+      // still gates what the user can see and confirm; this only avoids making
+      // the same CNB request again inside bundle generation.
+      const trustedSaveCheckpoint =
+        resumeSavePage && resumeStage === "save-page-opened";
+      if (
+        !trustedSaveCheckpoint &&
+        !(
+          repositoryAvailability === "available" &&
+          verifiedRepository.current === repository.trim()
+        ) &&
+        !(await verifyRepository())
+      )
+        return;
+      await Promise.all([
+        setAppSetting(repositoryKey, repository.trim()),
+        setAppSetting("cnb.secret-repository", repository.trim()),
+      ]);
+      setRepositoryPreviouslyUsed(true);
+      if (!resumeSavePage) await saveResumeStage("repository-ready");
+      const generated = await prepareCnbDeploymentBundle(
+        path,
+        environment,
+        repository.trim(),
+        server,
+        resumeSavePage,
+      );
+      if (generated.missingVariables.length) {
+        throw new Error(
+          `还有 ${generated.missingVariables.length} 项配置没有值，请先补齐后再生成`,
+        );
+      }
+      setBundle(generated);
+      setSavePageOpened(resumeSavePage);
+      setCopyStatus("");
+      if (openAfterGenerate) {
+        setRedoingSave(true);
+        await copyText(generated.filename);
+        setCopyStatus("文件名已复制");
+        await openUrl(cnbNewFileUrl(repository, generated.filename));
+        await saveResumeStage("save-page-opened");
+        setSavePageOpened(true);
+      }
+    } catch (error) {
+      onError(toMessage(error));
+    } finally {
+      setGenerating(false);
+      setWorking(false);
+    }
+  }
+
+  async function openSecretRepositoryCreation() {
+    const name = repository.trim().split("/").filter(Boolean).pop();
+    if (!name) return;
+    setWorking(true);
+    try {
+      await copyText(name);
+      await setAppSetting(repositoryKey, repository.trim());
+      setCreationHint(
+        "名称已经复制。请在网页中粘贴名称，选择“密钥仓库”并创建，完成后回到这里。",
+      );
+      await openUrl("https://cnb.cool/new/repos");
+      await saveResumeStage("creation-page-opened");
+    } catch (error) {
+      onError(toMessage(error));
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function copyBundle(currentBundle: CnbSecretBundle) {
+    setWorking(true);
+    try {
+      await copyText(currentBundle.content);
+      setCopyStatus("配置内容已复制，请回到网页粘贴并保存");
+    } catch (error) {
+      onError(toMessage(error));
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function openBundleSavePage(currentBundle: CnbSecretBundle) {
+    setRedoingSave(true);
+    setWorking(true);
+    try {
+      // CNB currently ignores the filename query parameter on its Web editor.
+      // Copy the filename before opening so the first paste has one clear
+      // destination; the user can then return here to copy the secret content.
+      await copyText(currentBundle.filename);
+      setCopyStatus("文件名已复制");
+      await openUrl(cnbNewFileUrl(repository, currentBundle.filename));
+      await saveResumeStage("save-page-opened");
+      setSavePageOpened(true);
+    } catch (error) {
+      onError(toMessage(error));
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function restartBundleSave(currentBundle: CnbSecretBundle) {
+    setRedoingSave(true);
+    await openBundleSavePage(currentBundle);
+  }
+
+  async function confirmSaved(currentBundle: CnbSecretBundle) {
+    setWorking(true);
+    try {
+      if (!(await verifyRepository())) return;
+      const document = parseDocument(workspace.manifestYaml);
+      document.setIn(
+        ["environments", environment, "secrets_ref"],
+        currentBundle.fileUrl,
+      );
+      if (
+        environment === "staging" &&
+        !secretReferenceReady(workspace, "production")
+      ) {
+        document.setIn(
+          ["environments", "production", "secrets_ref"],
+          currentBundle.fileUrl.replace(/\.staging\.yml$/, ".production.yml"),
+        );
+      }
+      if (!(await onSaveManifest(document.toString({ lineWidth: 0 })))) {
+        throw new Error("云端安全配置没有保存成功，请重试");
+      }
+      await setAppSetting(pendingKey, "false");
+      await setAppSetting("cnb.secret-repository", repository.trim());
+      await saveResumeStage(null);
+      if (
+        environment === "staging" &&
+        !secretReferenceReady(workspace, "production")
+      ) {
+        await setAppSetting(
+          `project.${encodeURIComponent(path)}.cnb-secret-pending.production`,
+          "true",
+        );
+      }
+      await clearClipboardIfUnchanged(currentBundle.content);
+      setEditing(false);
+      setReady(true);
+      onReadyChange(true);
+    } catch (error) {
+      onError(toMessage(error));
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function confirmResumedSave() {
+    if (!server || !repository.includes("/")) return;
+    setWorking(true);
+    try {
+      const generated = await prepareCnbDeploymentBundle(
+        path,
+        environment,
+        repository.trim(),
+        server,
+      );
+      if (generated.missingVariables.length) {
+        throw new Error(
+          `还有 ${generated.missingVariables.length} 项配置没有值，请先补齐后再继续`,
+        );
+      }
+      await confirmSaved(generated);
+    } catch (error) {
+      onError(toMessage(error));
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  function requestSavedConfirmation() {
+    if (!contentCopied) {
+      setSaveConfirmationOpen(true);
+      return;
+    }
+    if (bundle) void confirmSaved(bundle);
+    else void confirmResumedSave();
+  }
+
+  function finishSavedConfirmation() {
+    setSaveConfirmationOpen(false);
+    if (bundle) void confirmSaved(bundle);
+    else void confirmResumedSave();
+  }
+
+  useEffect(() => {
+    if (!resumingSave) {
+      automaticResumeStarted.current = false;
+      return;
+    }
+    if (
+      automaticResumeStarted.current ||
+      bundle ||
+      generating ||
+      working ||
+      !server ||
+      !repository.includes("/") ||
+      (repositoryAvailability !== "checking" &&
+        repositoryAvailability !== "available")
+    )
+      return;
+    automaticResumeStarted.current = true;
+    void generate(true, false);
+  }, [
+    bundle,
+    generating,
+    repository,
+    repositoryAvailability,
+    resumingSave,
+    server,
+    working,
+  ]);
+
+  if (ready && !editing) {
+    const readyTitle =
+      environment === "staging" ? "自动部署已经开启" : "正式发布配置已准备";
+    const readyDescription =
+      environment === "staging"
+        ? "以后把代码合并到主分支，系统会自动生成版本并更新测试版；正式版仍由你确认发布。"
+        : "以后发布正式版时会使用这里保存的配置，不需要重复填写。";
+    return (
+      <div className="mt-3 flex items-center justify-between rounded-md border border-[var(--success)]/20 bg-[var(--success-soft)] px-4 py-3">
+        <div>
+          <strong className="text-sm">{readyTitle}</strong>
+          <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
+            {readyDescription}
+          </span>
+        </div>
+        <Button onClick={() => setEditing(true)} size="sm" variant="ghost">
+          重新设置
+        </Button>
+      </div>
+    );
+  }
+
+  if (!runtimeReady) {
+    return (
+      <p className="mb-0 mt-3 text-xs text-[var(--muted-foreground)]">
+        {`先完成${environment === "staging" ? "测试" : "正式"}配置，随后系统会引导你在代码平台网页安全保存。`}
+      </p>
+    );
+  }
+
+  if (!server) {
+    return (
+      <IssueBanner
+        message="先连接运行服务器，系统才能生成完整的云端安全配置。"
+        title="还缺少服务器信息"
+      />
+    );
+  }
+
+  if (
+    resumeStage === "loading" ||
+    !repositoryLoaded ||
+    repositoryAvailability === "checking"
+  ) {
+    return (
+      <div className="mt-3 flex items-center gap-3 rounded-md border border-[var(--border)] bg-[var(--muted)]/25 px-4 py-4">
+        <LoaderCircle className="size-4 shrink-0 animate-spin-slow text-[var(--accent)]" />
+        <div>
+          <strong className="block text-xs">
+            {repositoryAvailability === "checking"
+              ? "正在确认安全位置"
+              : "正在恢复上次进度"}
+          </strong>
+          <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
+            {repositoryAvailability === "checking"
+              ? "正在向 CNB 确认这个位置确实存在。"
+              : "正在确认是否有尚未完成的网页保存。"}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-3 rounded-md border border-[var(--border)] bg-[var(--muted)]/25 p-4">
+      <strong className="text-sm">
+        {bundle
+          ? resumedSaveChoice
+            ? "继续上次的网页保存"
+            : contentCopied
+              ? "最后一步：在网页粘贴并保存"
+              : "把配置复制到网页"
+          : repositoryAvailability === "missing"
+            ? "先完成安全位置创建"
+            : resumingSave
+              ? "安全配置已经准备好"
+              : resumeStage === "creation-page-opened"
+                ? "继续刚才的安全位置创建"
+                : reusableRepositoryReady || resumeStage === "repository-ready"
+                  ? "准备这次要保存的配置"
+                  : "在网页完成一次安全保存"}
+      </strong>
+      <p className="mb-4 mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
+        {repositoryAvailability === "missing"
+          ? "系统刚刚检查过，CNB 上还没有这个位置。重新创建即可继续，不会修改其他项目。"
+          : repositoryAvailability === "error"
+            ? "暂时无法确认这个位置是否可用。重新检查后再继续，避免把配置保存到无效页面。"
+            : resumedSaveChoice
+              ? "系统已保留本项目的位置和配置。先确认网页是否已经保存。"
+              : bundle
+                ? "敏感配置只保存在代码平台，不会写入项目代码。"
+                : reusableRepositoryReady
+                  ? "系统找到了以前使用的安全位置，本项目只会新增一份配置。"
+                  : "为了让自动部署读取这套配置，需要你在 CNB 网页确认一次。系统会准备好名称和内容，ABCDeploy 不会把敏感信息放进项目代码。"}
+      </p>
+      {repositoryEditorOpen ? (
+        <div className="rounded-md bg-[var(--surface)] px-4 py-3">
+          <div className="space-y-1.5">
+            <Label htmlFor={`${environment}-secret-repository`}>
+              已有的 CNB 密钥仓库位置
+            </Label>
+            <Input
+              id={`${environment}-secret-repository`}
+              onBlur={() => {
+                if (repository.includes("/"))
+                  void setAppSetting(repositoryKey, repository.trim());
+              }}
+              onChange={(event) => {
+                setRepository(event.target.value);
+                setRepositoryPreviouslyUsed(false);
+                setRepositoryAvailability("idle");
+                verifiedRepository.current = "";
+                repositoryCheckRequest.current = null;
+                setBundle(null);
+                setCopyStatus("");
+                setCreationHint("");
+                setSavePageOpened(false);
+                setRedoingSave(false);
+              }}
+              placeholder="例如 team/project-secrets"
+              value={repository}
+            />
+            <span className="block text-xs leading-5 text-[var(--muted-foreground)]">
+              只有这个位置已经是密钥仓库时才直接继续。
+            </span>
+          </div>
+          <div className="mt-3 flex flex-wrap justify-end gap-2">
+            <Button
+              disabled={working}
+              onClick={() => setRepositoryEditorOpen(false)}
+              size="sm"
+              variant="secondary"
+            >
+              返回创建新仓库
+            </Button>
+            <Button
+              disabled={working || !repository.includes("/")}
+              onClick={() => {
+                setRepositoryEditorOpen(false);
+                void generate(false, true);
+              }}
+              size="sm"
+            >
+              使用并打开配置页面
+            </Button>
+          </div>
+        </div>
+      ) : resumingSave ? null : (
+        <div className="rounded-md bg-[var(--surface)] px-4 py-3">
+          <strong className="block text-xs">
+            {repositoryAvailability === "missing"
+              ? "这个位置还没有创建"
+              : repositoryAvailability === "error"
+                ? "还不能确认这个位置"
+                : reusableRepositoryReady
+                  ? "已找到以前使用的位置"
+                  : "新位置名称已经准备好"}
+          </strong>
+          <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
+            {repositoryAvailability === "missing"
+              ? "名称仍然保留，打开 CNB 完成创建即可。"
+              : repositoryAvailability === "error"
+                ? "网络或授权可能暂时不可用，请重新检查。"
+                : reusableRepositoryReady
+                  ? "同一 CNB 账号可以复用，不需要重新创建。"
+                  : "无需填写，打开网页时会自动复制仓库名称。"}
+          </span>
+        </div>
+      )}
+      {repositoryEditorOpen ? null : repositoryAvailability === "error" ? (
+        <div className="mt-4 flex flex-wrap justify-end gap-2">
+          <Button
+            disabled={working || !repository.includes("/")}
+            onClick={() => void verifyRepository()}
+            size="sm"
+          >
+            <RefreshCw />
+            重新检查
+          </Button>
+        </div>
+      ) : repositoryAvailability === "missing" ? (
+        <div className="mt-4 flex flex-wrap justify-end gap-2">
+          <Button
+            disabled={working}
+            onClick={() => {
+              setRepositoryAvailability("idle");
+              setRepositoryEditorOpen(true);
+            }}
+            size="sm"
+            variant="ghost"
+          >
+            使用其他位置
+          </Button>
+          <Button
+            disabled={working}
+            onClick={() => void openSecretRepositoryCreation()}
+            size="sm"
+          >
+            <ExternalLink />
+            打开 CNB 创建
+          </Button>
+          <Button
+            disabled={working || !repository.includes("/")}
+            onClick={() => void generate(false, true)}
+            size="sm"
+          >
+            <Check />
+            我已创建，打开配置页面
+          </Button>
+        </div>
+      ) : generating ? (
+        <div className="mt-4 flex items-center gap-3 rounded-md bg-[var(--surface)] px-4 py-4">
+          <LoaderCircle className="size-4 shrink-0 animate-spin-slow text-[var(--accent)]" />
+          <div>
+            <strong className="block text-xs">正在准备下一步</strong>
+            <span className="mt-1 block text-xs leading-5 text-[var(--muted-foreground)]">
+              正在整理服务器连接和{environment === "staging" ? "测试" : "正式"}
+              配置，通常只需要几秒。
+            </span>
+          </div>
+        </div>
+      ) : bundle ? (
+        <div className="mt-4 rounded-md bg-[var(--surface)] px-4 py-3">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-md border border-[var(--border)] px-3 py-2">
+            <div className="min-w-0">
+              <span className="block text-xs text-[var(--muted-foreground)]">
+                {savePageOpened
+                  ? "第 1 步已完成：网页已经打开"
+                  : "第 1 步：打开网页并粘贴文件名"}
+              </span>
+              <code className="mt-1 block break-all text-xs">
+                {bundle.filename}
+              </code>
+            </div>
+          </div>
+          {!savePageOpened ? (
+            <>
+              <p className="m-0 text-xs leading-5 text-[var(--muted-foreground)]">
+                点击后文件名会自动复制。到网页粘贴文件名，再回到这里继续。
+              </p>
+              <div className="mt-3 flex justify-end">
+                <Button
+                  disabled={working}
+                  onClick={() => void openBundleSavePage(bundle)}
+                  size="sm"
+                >
+                  <ExternalLink />
+                  复制文件名并打开 CNB
+                </Button>
+              </div>
+            </>
+          ) : resumedSaveChoice ? (
+            <>
+              <div className="flex gap-3">
+                <Circle className="mt-0.5 size-4 shrink-0 text-[var(--subtle-foreground)]" />
+                <div>
+                  <strong className="block text-xs">
+                    上次已经打开过保存网页
+                  </strong>
+                  <span className="mt-1 block text-xs leading-5 text-[var(--muted-foreground)]">
+                    已经粘贴并保存就直接继续；还没保存则重新打开，系统会接着提示。
+                  </span>
+                </div>
+              </div>
+              <div className="mt-3 flex flex-wrap justify-end gap-2">
+                <Button
+                  disabled={working}
+                  onClick={() => void restartBundleSave(bundle)}
+                  size="sm"
+                  variant="secondary"
+                >
+                  <ExternalLink />
+                  还没保存，重新打开网页
+                </Button>
+                <Button
+                  disabled={working}
+                  onClick={requestSavedConfirmation}
+                  size="sm"
+                >
+                  <Check />
+                  网页已保存，继续
+                </Button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="flex gap-3">
+                {contentCopied ? (
+                  <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-[var(--success)]" />
+                ) : (
+                  <Circle className="mt-0.5 size-4 shrink-0 text-[var(--subtle-foreground)]" />
+                )}
+                <div>
+                  <strong className="block text-xs">
+                    {contentCopied
+                      ? "第 2 步已完成：配置内容已经复制"
+                      : "第 2 步：复制配置内容"}
+                  </strong>
+                  <span className="mt-1 block text-xs leading-5 text-[var(--muted-foreground)]">
+                    {contentCopied
+                      ? "回到刚才的网页粘贴并保存，完成后再回来继续。"
+                      : "复制后回到刚才的网页，粘贴到编辑区并保存。"}
+                  </span>
+                </div>
+              </div>
+              <div className="mt-3 flex flex-wrap justify-end gap-2">
+                <Button
+                  disabled={working}
+                  onClick={() => void restartBundleSave(bundle)}
+                  size="sm"
+                  variant="secondary"
+                >
+                  <ExternalLink />
+                  重新打开网页
+                </Button>
+                {contentCopied ? (
+                  <Button
+                    disabled={working}
+                    onClick={requestSavedConfirmation}
+                    size="sm"
+                  >
+                    <Check />
+                    我已粘贴并保存
+                  </Button>
+                ) : (
+                  <Button
+                    disabled={working}
+                    onClick={() => void copyBundle(bundle)}
+                    size="sm"
+                  >
+                    <Copy />
+                    复制配置内容
+                  </Button>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      ) : resumingSave ? (
+        <div className="mt-4 rounded-md bg-[var(--surface)] px-4 py-3">
+          <p className="m-0 text-xs leading-5 text-[var(--muted-foreground)]">
+            尚未保存就重新打开网页；已经保存则直接继续。客户端会重新准备文件名和配置内容。
+          </p>
+          <div className="mt-3 flex flex-wrap justify-end gap-2">
+            <Button
+              disabled={working || !repository.includes("/")}
+              onClick={() => {
+                setRedoingSave(true);
+                void generate(true, true);
+              }}
+              size="sm"
+              variant="secondary"
+            >
+              <ExternalLink />
+              重新复制文件名并打开网页
+            </Button>
+            <Button
+              disabled={working || !repository.includes("/")}
+              onClick={requestSavedConfirmation}
+              size="sm"
+            >
+              {working ? (
+                <LoaderCircle className="animate-spin-slow" />
+              ) : (
+                <Check />
+              )}
+              我已在网页保存
+            </Button>
+          </div>
+        </div>
+      ) : reusableRepositoryReady || resumeStage === "repository-ready" ? (
+        <div className="mt-4 flex flex-wrap justify-end gap-2">
+          <Button
+            disabled={working}
+            onClick={() => {
+              setRepositoryPreviouslyUsed(false);
+              setRepositoryEditorOpen(true);
+            }}
+            size="sm"
+            variant="ghost"
+          >
+            更换位置
+          </Button>
+          <Button
+            disabled={working || !repository.includes("/")}
+            onClick={() => void generate(false, true)}
+            size="sm"
+          >
+            {working ? (
+              <LoaderCircle className="animate-spin-slow" />
+            ) : (
+              <Copy />
+            )}
+            准备配置并打开 CNB
+          </Button>
+        </div>
+      ) : creationHint || resumeStage === "creation-page-opened" ? (
+        <div className="mt-4 rounded-md border border-[var(--primary)]/20 bg-[var(--surface)] px-4 py-3">
+          <p className="m-0 text-xs leading-5 text-[var(--muted-foreground)]">
+            {creationHint ||
+              "上次已经打开过创建页面。完成创建后继续；如果网页已经关闭，也可以再次打开。"}
+          </p>
+          <div className="mt-3 flex flex-wrap justify-end gap-2">
+            <Button
+              disabled={working}
+              onClick={() => void openSecretRepositoryCreation()}
+              size="sm"
+              variant="secondary"
+            >
+              <ExternalLink />
+              重新复制名称并打开网页
+            </Button>
+            <Button
+              disabled={working || !repository.includes("/")}
+              onClick={() => void generate(false, true)}
+              size="sm"
+            >
+              <Check />
+              我已创建，打开配置页面
+            </Button>
+          </div>
+        </div>
+      ) : repositoryEditorOpen ? null : (
+        <div className="mt-4 text-right">
+          <Button
+            disabled={working || !repository.includes("/")}
+            onClick={() => void openSecretRepositoryCreation()}
+            size="sm"
+          >
+            <ExternalLink />
+            打开 CNB 创建保存位置
+          </Button>
+          <Button
+            className="ml-auto mt-2"
+            disabled={working}
+            onClick={() => setRepositoryEditorOpen(true)}
+            size="sm"
+            variant="ghost"
+          >
+            我已经有保存位置
+          </Button>
+        </div>
+      )}
+      <Dialog
+        onOpenChange={setSaveConfirmationOpen}
+        open={saveConfirmationOpen}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>确认网页已经保存</DialogTitle>
+            <DialogDescription>
+              为保护密钥，客户端无法读取网页中的配置内容。请确认你已经在 CNB
+              网页粘贴配置并点击保存；如果还没有，先返回继续操作。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              onClick={() => setSaveConfirmationOpen(false)}
+              variant="secondary"
+            >
+              返回继续操作
+            </Button>
+            <Button disabled={working} onClick={finishSavedConfirmation}>
+              <Check />
+              已经保存，继续
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+export async function prepareCnbDeploymentBundle(
+  path: string,
+  environment: CnbSecretBundle["environment"],
+  repository: string,
+  server: ServerForm,
+  identityAlreadyPrepared = false,
+): Promise<CnbSecretBundle> {
+  // A persisted `save-page-opened` checkpoint can only be written after this
+  // identity was installed successfully. Reinstalling the same public key on
+  // every resume is idempotent but costs another SSH connection. Bundle
+  // generation still verifies the server fingerprint and reads the existing
+  // private key; a damaged checkpoint therefore fails safely.
+  if (!identityAlreadyPrepared) await preparePipelineIdentity(path, server);
+  return prepareCnbSecretBundle(path, environment, repository, server);
+}
+
+export function cnbRepositoryUrl(repository: string) {
+  return `https://cnb.cool/${repository.trim().replace(/^\/+|\/+$/g, "")}`;
+}
+
+export function cnbNewFileUrl(repository: string, filename = "") {
+  const url = `${cnbRepositoryUrl(repository)}/-/new/main`;
+  return filename ? `${url}?file_name=${encodeURIComponent(filename)}` : url;
+}
+
+export function recordedSecretRepository(
+  workspace: WorkspacePreview,
+  environment: "staging" | "production",
+  repository: string,
+) {
+  const recorded =
+    secretRepositoryFromManifest(workspace, environment) ||
+    secretRepositoryFromManifest(workspace, "staging");
+  return Boolean(
+    recorded && cnbRepositoryUrl(recorded) === cnbRepositoryUrl(repository),
+  );
+}
+
+export function productionConfigStatus(
+  runtimeReady: boolean | null,
+  cloudReady: boolean | null,
+) {
+  if (runtimeReady === null || cloudReady === null) return "正在确认";
+  if (!runtimeReady) return "未完成";
+  return cloudReady ? "已准备" : "等待网页保存";
+}
+
+export function productionConfigDetail(
+  runtimeReady: boolean | null,
+  cloudReady: boolean | null,
+) {
+  if (runtimeReady === null || cloudReady === null)
+    return "正在核对已经保存的正式配置";
+  if (!runtimeReady) return "保存后继续完成网页安全配置";
+  return cloudReady
+    ? "配置内容和自动发布均已准备"
+    : "配置内容已齐全，运行服务器已准备";
+}
+
+export function testEnvironmentDisplayReady(
+  currentReady: boolean,
+  checking: boolean,
+  hasTrustedHistory: boolean,
+  reviewResolved: boolean,
+) {
+  return currentReady || (hasTrustedHistory && (checking || !reviewResolved));
+}
+
+function useStagingPreparationStatus(
+  path: string,
+  server: ServerForm | undefined,
+  workspace: WorkspacePreview,
+) {
+  const runtimeReadyKey = server
+    ? runtimeConfigReadyCacheKey(path, "staging", server)
+    : "";
+  const [runtimeConfigReady, setRuntimeConfigReady] = useState<boolean | null>(
+    server ? null : false,
+  );
+  const [cloudConfigReady, setCloudConfigReady] = useState(
+    secretReferenceReady(workspace, "staging"),
+  );
+  const [addressReady, setAddressReady] = useState(() =>
+    stagingAddressConfigured(workspace),
+  );
+
+  useEffect(() => {
+    setAddressReady(stagingAddressConfigured(workspace));
+  }, [workspace.manifestYaml]);
+
+  useEffect(() => {
+    let active = true;
+    const pendingKey = `project.${encodeURIComponent(path)}.cnb-secret-pending.staging`;
+    getAppSetting(pendingKey)
+      .then((pending) => {
+        if (active) {
+          setCloudConfigReady(
+            secretReferenceReady(workspace, "staging") && pending !== "true",
+          );
+        }
+      })
+      .catch(() => {
+        if (active) setCloudConfigReady(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [path, workspace.manifestYaml]);
+
+  useEffect(() => {
+    let active = true;
+    if (!server) {
+      setRuntimeConfigReady(false);
+      return () => {
+        active = false;
+      };
+    }
+    setRuntimeConfigReady(null);
+    let verificationFinished = false;
+    const cachedReady = getAppSetting(runtimeReadyKey).catch(() => null);
+    void cachedReady.then((cached) => {
+      if (active && !verificationFinished && cached === "true")
+        setRuntimeConfigReady(true);
+    });
+    Promise.all([
+      loadRuntimeConfig(path, "staging", false),
+      getRuntimeConfigSyncStatus(path, "staging", server),
+    ])
+      .then(async ([config, sync]) => {
+        verificationFinished = true;
+        const cached = await cachedReady;
+        if (!active) return;
+        if (config.authorizationRequired && cached === "true") {
+          setRuntimeConfigReady(true);
+          return;
+        }
+        const next =
+          runtimeConfigStoredReady(config) && sync.stored && sync.synchronized;
+        setRuntimeConfigReady(next);
+        void setAppSetting(runtimeReadyKey, String(next)).catch(
+          () => undefined,
+        );
+      })
+      .catch(async () => {
+        verificationFinished = true;
+        const cached = await cachedReady;
+        if (active) setRuntimeConfigReady(cached === "true");
+      });
+    return () => {
+      active = false;
+    };
+  }, [path, runtimeReadyKey, server]);
+
+  const updateRuntimeConfigReady = useCallback(
+    (next: boolean) => {
+      setRuntimeConfigReady(next);
+      if (runtimeReadyKey)
+        void setAppSetting(runtimeReadyKey, String(next)).catch(
+          () => undefined,
+        );
+    },
+    [runtimeReadyKey],
+  );
+
+  return {
+    addressReady,
+    cloudConfigReady,
+    runtimeConfigReady,
+    setAddressReady,
+    setCloudConfigReady,
+    setRuntimeConfigReady: updateRuntimeConfigReady,
+  };
+}
+
+export function runtimeConfigReadyCacheKey(
+  path: string,
+  environment: "staging" | "production",
+  server: ServerForm,
+) {
+  const target = `${server.user}@${server.host}:${server.port}`;
+  return `project.${encodeURIComponent(path)}.${environment}-runtime-ready.${encodeURIComponent(target)}`;
+}
+
+export function stagingAddressConfigured(workspace: WorkspacePreview) {
+  return (
+    Object.keys(readEnvironmentDomains(workspace.manifestYaml, "staging"))
+      .length > 0
+  );
+}
+
+export function runtimeConfigStoredReady(config: RuntimeConfigFile) {
+  if (!config.stored || config.authorizationRequired) return false;
+  const values = new Map(
+    parseEnvFields(config.content, config.requiredVariables).map((field) => [
+      field.key,
+      field.value,
+    ]),
+  );
+  return config.requiredVariables.every(
+    (variable) =>
+      variable === "DATABASE_URL" ||
+      variable === "REDIS_URL" ||
+      Boolean(values.get(variable)?.trim()),
+  );
+}
+
+export function runtimeVariableOptionalManifest(
+  manifestYaml: string,
+  variableName: string,
+) {
+  const document = parseDocument(manifestYaml);
+  const manifest = document.toJS() as {
+    services?: Array<{
+      runtime_env?: Array<{ name?: string; required?: boolean }>;
+    }>;
+  };
+  for (const [serviceIndex, service] of (manifest.services ?? []).entries()) {
+    for (const [variableIndex, variable] of (
+      service.runtime_env ?? []
+    ).entries()) {
+      if (variable.name === variableName) {
+        document.setIn(
+          ["services", serviceIndex, "runtime_env", variableIndex, "required"],
+          false,
+        );
+      }
+    }
+  }
+  return document.toString({ lineWidth: 0 });
+}
+
+function RepositoryPreparation({
+  onError,
+  onReady,
+  onSaveManifest,
+  repository,
+  workspace,
+}: {
+  onError: (message: string) => void;
+  onReady: (repository: string) => void;
+  onSaveManifest: (manifestYaml: string) => Promise<boolean>;
+  repository: string;
+  workspace: WorkspacePreview;
+}) {
+  const [account, setAccount] = useState<CnbAccount | null>(null);
+  const [accountError, setAccountError] = useState("");
+  const [accountSlow, setAccountSlow] = useState(false);
+  const [tokenDialog, setTokenDialog] = useState(false);
+  const [token, setToken] = useState("");
+  const [working, setWorking] = useState(false);
+  const [customRepository, setCustomRepository] = useState("");
+  const [existingRepository, setExistingRepository] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [repositoryAccessError, setRepositoryAccessError] = useState("");
+  const [repositoryChecking, setRepositoryChecking] = useState(false);
+  const onReadyRef = useRef(onReady);
+  const accountLoadSequence = useRef(0);
+  const accountSlowTimer = useRef<number | null>(null);
+  const isHistoryOnlyError = (message: string) =>
+    message.includes("repo-cnb-history:r");
+  const loadAccount = useCallback(() => {
+    const sequence = accountLoadSequence.current + 1;
+    accountLoadSequence.current = sequence;
+    if (accountSlowTimer.current !== null)
+      window.clearTimeout(accountSlowTimer.current);
+    setAccount(null);
+    setAccountError("");
+    setAccountSlow(false);
+    accountSlowTimer.current = window.setTimeout(() => {
+      if (accountLoadSequence.current === sequence) setAccountSlow(true);
+    }, 2500);
+    getCnbAccount()
+      .then((next) => {
+        if (accountLoadSequence.current !== sequence) return;
+        if (accountSlowTimer.current !== null)
+          window.clearTimeout(accountSlowTimer.current);
+        accountSlowTimer.current = null;
+        setAccount(next);
+        setAccountError("");
+        setAccountSlow(false);
+      })
+      .catch((error) => {
+        if (accountLoadSequence.current !== sequence) return;
+        if (accountSlowTimer.current !== null)
+          window.clearTimeout(accountSlowTimer.current);
+        accountSlowTimer.current = null;
+        setAccount(null);
+        setAccountError(toMessage(error));
+        setAccountSlow(false);
+      });
+  }, []);
+  useEffect(
+    () => () => {
+      accountLoadSequence.current += 1;
+      if (accountSlowTimer.current !== null)
+        window.clearTimeout(accountSlowTimer.current);
+    },
+    [],
+  );
+  useEffect(() => {
+    // 已保存的仓库不依赖账号资料接口才能恢复；账号和组织信息只在首次
+    // 选仓库时需要。这样慢网络或仓库级令牌不会挡住项目的既有配置。
+    if (usableRepository(repository)) return;
+    loadAccount();
+  }, [loadAccount, repository]);
+  useEffect(() => {
+    onReadyRef.current = onReady;
+  }, [onReady]);
+  useEffect(() => {
+    if (!usableRepository(repository)) {
+      setRepositoryAccessError("");
+      setRepositoryChecking(false);
+      onReadyRef.current("");
+      return;
+    }
+    let cancelled = false;
+    setRepositoryAccessError("");
+    setRepositoryChecking(true);
+    // 仓库地址已经由用户确认并保存在项目清单中，先恢复准备状态，再在
+    // 后台校验当前授权。真正同步代码时仍会执行完整鉴权并给出可操作错误。
+    onReadyRef.current(repository);
+    checkCnbRepositoryAccess(repository)
+      .then(() => undefined)
+      .catch((error) => {
+        if (cancelled) return;
+        const message = toMessage(error);
+        setRepositoryAccessError(message);
+      })
+      .finally(() => {
+        if (!cancelled) setRepositoryChecking(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [repository]);
+  async function connect() {
+    if (!token.trim()) return;
+    setWorking(true);
+    try {
+      const connected = await connectCnb(
+        token,
+        true,
+        usableRepository(repository) ? repository : undefined,
+      );
+      setAccount(connected);
+      setAccountError("");
+      setToken("");
+      setTokenDialog(false);
+    } catch (error) {
+      onError(toMessage(error));
+    } finally {
+      setWorking(false);
+    }
+  }
+  async function saveRepository(next: string) {
+    try {
+      await checkCnbRepositoryAccess(next);
+      setRepositoryAccessError("");
+    } catch (error) {
+      const message = toMessage(error);
+      setRepositoryAccessError(message);
+      if (!isHistoryOnlyError(message)) {
+        onError(message);
+        return;
+      }
+    }
+    const document = parseDocument(workspace.manifestYaml);
+    document.setIn(["providers", "build", "repository"], next);
+    document.setIn(["source", "repository"], next);
+    const registryKind = document.getIn(["providers", "registry", "kind"]);
+    if (registryKind === "cnb")
+      document.setIn(["providers", "registry", "repository"], next);
+    if (await onSaveManifest(document.toString({ lineWidth: 0 }))) {
+      onReady(next);
+      setEditing(false);
+    }
+  }
+  async function create() {
+    if (!account?.connected) return setTokenDialog(true);
+    setWorking(true);
+    try {
+      const name = safeRepositoryName(workspace.inspection.project_name);
+      const result = await ensureCnbRepository(account.defaultNamespace, name);
+      if (result.created) {
+        await saveRepository(result.repository);
+      } else {
+        setExistingRepository(result.repository);
+      }
+    } catch (error) {
+      onError(toMessage(error));
+    } finally {
+      setWorking(false);
+    }
+  }
+  async function createAlternative() {
+    if (!account?.connected) return;
+    setWorking(true);
+    try {
+      const name = `${safeRepositoryName(workspace.inspection.project_name)}-deploy`;
+      const result = await ensureCnbRepository(account.defaultNamespace, name);
+      if (!result.created) {
+        setExistingRepository(result.repository);
+        onError(
+          "建议的新仓库名称也已存在，请填写一个确认属于当前项目的已有仓库",
+        );
+        return;
+      }
+      setExistingRepository("");
+      await saveRepository(result.repository);
+    } catch (error) {
+      onError(toMessage(error));
+    } finally {
+      setWorking(false);
+    }
+  }
+  const authorizationDialog = (
+    <CnbAuthorizationDialog
+      description="连接后，同一 CNB 账号可以用于所有项目。请在创建令牌时勾选下面 5 项。"
+      fieldId="cnb-token"
+      fieldLabel="访问令牌"
+      onOpenChange={setTokenDialog}
+      onSubmit={() => void connect()}
+      onTokenChange={setToken}
+      open={tokenDialog}
+      submitLabel="验证账号并连接"
+      title="连接 CNB"
+      token={token}
+      working={working}
+    />
+  );
+  if (!editing && usableRepository(repository)) {
+    const repositoryIssue = repositoryAccessError
+      ? issueFromUnknown(repositoryAccessError)
+      : null;
+    return (
+      <>
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <span className="text-xs text-[var(--muted-foreground)]">
+              {account?.connected
+                ? `CNB 账号：${account.displayName}`
+                : "CNB 代码仓库"}
+            </span>
+            <strong className="mt-1 block text-sm">{repository}</strong>
+            <span
+              className={`mt-1 block text-xs ${repositoryIssue ? "text-[var(--warning)]" : repositoryChecking ? "text-[var(--muted-foreground)]" : "text-[var(--success)]"}`}
+            >
+              {repositoryIssue
+                ? isHistoryOnlyError(repositoryAccessError)
+                  ? "代码仓库可用；版本列表暂不可同步"
+                  : repositoryIssue.message
+                : repositoryChecking
+                  ? "正在检查代码仓库"
+                  : "代码仓库可用"}
+            </span>
+            <span className="mt-1 block text-[11px] leading-4 text-[var(--muted-foreground)]">
+              当前 CNB 授权供所有项目复用；真正同步或构建前会再次核对权限。
+            </span>
+          </div>
+          <div className="flex gap-1">
+            <Button
+              onClick={() => setTokenDialog(true)}
+              size="sm"
+              variant="ghost"
+            >
+              更新授权
+            </Button>
+            <Button onClick={() => setEditing(true)} size="sm" variant="ghost">
+              更换仓库
+            </Button>
+          </div>
+        </div>
+        {authorizationDialog}
+      </>
+    );
+  }
+  return (
+    <>
+      <p className="m-0 text-sm leading-6 text-[var(--muted-foreground)]">
+        用于保存项目代码，并在代码更新后自动生成测试版本。
+      </p>
+      {(accountError || accountSlow) && !account?.connected ? (
+        <div className="mt-4 flex items-center justify-between gap-3 rounded-md bg-[var(--warning-soft)] px-3 py-2.5 text-sm">
+          <div>
+            <strong className="block">
+              {accountError
+                ? "暂时无法读取已保存的代码平台账号"
+                : "读取已保存的代码平台账号用时较长"}
+            </strong>
+            <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
+              {accountError
+                ? "不用重复填写，可以先重试；仍未恢复时再重新连接账号。"
+                : "不用一直等待，可以重试；仍未恢复时再重新连接账号。"}
+            </span>
+          </div>
+          <div className="flex gap-2">
+            <Button onClick={loadAccount} size="sm" variant="secondary">
+              重试读取
+            </Button>
+            <Button onClick={() => setTokenDialog(true)} size="sm">
+              重新连接
+            </Button>
+          </div>
+        </div>
+      ) : account === null ? (
+        <div className="mt-4 flex items-center gap-2 text-sm text-[var(--muted-foreground)]">
+          <LoaderCircle className="size-4 animate-spin-slow" />
+          正在读取已保存的 CNB 授权
+        </div>
+      ) : account?.connected ? (
+        <div className="mt-4 flex items-center justify-between gap-3 text-sm">
+          <span className="flex items-start gap-2">
+            <CheckCircle2 className="mt-0.5 size-4 text-[var(--success)]" />
+            <span>
+              <span className="block">CNB 账号：{account.displayName}</span>
+              <span className="mt-1 block text-[11px] text-[var(--muted-foreground)]">
+                已安全保存，其他项目也可以直接使用
+              </span>
+            </span>
+          </span>
+          <Button
+            onClick={() => setTokenDialog(true)}
+            size="sm"
+            variant="ghost"
+          >
+            更新授权
+          </Button>
+        </div>
+      ) : (
+        <div className="mt-4 flex items-center justify-between gap-3 rounded-md bg-[var(--warning-soft)] px-3 py-2.5 text-sm">
+          <span>还没有连接 CNB 账号</span>
+          <Button onClick={() => setTokenDialog(true)} size="sm">
+            连接 CNB
+          </Button>
+        </div>
+      )}
+      {account?.connected ? (
+        <div className="mt-4 rounded-md border border-[var(--border)] bg-[var(--muted)]/35 p-4">
+          {existingRepository ? (
+            <div className="mb-4 rounded-md border border-[var(--warning)]/30 bg-[var(--warning-soft)] p-3">
+              <strong className="block text-sm">发现同名代码仓库</strong>
+              <p className="mb-3 mt-1 text-xs text-[var(--muted-foreground)]">
+                {existingRepository}{" "}
+                可能属于旧项目。确认后再复用，客户端不会直接覆盖。
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  onClick={() => void saveRepository(existingRepository)}
+                  size="sm"
+                  variant="secondary"
+                >
+                  确认复用
+                </Button>
+                <Button
+                  disabled={working}
+                  onClick={() => void createAlternative()}
+                  size="sm"
+                >
+                  创建新仓库
+                </Button>
+              </div>
+            </div>
+          ) : null}
+          <span className="text-xs text-[var(--muted-foreground)]">
+            推荐创建
+          </span>
+          <strong className="mt-1 block text-sm">
+            {safeRepositoryName(workspace.inspection.project_name)} · 私有仓库
+          </strong>
+          <p className="mb-4 mt-1 text-xs text-[var(--muted-foreground)]">
+            只有你和授权成员可以访问，原项目文件不会被删除。
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <Button disabled={working} onClick={() => void create()} size="sm">
+              {working ? (
+                <LoaderCircle className="animate-spin-slow" />
+              ) : (
+                <FolderGit2 />
+              )}
+              创建代码仓库
+            </Button>
+            <div className="flex min-w-[320px] flex-1 gap-2 max-[760px]:min-w-0 max-[760px]:basis-full max-[760px]:flex-col">
+              <Input
+                aria-label="已有代码仓库"
+                onChange={(event) => setCustomRepository(event.target.value)}
+                placeholder="或填写已有仓库，例如 team/project"
+                value={customRepository}
+              />
+              <Button
+                disabled={!customRepository.includes("/")}
+                onClick={() => void saveRepository(customRepository.trim())}
+                className="max-[760px]:w-full"
+                size="sm"
+                variant="secondary"
+              >
+                使用已有仓库
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {authorizationDialog}
+    </>
+  );
+}
+
+export function ServerPreparation({
+  initialServer,
+  onError,
+  onReady,
+  path,
+}: {
+  initialServer?: ServerForm;
+  onError: (message: string) => void;
+  onReady: (server: ServerForm) => void;
+  path: string;
+}) {
+  const [form, setForm] = useState<ServerForm>(
+    initialServer ?? {
+      name: "测试服务器",
+      host: "",
+      user: "ubuntu",
+      port: 22,
+      keyPath: "",
+    },
+  );
+  const [working, setWorking] = useState(false);
+  const [fingerprint, setFingerprint] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [savedServers, setSavedServers] = useState<ServerResource[]>([]);
+  const [passwordRequired, setPasswordRequired] = useState(false);
+  const [password, setPassword] = useState("");
+  const [connectionIssue, setConnectionIssue] = useState("");
+  const automaticReuseStarted = useRef(false);
+  useEffect(() => {
+    if (initialServer) setForm(initialServer);
+  }, [initialServer]);
+  useEffect(() => {
+    if (initialServer) {
+      setSavedServers([]);
+      return;
+    }
+    let active = true;
+    listServers()
+      .then((servers) => {
+        if (!active) return;
+        const reusable = servers.filter(
+          (server) => server.keyPathExists && Boolean(server.hostFingerprint),
+        );
+        setSavedServers(reusable);
+        if (reusable.length === 1 && !automaticReuseStarted.current) {
+          automaticReuseStarted.current = true;
+          const selected = serverFormFromResource(reusable[0]);
+          setForm(selected);
+          void connect(false, selected);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [initialServer, path]);
+
+  async function finishConnection(next: ServerForm) {
+    const bound = await bindProjectServer(path, "staging", next);
+    const ready = {
+      ...next,
+      hostFingerprint: bound.hostFingerprint ?? next.hostFingerprint,
+    };
+    setForm(ready);
+    setSavedServers([]);
+    setEditing(false);
+    setFingerprint("");
+    setPasswordRequired(false);
+    setPassword("");
+    setConnectionIssue("");
+    onReady(ready);
+  }
+
+  async function connect(
+    confirmFingerprint = false,
+    selectedForm: ServerForm = form,
+  ) {
+    setWorking(true);
+    setConnectionIssue("");
+    try {
+      let next = {
+        ...selectedForm,
+        hostFingerprint: confirmFingerprint
+          ? fingerprint
+          : selectedForm.hostFingerprint,
+      };
+      const reusable = reusableServer(next, await listServers());
+      if (reusable) {
+        next = {
+          ...next,
+          name: reusable.name,
+          keyPath: reusable.keyPath,
+          hostFingerprint: reusable.hostFingerprint,
+        };
+        setForm(next);
+      }
+      if (!next.keyPath) {
+        const identities = await discoverSshIdentities();
+        const identity =
+          identities[0] ?? (await generateSshIdentity()).identity;
+        next = { ...next, keyPath: identity.path };
+        setForm(next);
+      }
+      const result = await checkServer(next);
+      if (
+        !result.ok &&
+        result.provider === "ssh-host-key" &&
+        result.details[0]
+      ) {
+        setForm(next);
+        setFingerprint(result.details[0]);
+        return;
+      }
+      if (!result.ok && result.code === "AD-SSH-105") {
+        setForm(next);
+        setFingerprint("");
+        setPasswordRequired(true);
+        setConnectionIssue(result.summary);
+        return;
+      }
+      if (!result.ok) {
+        setConnectionIssue(result.summary);
+        throw new Error(result.summary);
+      }
+      await finishConnection(next);
+    } catch (error) {
+      onError(toMessage(error));
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function installAccess() {
+    if (!password) return;
+    setWorking(true);
+    setConnectionIssue("");
+    try {
+      const result = await installServerKeyWithPassword(form, password);
+      setPassword("");
+      if (!result.ok) {
+        setConnectionIssue(result.summary);
+        return;
+      }
+      await finishConnection(form);
+    } catch (error) {
+      setPassword("");
+      const message = toMessage(error);
+      setConnectionIssue(message);
+      onError(message);
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function chooseExistingIdentity() {
+    const selected = await selectPrivateKey(form.keyPath || undefined);
+    if (!selected) return;
+    const next = { ...form, keyPath: selected };
+    setForm(next);
+    setPassword("");
+    setPasswordRequired(false);
+    setConnectionIssue("");
+    await connect(false, next);
+  }
+  if (!editing && initialServer?.hostFingerprint)
+    return (
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <strong className="text-sm">
+            {initialServer.name || "运行服务器"}
+          </strong>
+          <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
+            {initialServer.user}@{initialServer.host}:{initialServer.port}
+          </span>
+          <span className="mt-1 block text-xs text-[var(--success)]">
+            服务器信息已保存
+            <span className="mt-1 block text-[var(--muted-foreground)]">
+              部署时如果连接失效，系统会在当前步骤提示处理
+            </span>
+          </span>
+        </div>
+        <Button
+          onClick={() => {
+            setForm({ ...initialServer, hostFingerprint: undefined });
+            setEditing(true);
+          }}
+          size="sm"
+          variant="ghost"
+        >
+          重新连接
+        </Button>
+      </div>
+    );
+  return (
+    <>
+      <p className="m-0 text-sm text-[var(--muted-foreground)]">
+        填写云服务器的公网 IP 和登录用户名。后续安全连接由系统自动处理。
+      </p>
+      {savedServers.length ? (
+        <div className="mt-4 rounded-md border border-[var(--border)] bg-[var(--muted)]/35 p-3">
+          <strong className="text-sm">使用已保存的服务器</strong>
+          <div className="mt-2 grid gap-2">
+            {savedServers.map((server) => {
+              const selected = serverFormFromResource(server);
+              return (
+                <div
+                  className="flex items-center justify-between gap-3 rounded-md bg-[var(--surface)] px-3 py-2 max-[760px]:flex-col max-[760px]:items-stretch"
+                  key={server.id}
+                >
+                  <span className="text-xs text-[var(--muted-foreground)]">
+                    <strong className="mr-2 text-[var(--foreground)]">
+                      {server.name}
+                    </strong>
+                    {server.user}@{server.host}:{server.port}
+                  </span>
+                  <Button
+                    disabled={working}
+                    onClick={() => {
+                      setForm(selected);
+                      void connect(false, selected);
+                    }}
+                    className="max-[760px]:w-full"
+                    size="sm"
+                    variant="secondary"
+                  >
+                    使用这台服务器
+                  </Button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
+      <div className="mt-4 grid grid-cols-[minmax(240px,1fr)_160px_100px] gap-3 max-[760px]:grid-cols-1">
+        <div className="space-y-1.5">
+          <Label htmlFor="server-host">服务器公网 IP</Label>
+          <Input
+            id="server-host"
+            onChange={(event) => {
+              const host = event.target.value;
+              setPassword("");
+              setPasswordRequired(false);
+              setConnectionIssue("");
+              setForm((current) => ({
+                ...current,
+                host,
+                ...(host === current.host
+                  ? {}
+                  : { hostFingerprint: undefined, keyPath: "" }),
+              }));
+            }}
+            placeholder="例如 123.123.123.123"
+            value={form.host}
+          />
+          <span className="block text-[11px] leading-4 text-[var(--muted-foreground)]">
+            在云服务器控制台的实例详情中复制“公网 IP”。
+          </span>
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="server-user">登录用户名</Label>
+          <Input
+            id="server-user"
+            onChange={(event) => {
+              const user = event.target.value;
+              setPassword("");
+              setPasswordRequired(false);
+              setConnectionIssue("");
+              setForm((current) => ({
+                ...current,
+                user,
+                ...(user === current.user
+                  ? {}
+                  : { hostFingerprint: undefined, keyPath: "" }),
+              }));
+            }}
+            placeholder="例如 ubuntu"
+            value={form.user}
+          />
+          <span className="block text-[11px] leading-4 text-[var(--muted-foreground)]">
+            Ubuntu 通常是 ubuntu，其他系统可在实例详情中查看。
+          </span>
+        </div>
+        <div className="flex items-end">
+          <Button
+            className="w-full"
+            disabled={working || !form.host || !form.user}
+            onClick={() => void connect()}
+          >
+            {working ? (
+              <LoaderCircle className="animate-spin-slow" />
+            ) : (
+              <Server />
+            )}
+            连接
+          </Button>
+        </div>
+      </div>
+      {fingerprint ? (
+        <div className="mt-4 rounded-md border border-[var(--warning)]/30 bg-[var(--warning-soft)] p-4">
+          <strong className="text-sm">确认连接这台服务器</strong>
+          <p className="my-2 text-xs leading-5 text-[var(--muted-foreground)]">
+            你正在连接 {form.host}
+            。如果这是你刚才填写的服务器，请确认；系统会记住它，今后身份变化时会阻止连接。
+          </p>
+          <details className="rounded-md border border-[var(--warning)]/20 bg-[var(--surface)]/65 px-3 py-2 text-xs">
+            <summary className="cursor-pointer text-[var(--muted-foreground)]">
+              查看服务器指纹
+            </summary>
+            <code className="mt-2 block break-all">{fingerprint}</code>
+          </details>
+          <div className="mt-3">
+            <Button
+              disabled={working}
+              onClick={() => void connect(true)}
+              size="sm"
+            >
+              确认这是我的服务器
+            </Button>
+          </div>
+        </div>
+      ) : null}
+      {passwordRequired ? (
+        <div className="mt-4 rounded-md border border-[var(--warning)]/30 bg-[var(--warning-soft)] p-4">
+          <strong className="text-sm">还差一次服务器授权</strong>
+          <p className="mb-3 mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
+            {connectionIssue || "服务器还不认识这台电脑。"}
+            填写当前登录用户的服务器密码，ABCDeploy
+            会建立后续自动连接；密码只使用这一次，不会保存。
+          </p>
+          <div className="grid grid-cols-[minmax(240px,1fr)_auto] items-end gap-3 max-[760px]:grid-cols-1">
+            <div className="space-y-1.5">
+              <Label htmlFor="server-password">服务器登录密码</Label>
+              <Input
+                autoComplete="off"
+                id="server-password"
+                onChange={(event) => setPassword(event.target.value)}
+                type="password"
+                value={password}
+              />
+            </div>
+            <Button
+              className="max-[760px]:w-full"
+              disabled={working || !password}
+              onClick={() => void installAccess()}
+            >
+              {working ? (
+                <LoaderCircle className="animate-spin-slow" />
+              ) : (
+                <KeyRound />
+              )}
+              建立安全连接
+            </Button>
+          </div>
+          <div className="mt-3 flex items-center justify-between gap-3 border-t border-[var(--warning)]/20 pt-3 max-[760px]:flex-col max-[760px]:items-stretch">
+            <span className="text-xs text-[var(--muted-foreground)]">
+              创建服务器时下载过登录文件？可以直接使用，不需要密码。
+            </span>
+            <Button
+              disabled={working}
+              onClick={() => void chooseExistingIdentity()}
+              className="max-[760px]:w-full"
+              size="sm"
+              variant="secondary"
+            >
+              改用已有登录文件
+            </Button>
+          </div>
+        </div>
+      ) : connectionIssue ? (
+        <p className="mb-0 mt-3 text-xs text-[var(--warning)]">
+          {connectionIssue}
+        </p>
+      ) : null}
+    </>
+  );
+}
+
+export function reusableServer(
+  form: ServerForm,
+  servers: ServerResource[],
+): ServerResource | undefined {
+  const host = form.host.trim().toLowerCase();
+  const user = form.user.trim();
+  return servers.find(
+    (server) =>
+      server.keyPathExists &&
+      server.host.trim().toLowerCase() === host &&
+      server.user.trim() === user &&
+      server.port === form.port,
+  );
+}
+
+export function serverFormFromResource(server: ServerResource): ServerForm {
+  return {
+    name: server.name,
+    host: server.host,
+    user: server.user,
+    port: server.port,
+    keyPath: server.keyPath,
+    hostFingerprint: server.hostFingerprint,
+  };
+}
+
+function TestAddressPreparation({
+  onReadyChange,
+  onSaveManifest,
+  saving,
+  server,
+  workspace,
+}: {
+  onReadyChange: (ready: boolean) => void;
+  onSaveManifest: (manifest: string) => Promise<boolean>;
+  saving: boolean;
+  server?: ServerForm;
+  workspace: WorkspacePreview;
+}) {
+  const [generating, setGenerating] = useState(false);
+  const [domainReady, setDomainReady] = useState(() =>
+    stagingAddressConfigured(workspace),
+  );
+  const [stored, setStored] = useState(() =>
+    stagingAddressConfigured(workspace),
+  );
+  useEffect(() => {
+    if (!domainReady) setStored(false);
+  }, [domainReady]);
+  useEffect(
+    () => onReadyChange(stored && domainReady),
+    [domainReady, onReadyChange, stored],
+  );
+  const automaticDomains = automaticTestDomains(workspace, server);
+  async function generateAutomaticAddress() {
+    if (!automaticDomains) return;
+    setGenerating(true);
+    try {
+      const document = parseDocument(workspace.manifestYaml);
+      document.setIn(
+        ["environments", "staging", "domains"],
+        Object.entries(automaticDomains).map(([service, host]) => ({
+          service,
+          host,
+          path: "/",
+        })),
+      );
+      if (await onSaveManifest(document.toString({ lineWidth: 0 }))) {
+        setDomainReady(true);
+        setStored(true);
+      }
+    } finally {
+      setGenerating(false);
+    }
+  }
+  if (stored)
+    return (
+      <div className="flex items-center justify-between">
+        <div>
+          <strong className="text-sm">测试域名已设置</strong>
+          <span className="mt-1 block text-xs text-[var(--success)]">
+            部署完成后可以直接打开
+          </span>
+        </div>
+        <Button onClick={() => setStored(false)} size="sm" variant="ghost">
+          重新设置
+        </Button>
+      </div>
+    );
+  return (
+    <div>
+      <p className="m-0 text-sm text-[var(--muted-foreground)]">
+        测试版需要一个访问域名，系统会自动配置访问和 HTTPS。
+      </p>
+      {automaticDomains ? (
+        <div className="mt-4 flex items-center justify-between rounded-md bg-[var(--muted)] px-3 py-3">
+          <span className="text-sm">没有测试域名也可以继续</span>
+          <Button
+            disabled={saving || generating}
+            onClick={() => void generateAutomaticAddress()}
+            size="sm"
+            variant="secondary"
+          >
+            {generating ? <LoaderCircle className="animate-spin-slow" /> : null}
+            自动生成测试地址
+          </Button>
+        </div>
+      ) : null}
+      <div className="mt-4">
+        <DomainFields
+          environment="staging"
+          onReadyChange={setDomainReady}
+          onSaveManifest={onSaveManifest}
+          saving={saving}
+          workspace={workspace}
+        />
+      </div>
+      <div className="mt-4 flex justify-end">
+        <Button
+          disabled={!domainReady}
+          onClick={() => setStored(true)}
+          size="sm"
+        >
+          确认测试地址
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+export function automaticTestDomains(
+  workspace: WorkspacePreview,
+  server?: ServerForm,
+): Record<string, string> | null {
+  const octets = server?.host
+    .trim()
+    .split(".")
+    .map((part) => Number(part));
+  if (
+    !octets ||
+    octets.length !== 4 ||
+    octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)
+  )
+    return null;
+  const project = workspace.inspection.project_name
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 30);
+  const address = octets.join("-");
+  return Object.fromEntries(
+    workspace.inspection.services
+      .filter((service) => service.kind !== "worker")
+      .map((service) => {
+        const id = service.id
+          .toLowerCase()
+          .replace(/[^a-z0-9-]+/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 20);
+        return [service.id, `${project}-${id}-test.${address}.sslip.io`];
+      }),
+  );
+}
+
+function DomainFields({
+  environment,
+  onReadyChange,
+  onSaveManifest,
+  saving,
+  workspace,
+}: {
+  environment: "staging" | "production";
+  onReadyChange: (ready: boolean) => void;
+  onSaveManifest: (manifest: string) => Promise<boolean>;
+  saving: boolean;
+  workspace: WorkspacePreview;
+}) {
+  const services = useMemo(
+    () =>
+      workspace.inspection.services.filter(
+        (service) => service.kind !== "worker",
+      ),
+    [workspace.inspection.services],
+  );
+  const [domains, setDomains] = useState(() =>
+    readEnvironmentDomains(workspace.manifestYaml, environment),
+  );
+  const missingServices = services.filter(
+    (service) => !domains[service.id]?.trim(),
+  );
+  useEffect(() => {
+    const next = readEnvironmentDomains(workspace.manifestYaml, environment);
+    setDomains(next);
+    onReadyChange(
+      services.length > 0 &&
+        services.every((service) => Boolean(next[service.id])),
+    );
+  }, [environment, onReadyChange, services, workspace.manifestYaml]);
+  async function save() {
+    const document = parseDocument(workspace.manifestYaml);
+    document.setIn(
+      ["environments", environment, "domains"],
+      services
+        .filter((service) => domains[service.id]?.trim())
+        .map((service) => ({
+          service: service.id,
+          host: domains[service.id].trim(),
+          path: "/",
+        })),
+    );
+    const success = await onSaveManifest(document.toString({ lineWidth: 0 }));
+    if (success)
+      onReadyChange(
+        services.every((service) => Boolean(domains[service.id]?.trim())),
+      );
+  }
+  return (
+    <div className="overflow-hidden rounded-md border border-[var(--border)]">
+      {services.map((service, index) => (
+        <div
+          className="grid grid-cols-[180px_1fr] items-center gap-3 border-b border-[var(--border)] px-3 py-3 last:border-b-0 max-[760px]:grid-cols-1 max-[760px]:gap-1.5"
+          key={service.id}
+        >
+          <Label htmlFor={`${environment}-${service.id}`}>
+            {serviceDisplayName(
+              service.id,
+              service.kind,
+              index,
+              services.length,
+            )}
+          </Label>
+          <Input
+            id={`${environment}-${service.id}`}
+            onChange={(event) =>
+              setDomains((current) => ({
+                ...current,
+                [service.id]: event.target.value,
+              }))
+            }
+            placeholder={
+              environment === "production"
+                ? "例如 app.example.com"
+                : "例如 test.example.com"
+            }
+            value={domains[service.id] ?? ""}
+          />
+        </div>
+      ))}
+      <div className="flex items-center justify-between gap-4 border-t border-[var(--border)] px-3 py-2.5 max-[760px]:flex-col max-[760px]:items-stretch">
+        <span
+          className={`text-xs ${missingServices.length ? "text-[var(--warning)]" : "text-[var(--success)]"}`}
+        >
+          {missingServices.length
+            ? `还缺少：${missingServices.map((service, index) => serviceDisplayName(service.id, service.kind, index, services.length)).join("、")}`
+            : "所有服务地址都已填写"}
+        </span>
+        <Button
+          className="max-[760px]:w-full"
+          disabled={saving || Boolean(missingServices.length)}
+          onClick={() => void save()}
+          size="sm"
+        >
+          保存{environment === "production" ? "正式" : "测试"}地址
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function SetupDependencyNotice({
+  message,
+  title,
+}: {
+  message: string;
+  title: string;
+}) {
+  return (
+    <div className="flex items-start gap-3 rounded-md border border-[var(--border)] bg-[var(--muted)]/35 px-3 py-3">
+      <Circle className="mt-0.5 size-4 shrink-0 text-[var(--subtle-foreground)]" />
+      <div>
+        <strong className="block text-sm">{title}</strong>
+        <span className="mt-1 block text-xs leading-5 text-[var(--muted-foreground)]">
+          {message}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function PreparationStep({
+  activeLabel = "现在完成",
+  children,
+  checking = false,
+  current,
+  description,
+  done,
+  index,
+  name,
+  onOpen,
+  open,
+}: {
+  activeLabel?: string;
+  children: React.ReactNode;
+  checking?: boolean;
+  current: boolean;
+  description: string;
+  done: boolean;
+  index: number;
+  name: string;
+  onOpen: () => void;
+  open: boolean;
+}) {
+  return (
+    <section
+      className={`overflow-hidden rounded-lg border bg-[var(--surface)] ${open ? "border-[var(--accent)]/45" : "border-[var(--border)]"}`}
+    >
+      <button
+        className={`grid w-full grid-cols-[32px_1fr_auto] items-center gap-3 px-4 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--focus)] ${done && !open ? "min-h-[52px]" : "min-h-[68px]"}`}
+        onClick={onOpen}
+        type="button"
+      >
+        <span
+          className={`grid size-7 place-items-center rounded-full text-xs ${done ? "bg-[var(--success)] text-white" : current && !checking ? "bg-[var(--primary)] text-[var(--primary-foreground)]" : "bg-[var(--muted)] text-[var(--muted-foreground)]"}`}
+        >
+          {done ? (
+            "✓"
+          ) : checking ? (
+            <LoaderCircle className="size-3.5 animate-spin-slow" />
+          ) : (
+            index
+          )}
+        </span>
+        <span>
+          <strong className="block text-sm font-semibold">{name}</strong>
+          <span
+            className={`mt-1 text-xs text-[var(--muted-foreground)] ${done && !open ? "hidden" : "block"}`}
+          >
+            {description}
+          </span>
+        </span>
+        <span
+          className={
+            done
+              ? "text-xs text-[var(--success)]"
+              : "text-xs text-[var(--muted-foreground)]"
+          }
+        >
+          {done
+            ? "已准备"
+            : checking
+              ? "正在确认"
+              : current
+                ? activeLabel
+                : open
+                  ? "正在查看"
+                  : "随后处理"}{" "}
+          ›
+        </span>
+      </button>
+      {open ? (
+        <div className="border-t border-[var(--border)] px-5 py-5 pl-[64px]">
+          {children}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function DeploymentState({
+  action,
+  compactMessage,
+  compactTitle,
+  messageOverride,
+  onError,
+  onRefresh,
+  run,
+  secondaryAction,
+}: {
+  action?: React.ReactNode;
+  compactMessage?: string;
+  compactTitle?: string;
+  messageOverride?: string;
+  onError: (message: string) => void;
+  onRefresh: (run: DeploymentRun) => Promise<DeploymentRun>;
+  run: DeploymentRun;
+  secondaryAction?: React.ReactNode;
+}) {
+  const [checking, setChecking] = useState(false);
+  const [checkFailed, setCheckFailed] = useState(false);
+  const [lastCheckedAt, setLastCheckedAt] = useState("");
+  const initialRecheck = useRef("");
+  const checkingRef = useRef(false);
+  const runRef = useRef(run);
+  const onRefreshRef = useRef(onRefresh);
+  const onErrorRef = useRef(onError);
+  runRef.current = run;
+  onRefreshRef.current = onRefresh;
+  onErrorRef.current = onError;
+  const active = run.status === "queued" || run.status === "running";
+  const issue = run.status === "failed" || run.status === "needs_action";
+  const recheckOnReturn = autoRechecksDeployment(run);
+  const stateMessage = messageOverride || deploymentStateMessage(run);
+  const userIssue = issue
+    ? issueFromUnknown(
+        run.issueCode ? `${run.issueCode}：${stateMessage}` : stateMessage,
+        deploymentTitle(run),
+      )
+    : null;
+  const title = compactTitle ?? userIssue?.title ?? stateMessage;
+  const message = compactTitle
+    ? (compactMessage ?? "")
+    : (userIssue?.message ?? stateMessage);
+  const milestones = deploymentMilestones(run);
+  const recordUpdatedAt = deploymentUpdatedAtLabel(run.updatedAt);
+  const completedMilestones = milestones
+    .filter((milestone) => milestone.state === "done")
+    .map((milestone) => milestone.label);
+  const activeMilestone =
+    milestones.find((milestone) => milestone.state === "active")?.label ??
+    stageLabel(run.currentStage);
+  const refresh = useCallback(async (announceFailure = false) => {
+    if (checkingRef.current) return;
+    checkingRef.current = true;
+    setChecking(true);
+    setCheckFailed(false);
+    try {
+      const checked = await onRefreshRef.current(runRef.current);
+      if (checked) {
+        setLastCheckedAt(
+          new Intl.DateTimeFormat("zh-CN", {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          }).format(new Date()),
+        );
+      }
+    } catch {
+      setCheckFailed(true);
+      if (announceFailure) {
+        onErrorRef.current("状态检查没有完成，当前任务和已完成步骤仍然保留");
+      }
+    } finally {
+      checkingRef.current = false;
+      setChecking(false);
+    }
+  }, []);
+  useEffect(() => {
+    if (!recheckOnReturn) return;
+    let timer = 0;
+    let interval = 0;
+    const scheduleRecheck = (identity = "") => {
+      if (document.visibilityState !== "visible") return;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        if (identity) initialRecheck.current = identity;
+        void refresh();
+      }, 500);
+    };
+    const recheckOnFocus = () => scheduleRecheck();
+    window.addEventListener("focus", recheckOnFocus);
+    document.addEventListener("visibilitychange", recheckOnFocus);
+    const recheckIdentity = `${run.id}:${run.actionKind ?? ""}:${run.issueCode ?? ""}`;
+    if (initialRecheck.current !== recheckIdentity) {
+      // 恢复项目时父层还会补齐任务、版本和配置。只有定时器真正执行时
+      // 才记录“已经自动复核”，避免中途重渲染取消定时器后永远不再检查。
+      scheduleRecheck(recheckIdentity);
+    }
+    interval = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refresh();
+    }, EXTERNAL_STATUS_RECHECK_MS);
+    return () => {
+      window.clearTimeout(timer);
+      window.clearInterval(interval);
+      window.removeEventListener("focus", recheckOnFocus);
+      document.removeEventListener("visibilitychange", recheckOnFocus);
+    };
+  }, [recheckOnReturn, refresh, run.actionKind, run.id, run.issueCode]);
+  return (
+    <div
+      className={`rounded-lg border p-5 ${issue ? "border-[var(--warning)]/35 bg-[var(--warning-soft)]" : run.status === "success" ? "border-[var(--success)]/25 bg-[var(--success-soft)]" : "border-[var(--border)] bg-[var(--surface)]"}`}
+    >
+      <div className="flex items-start justify-between gap-4 max-[760px]:flex-col max-[760px]:items-stretch">
+        <div className="flex gap-3">
+          {active ? (
+            <LoaderCircle className="mt-0.5 size-5 animate-spin-slow text-[var(--accent)]" />
+          ) : issue ? (
+            <AlertCircle className="mt-0.5 size-5 text-[var(--warning)]" />
+          ) : (
+            <CheckCircle2 className="mt-0.5 size-5 text-[var(--success)]" />
+          )}
+          <div>
+            <strong className="text-sm">{title}</strong>
+            {compactTitle && message ? (
+              <p className="mb-0 mt-1 text-xs leading-5 text-[var(--foreground)]/80">
+                {message}
+              </p>
+            ) : issue && message !== title ? (
+              <p className="mb-0 mt-1 text-xs leading-5 text-[var(--foreground)]/80">
+                {message}
+              </p>
+            ) : null}
+            {!compactTitle && (issue || active) ? (
+              <p className="mb-0 mt-1 text-xs text-[var(--muted-foreground)]">
+                {issue
+                  ? `任务停在：${activeMilestone}`
+                  : `当前进度：${activeMilestone}`}
+              </p>
+            ) : null}
+            {!compactTitle && issue && completedMilestones.length ? (
+              <p className="mb-0 mt-1 text-xs text-[var(--muted-foreground)]">
+                已经完成：{completedMilestones.join("、")}
+              </p>
+            ) : null}
+            {!compactTitle && issue ? (
+              <p className="mb-0 mt-2 text-xs font-medium text-[var(--foreground)]">
+                下一步：{deploymentNextStep(run, userIssue?.nextSteps[0])}
+              </p>
+            ) : null}
+            {!compactTitle && recheckOnReturn ? (
+              <p className="mb-0 mt-1 text-xs text-[var(--muted-foreground)]">
+                前往网页或云平台处理后直接回来即可；回来时会立即检查，停留本页时也会每
+                30 秒自动检查。
+              </p>
+            ) : null}
+            {lastCheckedAt && !checking ? (
+              <p
+                aria-live="polite"
+                className="mb-0 mt-1 text-xs text-[var(--muted-foreground)]"
+              >
+                {compactTitle ? (
+                  <>
+                    最近检查：{lastCheckedAt}
+                    {run.actionKind === "route-check" ? " · 地址还未生效" : ""}
+                  </>
+                ) : run.status === "success" ? (
+                  <>
+                    最近检查：{lastCheckedAt} ·{" "}
+                    {run.environment === "production"
+                      ? "正式版服务仍在服务器运行"
+                      : "测试版仍在服务器运行"}
+                  </>
+                ) : (
+                  <>已于 {lastCheckedAt} 重新检查，任务记录已保存</>
+                )}
+              </p>
+            ) : recordUpdatedAt && (active || issue) && !checking ? (
+              <p className="mb-0 mt-1 text-xs text-[var(--muted-foreground)]">
+                {compactTitle ? "任务记录：" : "任务记录更新于 "}
+                <time dateTime={run.updatedAt}>{recordUpdatedAt}</time>
+                {compactTitle ? "" : "，已完成步骤已保存"}
+              </p>
+            ) : null}
+            {checkFailed && !checking ? (
+              <p
+                aria-live="polite"
+                className="mb-0 mt-2 text-xs font-medium text-[var(--warning)]"
+              >
+                {run.status === "success"
+                  ? "这次检查没有完成，仍显示上一次部署结果；请确认网络后再次点击“检查运行状态”。"
+                  : `这次检查没有完成，任务仍停在这里；请确认网络后再次点击“${deploymentRefreshLabel(run)}”。`}
+              </p>
+            ) : null}
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {secondaryAction}
+          {action}
+          {!action && run.actionUrl ? (
+            <Button
+              onClick={() => void openUrl(run.actionUrl ?? "")}
+              size="sm"
+              variant="secondary"
+            >
+              <ExternalLink />
+              {issue ? "前往处理" : "查看发布记录"}
+            </Button>
+          ) : null}
+          {!action && run.status !== "failed" && run.status !== "cancelled" ? (
+            <Button
+              disabled={checking}
+              onClick={() => void refresh(true)}
+              size="sm"
+              variant="secondary"
+            >
+              <RefreshCw className={checking ? "animate-spin-slow" : ""} />
+              {checking ? "正在检查" : deploymentRefreshLabel(run)}
+            </Button>
+          ) : null}
+        </div>
+      </div>
+      {active || (issue && !compactTitle) ? (
+        <div className="mt-4 space-y-3">
+          <Progress value={deploymentProgress(run)} />
+          <div className="grid grid-cols-4 gap-2" aria-label="本次部署进度">
+            {milestones.map((milestone) => (
+              <div
+                className={`flex items-center gap-1.5 text-[11px] ${milestone.state === "done" ? "text-[var(--success)]" : milestone.state === "active" ? (issue ? "font-medium text-[var(--warning)]" : "font-medium text-[var(--foreground)]") : "text-[var(--subtle-foreground)]"}`}
+                key={milestone.label}
+              >
+                {milestone.state === "done" ? (
+                  <CheckCircle2 className="size-3.5 shrink-0" />
+                ) : milestone.state === "active" ? (
+                  issue ? (
+                    <AlertCircle className="size-3.5 shrink-0" />
+                  ) : (
+                    <LoaderCircle className="size-3.5 shrink-0 animate-spin-slow text-[var(--accent)]" />
+                  )
+                ) : (
+                  <Circle className="size-3.5 shrink-0" />
+                )}
+                <span>{milestone.label}</span>
+              </div>
+            ))}
+          </div>
+          <p className="m-0 text-[11px] leading-5 text-[var(--muted-foreground)]">
+            {issue
+              ? `这次任务和已完成步骤都已保留；处理后会从“${activeMilestone}”继续。`
+              : "可以离开当前页面，远程任务会继续运行。"}
+          </p>
+        </div>
+      ) : null}
+      {issue ? (
+        <details className="mt-4 text-xs text-[var(--muted-foreground)]">
+          <summary className="cursor-pointer">查看技术详情</summary>
+          <div className="mt-2">
+            错误编号：{run.issueCode ?? "未提供"} · 仓库：
+            {run.repository || "尚未确定"}
+          </div>
+          {userIssue?.technicalDetails.length ? (
+            <div className="mt-2 space-y-1">
+              {userIssue.technicalDetails.map((detail, index) => (
+                <code
+                  className="block max-h-24 overflow-auto whitespace-pre-wrap break-all text-[10px]"
+                  key={`${run.id}:${index}`}
+                >
+                  {detail}
+                </code>
+              ))}
+            </div>
+          ) : null}
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
+function CurrentVersionBanner({
+  label,
+  run,
+}: {
+  label: string;
+  run: DeploymentRun;
+}) {
+  return (
+    <div
+      aria-label={label}
+      className="mb-4 flex items-center justify-between gap-4 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-3"
+    >
+      <div className="min-w-0">
+        <span className="block text-xs text-[var(--muted-foreground)]">
+          {label}
+        </span>
+        <strong className="mt-1 block truncate text-sm">
+          {versionTitle(run)}
+        </strong>
+      </div>
+      <span
+        className="max-w-[60%] truncate text-xs text-[var(--muted-foreground)]"
+        title={versionMeta(run)}
+      >
+        {versionMeta(run)}
+      </span>
+    </div>
+  );
+}
+
+function StatusRow({
+  action,
+  detail,
+  label,
+  state,
+  status,
+}: {
+  action?: React.ReactNode;
+  detail: string;
+  label: string;
+  state: "active" | "idle" | "success" | "warning";
+  status: string;
+}) {
+  return (
+    <div className="flex min-h-[66px] items-center gap-3 border-b border-[var(--border)] px-4 last:border-b-0 max-[760px]:flex-wrap max-[760px]:py-3">
+      <span
+        aria-hidden="true"
+        className={`a11y-status-dot size-2 shrink-0 rounded-full ${state === "success" ? "bg-[var(--success)]" : state === "warning" ? "bg-[var(--warning)]" : state === "active" ? "bg-[var(--accent)]" : "bg-[var(--muted-strong)]"}`}
+        data-status={state}
+      />
+      <span className="min-w-0 flex-1">
+        <strong className="block truncate text-sm font-medium">{label}</strong>
+        <span className="mt-1 block truncate text-xs text-[var(--muted-foreground)]">
+          {detail}
+        </span>
+      </span>
+      <span
+        className={`text-xs ${state === "success" ? "text-[var(--success)]" : state === "warning" ? "text-[var(--warning)]" : state === "active" ? "font-medium text-[var(--foreground)]" : "text-[var(--muted-foreground)]"}`}
+      >
+        {status}
+      </span>
+      {action ? (
+        <div className="flex gap-2 max-[760px]:basis-full max-[760px]:flex-wrap max-[760px]:justify-end max-[760px]:pl-5">
+          {action}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function Section({
+  children,
+  title,
+  trailing,
+}: {
+  children: React.ReactNode;
+  title: string;
+  trailing?: string;
+}) {
+  return (
+    <section className="mt-7">
+      <div className="mb-3 flex items-center justify-between">
+        <h2 className="m-0 text-base font-semibold">{title}</h2>
+        {trailing ? (
+          <span className="text-xs text-[var(--muted-foreground)]">
+            {trailing}
+          </span>
+        ) : null}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function PageHeading({
+  action,
+  description,
+  title,
+}: {
+  action?: React.ReactNode;
+  description: string;
+  title: string;
+}) {
+  return (
+    <div className="mb-6 flex items-start justify-between gap-5 max-[760px]:flex-col max-[760px]:items-stretch">
+      <div>
+        <h1 className="m-0 text-2xl font-semibold">{title}</h1>
+        <p className="mb-0 mt-2 text-sm leading-6 text-[var(--muted-foreground)]">
+          {description}
+        </p>
+      </div>
+      {action}
+    </div>
+  );
+}
+
+function IssueBanner({
+  action,
+  message,
+  nextStep,
+  technicalCode,
+  technicalDetails,
+  title,
+}: {
+  action?: React.ReactNode;
+  message: string;
+  nextStep?: string;
+  technicalCode?: string;
+  technicalDetails?: string[];
+  title: string;
+}) {
+  return (
+    <div
+      className="mb-5 flex items-start justify-between gap-5 rounded-lg border border-[var(--warning)]/30 bg-[var(--warning-soft)] px-4 py-3 max-[760px]:flex-col max-[760px]:items-stretch"
+      role="alert"
+    >
+      <div>
+        <strong className="text-sm">{title}</strong>
+        <p className="mb-0 mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
+          {message}
+        </p>
+        {nextStep ? (
+          <p className="mb-0 mt-2 text-xs font-medium leading-5">
+            下一步：{nextStep}
+          </p>
+        ) : null}
+        {technicalDetails?.length ? (
+          <details className="mt-2 text-xs text-[var(--muted-foreground)]">
+            <summary className="cursor-pointer">查看技术详情</summary>
+            {technicalCode ? (
+              <div className="mt-2">错误编号：{technicalCode}</div>
+            ) : null}
+            <div className="mt-2 space-y-1">
+              {technicalDetails.map((detail, index) => (
+                <code
+                  className="block max-h-24 overflow-auto whitespace-pre-wrap break-all text-[10px]"
+                  key={`${technicalCode ?? "issue"}:${index}`}
+                >
+                  {detail}
+                </code>
+              ))}
+            </div>
+          </details>
+        ) : null}
+      </div>
+      {action ? <div className="shrink-0">{action}</div> : null}
+    </div>
+  );
+}
+
+export function DeploymentBlockerBanner({
+  deploying,
+  message,
+  onDeployCommitted,
+  onOpenSetup,
+  onRetry,
+}: {
+  deploying: boolean;
+  message: string;
+  onDeployCommitted: () => void;
+  onOpenSetup?: () => void;
+  onRetry?: () => void;
+}) {
+  const issue = issueFromUnknown(message, "测试版还没有部署成功");
+  const shouldCheckSetup = [
+    "AD-CFG-",
+    "AD-SSH-",
+    "AD-SRV-",
+    "AD-IMG-",
+    "AD-DB-",
+    "AD-CACHE-",
+    "AD-INF-",
+    "AD-CNB-101",
+    "AD-CNB-103",
+  ].some((prefix) => issue.code.startsWith(prefix));
+  return (
+    <IssueBanner
+      action={
+        issue.code === "AD-GIT-101" ? (
+          <Button disabled={deploying} onClick={onDeployCommitted} size="sm">
+            {deploying ? (
+              <LoaderCircle className="animate-spin-slow" />
+            ) : (
+              <Rocket />
+            )}
+            部署已提交版本
+          </Button>
+        ) : shouldCheckSetup && onOpenSetup ? (
+          <Button
+            disabled={deploying}
+            onClick={onOpenSetup}
+            size="sm"
+            variant="secondary"
+          >
+            <Tags />
+            检查上线设置
+          </Button>
+        ) : onRetry ? (
+          <Button disabled={deploying} onClick={onRetry} size="sm">
+            {deploying ? (
+              <LoaderCircle className="animate-spin-slow" />
+            ) : (
+              <RefreshCw />
+            )}
+            重新尝试
+          </Button>
+        ) : undefined
+      }
+      message={issue.message}
+      nextStep={issue.nextSteps[0]}
+      technicalCode={issue.code}
+      technicalDetails={issue.technicalDetails}
+      title={issue.title}
+    />
+  );
+}
+
+function SuccessBanner({
+  action,
+  message,
+  title,
+}: {
+  action?: React.ReactNode;
+  message: string;
+  title: string;
+}) {
+  return (
+    <div className="my-5 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[var(--success)]/25 bg-[var(--success-soft)] px-4 py-3">
+      <div className="flex min-w-0 items-start gap-3">
+        <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-[var(--success)]" />
+        <div>
+          <strong className="text-sm">{title}</strong>
+          <p className="mb-0 mt-1 text-xs text-[var(--muted-foreground)]">
+            {message}
+          </p>
+        </div>
+      </div>
+      {action ? <div className="shrink-0">{action}</div> : null}
+    </div>
+  );
+}
+
+function NoticeBanner({ message, title }: { message: string; title: string }) {
+  return (
+    <div className="my-5 flex items-start gap-3 rounded-lg border border-[var(--border)] bg-[var(--muted)]/45 px-4 py-3">
+      <Square className="mt-0.5 size-4 text-[var(--muted-foreground)]" />
+      <div>
+        <strong className="text-sm">{title}</strong>
+        <p className="mb-0 mt-1 text-xs text-[var(--muted-foreground)]">
+          {message}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function ChoiceCard({
+  checked,
+  description,
+  label,
+  onClick,
+}: {
+  checked: boolean;
+  description: string;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      aria-pressed={checked}
+      className={`rounded-lg border p-4 text-left outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus)] ${checked ? "border-[var(--accent)] bg-[var(--accent-soft)]" : "border-[var(--border)] bg-[var(--surface)]"}`}
+      onClick={onClick}
+      type="button"
+    >
+      <strong className="block text-sm">{label}</strong>
+      <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
+        {description}
+      </span>
+    </button>
+  );
+}
+
+function localInfrastructureRequirements(
+  workspace: WorkspacePreview,
+): Array<"postgres" | "redis"> {
+  const variables = new Set(
+    workspace.inspection.environment_variables.map((item) => item.name),
+  );
+  const result: Array<"postgres" | "redis"> = [];
+  if (
+    workspace.inspection.prisma_schemas.length ||
+    variables.has("DATABASE_URL")
+  )
+    result.push("postgres");
+  if (variables.has("REDIS_URL")) result.push("redis");
+  return result;
+}
+
+function serviceDisplayName(
+  id: string,
+  kind: string,
+  index: number,
+  total: number,
+) {
+  const normalized = id.toLowerCase();
+  if (normalized.includes("admin")) return "管理后台";
+  if (normalized === "api" || normalized.includes("backend")) return "后端服务";
+  if (normalized.includes("web") || normalized.includes("frontend"))
+    return "用户网站";
+  const base =
+    kind === "api" ? "后端服务" : kind === "worker" ? "任务服务" : "网页服务";
+  return total > 1 ? `${base} · ${id}` : base || `项目服务 ${index + 1}`;
+}
+
+function readRepository(manifestYaml: string) {
+  try {
+    const value = parseDocument(manifestYaml).getIn([
+      "providers",
+      "build",
+      "repository",
+    ]);
+    return typeof value === "string" ? value : "";
+  } catch {
+    return "";
+  }
+}
+
+function usableRepository(repository: string) {
+  return Boolean(
+    repository &&
+    repository.includes("/") &&
+    !repository.includes("replace-me") &&
+    !repository.startsWith("owner/"),
+  );
+}
+
+function readRegistry(manifestYaml: string): {
+  endpoint: string;
+  kind: "cnb" | "tcr" | "oci";
+  namespace: string;
+  repository: string;
+} {
+  try {
+    const document = parseDocument(manifestYaml);
+    const kindValue = String(
+      document.getIn(["providers", "registry", "kind"]) ?? "cnb",
+    );
+    const kind =
+      kindValue === "tcr" ? "tcr" : kindValue === "oci" ? "oci" : "cnb";
+    return {
+      endpoint: String(
+        document.getIn([
+          "providers",
+          "registry",
+          kind === "tcr" ? "registry" : "push_registry",
+        ]) ?? "",
+      ),
+      kind,
+      namespace: String(
+        document.getIn(["providers", "registry", "namespace"]) ?? "",
+      ),
+      repository: String(
+        document.getIn(["providers", "registry", "repository"]) ?? "",
+      ),
+    };
+  } catch {
+    return { endpoint: "", kind: "cnb", namespace: "", repository: "" };
+  }
+}
+
+export function tcrRegistryManifest(manifestYaml: string, namespace: string) {
+  const document = parseDocument(manifestYaml);
+  document.setIn(["providers", "registry"], {
+    kind: "tcr",
+    registry: "ccr.ccs.tencentyun.com",
+    namespace: namespace.trim(),
+  });
+  return document.toString({ lineWidth: 0 });
+}
+
+function versionLabel(run: DeploymentRun) {
+  return `${formatRunTime(run.startedAt)} 的版本`;
+}
+
+export function versionTitle(run: DeploymentRun) {
+  return primaryVersionTitle(run.sourceTitle) || versionLabel(run);
+}
+
+export function versionComparisonTitle(run: DeploymentRun) {
+  const title = primaryVersionTitle(run.sourceTitle);
+  return title
+    ? `${title}（${formatRunTime(run.startedAt)}）`
+    : versionLabel(run);
+}
+
+function deploymentAttemptLabel(run: DeploymentRun) {
+  return `${formatRunTime(run.startedAt)} 的部署`;
+}
+
+export function availableVersionRuns(runs: DeploymentRun[]) {
+  return runs.filter((run) => run.status === "success");
+}
+
+export function versionMeta(run: DeploymentRun) {
+  const title = friendlyVersionTitle(run.sourceTitle);
+  const revision = `代码 ${shortRevision(run)}`;
+  if (!title) return revision;
+  return primaryVersionTitle(run.sourceTitle)
+    ? `${formatRunTime(run.startedAt)} · ${revision}`
+    : `修改说明：${title} · ${revision}`;
+}
+
+function versionKey(run: DeploymentRun) {
+  return deploymentVersionKey(run);
+}
+
+export function isOlderVersion(
+  candidate: DeploymentRun,
+  current: DeploymentRun | undefined,
+) {
+  if (!current || versionKey(candidate) === versionKey(current)) return false;
+  const candidateTime = Date.parse(candidate.startedAt);
+  const currentTime = Date.parse(current.startedAt);
+  return (
+    Number.isFinite(candidateTime) &&
+    Number.isFinite(currentTime) &&
+    candidateTime < currentTime
+  );
+}
+
+export function productionConfirmationMessage({
+  candidateTitle,
+  currentTitle,
+  restoring,
+  target,
+}: {
+  candidateTitle: string;
+  currentTitle?: string;
+  restoring: boolean;
+  target?: string;
+}) {
+  const targetLabel = target ? `正式网站（${target}）` : "正式网站";
+  if (!currentTitle) {
+    return `${targetLabel}将使用“${candidateTitle}”。这是测试通过的同一版本，不会重新构建。`;
+  }
+  return `${targetLabel}将从“${currentTitle}”${restoring ? "恢复" : "切换"}到“${candidateTitle}”。这是测试通过的${restoring ? "历史" : "同一"}版本，不会重新构建；如果目标版本启动失败，系统会自动恢复“${currentTitle}”。`;
+}
+
+function versionKeyForSource(
+  sourceRunId: string | null | undefined,
+  runs: DeploymentRun[],
+) {
+  if (!sourceRunId) return "";
+  const source = runs.find((run) => run.id === sourceRunId);
+  return source ? versionKey(source) : sourceRunId;
+}
+
+function collapseVersionRuns(runs: DeploymentRun[]) {
+  const versions = new Map<string, DeploymentRun>();
+  for (const run of runs) {
+    const key = versionKey(run);
+    const current = versions.get(key);
+    if (!current || versionRunRank(run) > versionRunRank(current)) {
+      versions.set(key, run);
+    }
+  }
+  return Array.from(versions.values()).sort((left, right) =>
+    right.startedAt.localeCompare(left.startedAt),
+  );
+}
+
+function versionRunRank(run: DeploymentRun) {
+  if (run.status === "success") return 5;
+  if (isDeployedRun(run)) return 4;
+  if (run.status === "running") return 3;
+  if (run.status === "queued") return 2;
+  if (run.status === "needs_action") return 1;
+  return 0;
+}
+
+function isDeployedRun(run: DeploymentRun) {
+  return (
+    run.status === "success" ||
+    (run.status === "needs_action" && run.artifacts.length > 0)
+  );
+}
+
+function formatRunTime(value: string) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "时间未知";
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(parsed);
+}
+
+function safeRepositoryName(name: string) {
+  return (
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "abcdeploy-project"
+  );
+}
+
+function readEnvironmentDomains(
+  manifestYaml: string,
+  environment: "staging" | "production",
+) {
+  try {
+    const data = parseDocument(manifestYaml).toJS() as {
+      environments?: Record<
+        string,
+        { domains?: Array<{ service?: string; host?: string }> }
+      >;
+    };
+    return Object.fromEntries(
+      (data.environments?.[environment]?.domains ?? [])
+        .filter((item) => item.service && item.host)
+        .map((item) => [item.service as string, item.host as string]),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function productionDomainsReady(workspace: WorkspacePreview) {
+  const domains = readEnvironmentDomains(workspace.manifestYaml, "production");
+  const services = workspace.inspection.services.filter(
+    (service) => service.kind !== "worker",
+  );
+  return (
+    services.length > 0 &&
+    services.every((service) => Boolean(domains[service.id]))
+  );
+}
+
+function secretReferenceReady(
+  workspace: WorkspacePreview,
+  environment: "staging" | "production",
+) {
+  const reference = parseDocument(workspace.manifestYaml).getIn([
+    "environments",
+    environment,
+    "secrets_ref",
+  ]);
+  return (
+    typeof reference === "string" &&
+    reference.includes("cnb.cool/") &&
+    !reference.includes("replace-me")
+  );
+}
+
+export function secretRepositoryFromManifest(
+  workspace: WorkspacePreview,
+  environment: "staging" | "production",
+) {
+  const reference = parseDocument(workspace.manifestYaml).getIn([
+    "environments",
+    environment,
+    "secrets_ref",
+  ]);
+  if (typeof reference !== "string" || reference.includes("replace-me"))
+    return "";
+  return reference.match(/^https:\/\/cnb\.cool\/(.+?)\/-\/blob\//)?.[1] ?? "";
+}
+
+function suggestedSecretRepository(workspace: WorkspacePreview) {
+  const repository = readRepository(workspace.manifestYaml);
+  if (repository.includes("/")) {
+    const [namespace] = repository.split("/");
+    return `${namespace}/${safeRepositoryName(workspace.inspection.project_name)}-secrets`;
+  }
+  return `owner/${safeRepositoryName(workspace.inspection.project_name)}-secrets`;
+}
+
+async function copyText(value: string) {
+  if ("__TAURI_INTERNALS__" in window) {
+    await writeText(value);
+    return;
+  }
+  if (!navigator.clipboard)
+    throw new Error("当前环境无法使用剪贴板，请在桌面客户端中重试");
+  await navigator.clipboard.writeText(value);
+}
+
+export async function clearClipboardIfUnchanged(value: string) {
+  if (!value) return false;
+  try {
+    if ("__TAURI_INTERNALS__" in window) {
+      if ((await readText()) !== value) return false;
+      await clearClipboard();
+      return true;
+    }
+    if (
+      !navigator.clipboard ||
+      typeof navigator.clipboard.readText !== "function"
+    )
+      return false;
+    if ((await navigator.clipboard.readText()) !== value) return false;
+    await navigator.clipboard.writeText("");
+    return true;
+  } catch {
+    // Clipboard access is best-effort. A successful deployment setup must not
+    // be turned into an error if the operating system refuses a cleanup read.
+    return false;
+  }
+}
+
+function productionAddress(workspace: WorkspacePreview) {
+  return environmentAddresses(workspace, "production")[0]?.host ?? "";
+}
+
+export function testAddress(workspace: WorkspacePreview, server?: ServerForm) {
+  return (
+    environmentAddresses(workspace, "staging", server)[0]?.url ??
+    "测试地址将在部署后显示"
+  );
+}
+
+export function environmentAddresses(
+  workspace: WorkspacePreview,
+  environment: "staging" | "production",
+  server?: ServerForm,
+) {
+  const domains = readEnvironmentDomains(workspace.manifestYaml, environment);
+  const services = workspace.inspection.services.filter(
+    (service) => service.kind !== "worker",
+  );
+  const addresses = services
+    .map((service, index) => {
+      const host = domains[service.id]?.trim();
+      if (!host) return null;
+      const website =
+        service.kind === "web" ||
+        service.kind === "static" ||
+        /(^|[-_])(web|h5|site|frontend|admin)([-_]|$)/i.test(service.id);
+      const scheme =
+        environment === "staging" && host.toLowerCase().endsWith(".sslip.io")
+          ? "http"
+          : "https";
+      return {
+        service: service.id,
+        label: serviceDisplayName(
+          service.id,
+          service.kind,
+          index,
+          services.length,
+        ),
+        host,
+        url: `${scheme}://${host}`,
+        priority: website ? 0 : service.kind === "api" ? 1 : 2,
+        index,
+      };
+    })
+    .filter((item): item is NonNullable<typeof item> => Boolean(item))
+    .sort(
+      (left, right) =>
+        left.priority - right.priority || left.index - right.index,
+    )
+    .map(({ index: _index, priority: _priority, ...item }) => item);
+  if (addresses.length || environment === "production" || !server?.host)
+    return addresses;
+  return [
+    {
+      service: "server",
+      label: "测试地址",
+      host: server.host,
+      url: `http://${server.host}`,
+    },
+  ];
+}
+
+export function dnsRecordTypeForTarget(target?: string): "A" | "AAAA" {
+  return target?.includes(":") ? "AAAA" : "A";
+}
+
+function deploymentStatus(run: DeploymentRun) {
+  if (run.actionKind === "route-check") return "还差设置地址";
+  if (run.actionKind === "route-repair") return "地址未生效";
+  if (run.status === "queued") return "等待系统开始";
+  if (run.status === "running")
+    return run.environment === "production"
+      ? "正在发布正式版"
+      : "正在部署测试版";
+  if (run.status === "needs_action")
+    return deploymentNeedsActionStatus(run.environment, run.actionKind);
+  if (run.status === "success")
+    return run.environment === "production"
+      ? "正式版可以访问"
+      : "测试版可以使用";
+  if (run.status === "failed")
+    return run.environment === "production"
+      ? "正式发布没有完成"
+      : "测试部署没有完成";
+  return "已取消";
+}
+
+export function deploymentStateMessage(run: DeploymentRun) {
+  if (run.status === "success") {
+    return run.environment === "production"
+      ? "正式版正在使用测试通过的同一版本，访问地址正常"
+      : "测试版正在正常运行，可以打开并确认功能";
+  }
+  return run.message;
+}
+
+export function deploymentUpdatedAtLabel(
+  value: string,
+  reference = new Date(),
+) {
+  const updated = new Date(value);
+  if (Number.isNaN(updated.getTime())) return "";
+  const sameDay =
+    updated.getFullYear() === reference.getFullYear() &&
+    updated.getMonth() === reference.getMonth() &&
+    updated.getDate() === reference.getDate();
+  if (sameDay) {
+    return `今天 ${new Intl.DateTimeFormat("zh-CN", {
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(updated)}`;
+  }
+  return new Intl.DateTimeFormat("zh-CN", {
+    year:
+      updated.getFullYear() === reference.getFullYear() ? undefined : "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(updated);
+}
+
+export function autoRechecksDeployment(run: DeploymentRun) {
+  return (
+    run.status === "needs_action" &&
+    ["route-check", "route-repair", "verify-release", "cnb-builds"].includes(
+      run.actionKind ?? "",
+    )
+  );
+}
+
+export function deploymentRefreshLabel(run: DeploymentRun) {
+  if (run.actionKind === "route-check")
+    return run.environment === "production"
+      ? "检查并完成发布"
+      : "检查并打开测试版";
+  if (run.actionKind === "route-repair") return "重新检查地址";
+  if (run.status === "needs_action" && run.issueCode === "AD-CTR-201")
+    return "检查服务原因";
+  if (
+    run.status === "needs_action" &&
+    run.currentStage === "healthcheck" &&
+    run.artifacts.length
+  )
+    return "重新检查服务";
+  if (run.status === "needs_action") return "重新检查部署结果";
+  if (run.status === "queued" || run.status === "running") return "刷新进度";
+  if (run.status === "success") return "检查运行状态";
+  return "重新检查结果";
+}
+
+export function deploymentNextStep(run: DeploymentRun, fallback = "") {
+  if (run.issueCode === "AD-CNB-103")
+    return "点击“更新 CNB 授权”，保存新令牌后继续当前任务";
+  if (run.issueCode === "AD-CNB-202")
+    return run.environment === "production"
+      ? "点击“重新发布同一版本”，继续使用已经测试通过的版本"
+      : "点击“重新部署当前代码”，重新创建远程测试任务";
+  if (run.issueCode === "AD-CTR-201")
+    return run.status === "needs_action"
+      ? "点击“检查服务原因”，系统会读取启动日志并给出具体处理建议"
+      : "点击下方“检查后重新部署”，系统会重新核对服务状态";
+  if (run.actionKind === "route-check") {
+    return run.environment === "production"
+      ? "设置好域名后点击“检查并完成发布”，不会重新部署服务"
+      : "点击“打开测试版”，系统会在这台电脑建立临时访问地址，不会重新部署项目";
+  }
+  if (run.actionKind === "route-repair")
+    return "点击“重新应用地址”，只修复访问入口，不会重新生成版本";
+  if (run.actionKind === "cloud-setup")
+    return "完成当前上线设置后返回这里，继续部署同一份代码";
+  if (
+    run.status === "needs_action" &&
+    run.currentStage === "healthcheck" &&
+    run.artifacts.length
+  )
+    return fallback
+      ? `${fallback}；处理后点击“重新检查服务”`
+      : "按上面的提示处理后，点击“重新检查服务”";
+  if (run.status === "failed")
+    return run.environment === "production"
+      ? "查看原因并处理后，重新发布同一个测试通过版本"
+      : "处理失败原因后，重新部署测试版";
+  if (run.status === "needs_action")
+    return fallback || "完成上面提示后，点击“重新检查部署结果”";
+  return fallback || "等待当前操作完成";
+}
+
+function deploymentTitle(run: DeploymentRun) {
+  if (run.actionKind === "route-check")
+    return run.environment === "production"
+      ? "正式版已经部署"
+      : "测试版已经部署";
+  if (run.actionKind === "route-repair")
+    return run.environment === "production"
+      ? "正式版地址没有生效"
+      : "测试版地址没有生效";
+  if (run.status === "success")
+    return run.environment === "production"
+      ? "正式版已上线"
+      : "测试版已经可以使用";
+  if (run.status === "failed")
+    return run.environment === "production"
+      ? "正式发布没有完成"
+      : "测试版部署没有完成";
+  if (run.status === "needs_action")
+    return deploymentNeedsActionStatus(run.environment, run.actionKind);
+  return run.environment === "production" ? "正在发布正式版" : "正在部署测试版";
+}
+
+function stageLabel(stage: string) {
+  return (
+    (
+      {
+        queued: "等待开始",
+        prepare: "准备部署",
+        "cloud-setup": "保存远程配置",
+        "prepare-config": "准备运行配置",
+        build: "构建项目",
+        publish: "发送项目",
+        "prepare-server": "准备运行服务器",
+        deploy: "启动服务",
+        healthcheck: "检查服务和地址",
+        "verify-release": "确认版本可用",
+        rollback: "恢复上个版本",
+        complete: "已经完成",
+      } as Record<string, string>
+    )[stage] ?? stage
+  );
+}
+
+export function deploymentMilestones(run: DeploymentRun) {
+  const completed = new Set(run.completedSteps);
+  const currentStage = run.currentStage;
+  const successful = run.status === "success";
+  const milestones = [
+    {
+      label: "准备项目",
+      done: completed.has("write-config"),
+      stages: ["queued", "prepare", "cloud-setup", "prepare-config"],
+    },
+    {
+      label: run.environment === "production" ? "确认版本" : "生成版本",
+      done: completed.has("verify-build") && completed.has("publish-images"),
+      stages: ["build", "publish"],
+    },
+    {
+      label: "启动服务",
+      done: completed.has("prepare-server") && completed.has("deploy"),
+      stages: ["prepare-server", "deploy"],
+    },
+    {
+      label: "确认可用",
+      done: completed.has("healthcheck"),
+      stages: ["verify-release", "healthcheck", "complete"],
+    },
+  ];
+  return milestones.map((milestone) => ({
+    label: milestone.label,
+    state:
+      successful || milestone.done
+        ? ("done" as const)
+        : milestone.stages.includes(currentStage)
+          ? ("active" as const)
+          : ("pending" as const),
+  }));
+}
+
+function deploymentProgress(run: DeploymentRun) {
+  const steps = [
+    "write-config",
+    "verify-build",
+    "publish-images",
+    "prepare-server",
+    "deploy",
+    "healthcheck",
+  ];
+  const completedProgress = Math.round(
+    (run.completedSteps.filter((step) => steps.includes(step)).length /
+      steps.length) *
+      100,
+  );
+  const stageFloor =
+    {
+      queued: 5,
+      prepare: 10,
+      "cloud-setup": 10,
+      "prepare-config": 15,
+      build: 30,
+      publish: 50,
+      "prepare-server": 60,
+      deploy: 70,
+      "verify-release": 82,
+      healthcheck: 90,
+      complete: 100,
+    }[run.currentStage] ?? 0;
+  return Math.max(completedProgress, stageFloor);
+}
+
+function shortRevision(run: DeploymentRun) {
+  return run.commitSha
+    ? run.commitSha.slice(0, 8)
+    : (run.candidateTag ?? "当前测试版本");
+}
+
+function formatElapsed(seconds: number) {
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  const remaining = seconds % 60;
+  return remaining ? `${minutes} 分 ${remaining} 秒` : `${minutes} 分钟`;
+}
+
+function toMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}

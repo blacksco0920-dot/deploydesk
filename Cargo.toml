@@ -7,7 +7,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0-preview.3"
+version = "0.2.0-preview.4"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["ABCDeploy Contributors"]
@@ -34,7 +34,7 @@ sha2 = "0.10"
 ssh-key = { version = "0.6.7", features = ["ed25519", "getrandom"] }
 tempfile = "3.23"
 thiserror = "2.0"
-tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "sync", "time"] }
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
 walkdir = "2.5"

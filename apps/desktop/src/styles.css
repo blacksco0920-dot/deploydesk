@@ -32,6 +32,7 @@
   --accent: #0f766e;
   --accent-hover: #0b625c;
   --accent-soft: #e8f4f2;
+  --info-soft: #edf7f6;
   --focus: rgb(15 118 110 / 25%);
   --success: #18794e;
   --success-soft: #eaf6ef;
@@ -62,6 +63,7 @@
     --accent: #5fc4b8;
     --accent-hover: #79d4c9;
     --accent-soft: #173b37;
+    --info-soft: #173b37;
     --focus: rgb(95 196 184 / 30%);
     --success: #6ccc99;
     --success-soft: #183c2b;
@@ -70,6 +72,110 @@
     --destructive: #d8544a;
     --destructive-hover: #e36b62;
     --destructive-soft: #48231f;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --muted-foreground: #494946;
+    --subtle-foreground: #5f5f5a;
+    --muted: #e9e9e6;
+    --muted-strong: #c5c5bf;
+    --border: #92928b;
+    --input: #71716b;
+    --focus: rgb(15 118 110 / 80%);
+  }
+}
+
+@media (prefers-color-scheme: dark) and (prefers-contrast: more) {
+  :root:not(.light) {
+    --muted-foreground: #d0d0cb;
+    --subtle-foreground: #b6b6b0;
+    --muted: #333331;
+    --muted-strong: #555550;
+    --border: #777771;
+    --input: #92928b;
+    --focus: rgb(121 212 201 / 90%);
+  }
+}
+
+@media (forced-colors: active) {
+  :root {
+    color: CanvasText;
+    background: Canvas;
+    --background: Canvas;
+    --surface: Canvas;
+    --surface-raised: Canvas;
+    --foreground: CanvasText;
+    --muted-foreground: CanvasText;
+    --subtle-foreground: GrayText;
+    --muted: Canvas;
+    --muted-strong: GrayText;
+    --border: CanvasText;
+    --input: CanvasText;
+    --primary: ButtonText;
+    --primary-hover: Highlight;
+    --primary-foreground: ButtonFace;
+    --accent: Highlight;
+    --accent-hover: Highlight;
+    --accent-soft: Canvas;
+    --info-soft: Canvas;
+    --focus: Highlight;
+    --success: CanvasText;
+    --success-soft: Canvas;
+    --warning: CanvasText;
+    --warning-soft: Canvas;
+    --destructive: CanvasText;
+    --destructive-hover: Highlight;
+    --destructive-soft: Canvas;
+  }
+
+  ::selection {
+    color: HighlightText;
+    background: Highlight;
+  }
+
+  :where(button, input, textarea, select, [role="button"]):focus-visible {
+    outline: 2px solid Highlight !important;
+    outline-offset: 2px;
+    box-shadow: none !important;
+  }
+
+  button[aria-current="page"] {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+
+  .a11y-button:not([data-variant="ghost"]):not([data-variant="link"]) {
+    border-color: ButtonText !important;
+  }
+
+  .a11y-count-badge {
+    color: HighlightText !important;
+    background: Highlight !important;
+    border-color: Highlight !important;
+    forced-color-adjust: none;
+  }
+
+  .a11y-status-dot {
+    background: Canvas !important;
+    border: 1px solid GrayText;
+    forced-color-adjust: none;
+  }
+
+  .a11y-status-dot[data-status="success"] {
+    background: Highlight !important;
+    border-color: Highlight;
+  }
+
+  .a11y-status-dot[data-status="warning"] {
+    border: 2px solid CanvasText;
+  }
+
+  .a11y-status-dot[data-status="active"] {
+    border: 2px solid Highlight;
+    outline: 1px solid CanvasText;
+    outline-offset: 1px;
   }
 }
 

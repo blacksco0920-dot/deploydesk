@@ -38,6 +38,9 @@ serde_yaml_ng.workspace = true
 ssh-key.workspace = true
 zeroize.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
+
 [dev-dependencies]
 tempfile.workspace = true
 

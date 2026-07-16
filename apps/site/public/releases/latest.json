@@ -1,7 +1,7 @@
 {
-  "version": "v0.2.0-preview.3",
+  "version": "v0.2.0-preview.4",
   "channel": "preview",
-  "releasePage": "https://abcdeploy.finagent.cloud/#download",
+  "releasePage": "https://github.com/blacksco0920-dot/abcdeploy/releases",
   "assets": {
     "mac-arm": { "available": false, "url": "", "sha256": "" },
     "mac-intel": { "available": false, "url": "", "sha256": "" },

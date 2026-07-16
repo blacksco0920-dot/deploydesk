@@ -11,6 +11,7 @@ use russh::{ChannelMsg, Disconnect};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, PublicKey, rand_core::OsRng};
+use zeroize::Zeroizing;
 
 use crate::error::{DeployError, Result};
 use crate::model::ProviderCheck;
@@ -90,6 +91,17 @@ impl client::Handler for HostKeyVerifier {
             .is_none_or(|expected| expected == fingerprint))
     }
 }
+
+const AUTHORIZED_KEYS_INSTALL_COMMAND: &str = r#"set -eu
+umask 077
+mkdir -p "$HOME/.ssh"
+touch "$HOME/.ssh/authorized_keys"
+chmod 700 "$HOME/.ssh"
+chmod 600 "$HOME/.ssh/authorized_keys"
+IFS= read -r key
+case "$key" in ssh-*) ;; *) exit 64 ;; esac
+grep -qxF "$key" "$HOME/.ssh/authorized_keys" || printf '%s\n' "$key" >> "$HOME/.ssh/authorized_keys"
+"#;
 
 const fn default_port() -> u16 {
     22
@@ -267,6 +279,38 @@ fn public_key_fingerprint(private_path: &Path) -> Option<String> {
     Some(public_key.fingerprint(HashAlg::Sha256).to_string())
 }
 
+fn identity_public_key(private_path: &Path) -> Result<String> {
+    let public_path = PathBuf::from(format!("{}.pub", private_path.to_string_lossy()));
+    let encoded = if public_path.is_file() {
+        fs::read_to_string(&public_path).map_err(|source| DeployError::ReadFile {
+            path: public_path,
+            source,
+        })?
+    } else {
+        load_secret_key(private_path, None)
+            .map_err(|error| {
+                DeployError::MissingCredential(format!(
+                    "无法读取 SSH 私钥以生成公钥：{}",
+                    redact_text(&error.to_string())
+                ))
+            })?
+            .public_key()
+            .to_openssh()
+            .map_err(|error| DeployError::Command {
+                command: "encode ssh public key".to_string(),
+                message: redact_text(&error.to_string()),
+            })?
+    };
+    PublicKey::from_openssh(encoded.trim())
+        .and_then(|key| key.to_openssh())
+        .map_err(|error| {
+            DeployError::MissingCredential(format!(
+                "SSH 公钥格式不正确：{}",
+                redact_text(&error.to_string())
+            ))
+        })
+}
+
 fn expand_home(value: &str, home: &Path) -> PathBuf {
     if value == "~" {
         return home.to_path_buf();
@@ -308,6 +352,19 @@ pub async fn check_connection(profile: &SshProfile) -> Result<ProviderCheck> {
 
     let output = match execute(profile, "true", None, Duration::from_secs(20)).await {
         Ok(output) => output,
+        Err(DeployError::MissingCredential(message))
+            if message.contains("服务器未接受这把 SSH 公钥") =>
+        {
+            return Ok(ProviderCheck {
+                provider: "ssh-key-install".to_string(),
+                ok: false,
+                summary: "服务器还不认识这台电脑".to_string(),
+                details: vec!["SSH 公钥尚未安装到目标登录用户".to_string()],
+                code: Some("AD-SSH-105".to_string()),
+                next_steps: vec!["输入一次服务器登录密码，由 ABCDeploy 自动安装公钥".to_string()],
+                retryable: true,
+            });
+        }
         Err(error) => {
             return Ok(failed_check(
                 "ssh",
@@ -337,44 +394,94 @@ pub async fn check_connection(profile: &SshProfile) -> Result<ProviderCheck> {
     ))
 }
 
+pub async fn install_public_key_with_password(
+    profile: &SshProfile,
+    password: Zeroizing<String>,
+) -> Result<ProviderCheck> {
+    if password.is_empty() {
+        return Ok(ProviderCheck {
+            provider: "ssh-key-install".to_string(),
+            ok: false,
+            summary: "请填写服务器登录密码".to_string(),
+            details: Vec::new(),
+            code: Some("AD-SSH-105".to_string()),
+            next_steps: vec!["填写云服务器当前登录用户的密码后重试".to_string()],
+            retryable: true,
+        });
+    }
+    let public_key = identity_public_key(&profile.key_path)?;
+    let mut session = connect_verified(profile).await?;
+    let authentication = session
+        .authenticate_password(profile.user.clone(), password.as_str())
+        .await
+        .map_err(|error| ssh_error("authenticate password", &error))?;
+    if !authentication.success() {
+        let _ = session
+            .disconnect(Disconnect::ByApplication, "", "English")
+            .await;
+        return Ok(ProviderCheck {
+            provider: "ssh-key-install".to_string(),
+            ok: false,
+            summary: "服务器没有接受这个登录密码".to_string(),
+            details: vec!["未修改服务器，密码也没有保存".to_string()],
+            code: Some("AD-SSH-105".to_string()),
+            next_steps: vec!["确认登录用户和服务器密码是否正确，然后重试".to_string()],
+            retryable: true,
+        });
+    }
+
+    let input = format!("{public_key}\n");
+    let output = tokio::time::timeout(
+        Duration::from_secs(20),
+        run_remote_command(
+            &session,
+            AUTHORIZED_KEYS_INSTALL_COMMAND,
+            Some(input.as_bytes()),
+        ),
+    )
+    .await
+    .map_err(|_| DeployError::Command {
+        command: "ssh install public key".to_string(),
+        message: "安装公钥超时，执行结果未知，请重新验证服务器连接".to_string(),
+    })??;
+    session
+        .disconnect(Disconnect::ByApplication, "", "English")
+        .await
+        .map_err(|error| ssh_error("disconnect", &error))?;
+    if output.exit_status != Some(0) {
+        return Ok(ProviderCheck {
+            provider: "ssh-key-install".to_string(),
+            ok: false,
+            summary: "服务器没有完成安全身份安装".to_string(),
+            details: vec![redact_text(&output.stderr)],
+            code: Some("AD-SSH-106".to_string()),
+            next_steps: vec!["确认登录用户有权写入自己的 .ssh 目录，然后重试".to_string()],
+            retryable: true,
+        });
+    }
+
+    let verification = check_connection(profile).await?;
+    if verification.ok {
+        return Ok(ProviderCheck {
+            provider: "ssh".to_string(),
+            ok: true,
+            summary: format!("服务器 {} 已建立安全连接", profile.name),
+            details: vec!["公钥已幂等安装；服务器密码未保存".to_string()],
+            code: None,
+            next_steps: Vec::new(),
+            retryable: false,
+        });
+    }
+    Ok(verification)
+}
+
 pub async fn execute(
     profile: &SshProfile,
     command: &str,
     input: Option<&[u8]>,
     command_timeout: Duration,
 ) -> Result<RemoteCommandOutput> {
-    let expected = profile.host_fingerprint.as_deref().ok_or_else(|| {
-        DeployError::MissingCredential("请先确认目标服务器的 SSH 身份指纹".to_string())
-    })?;
-    let observed_fingerprint = Arc::new(Mutex::new(None));
-    let verifier = HostKeyVerifier {
-        expected: Some(expected.to_string()),
-        observed_fingerprint: Arc::clone(&observed_fingerprint),
-        observed_public_key: Arc::new(Mutex::new(None)),
-    };
-    let config = Arc::new(client_config());
-    let connect = client::connect(config, (profile.host.as_str(), profile.port), verifier);
-    let mut session = match tokio::time::timeout(Duration::from_secs(12), connect).await {
-        Ok(Ok(session)) => session,
-        Ok(Err(error)) => {
-            let actual = observed_fingerprint
-                .lock()
-                .ok()
-                .and_then(|value| value.clone());
-            if actual.as_deref().is_some_and(|actual| actual != expected) {
-                return Err(DeployError::MissingCredential(
-                    "服务器身份指纹已变化，已阻止连接".to_string(),
-                ));
-            }
-            return Err(ssh_error("connect", &error));
-        }
-        Err(_) => {
-            return Err(DeployError::Command {
-                command: "ssh connect".to_string(),
-                message: "连接超时，请检查服务器地址、安全组和 SSH 端口".to_string(),
-            });
-        }
-    };
+    let mut session = connect_verified(profile).await?;
 
     let key_pair = load_secret_key(&profile.key_path, None).map_err(|error| {
         DeployError::MissingCredential(format!(
@@ -412,6 +519,43 @@ pub async fn execute(
         .await
         .map_err(|error| ssh_error("disconnect", &error))?;
     Ok(output)
+}
+
+async fn connect_verified(profile: &SshProfile) -> Result<client::Handle<HostKeyVerifier>> {
+    let expected = profile.host_fingerprint.as_deref().ok_or_else(|| {
+        DeployError::MissingCredential("请先确认目标服务器的 SSH 身份指纹".to_string())
+    })?;
+    let observed_fingerprint = Arc::new(Mutex::new(None));
+    let verifier = HostKeyVerifier {
+        expected: Some(expected.to_string()),
+        observed_fingerprint: Arc::clone(&observed_fingerprint),
+        observed_public_key: Arc::new(Mutex::new(None)),
+    };
+    let config = Arc::new(client_config());
+    let connect = client::connect(config, (profile.host.as_str(), profile.port), verifier);
+    let session = match tokio::time::timeout(Duration::from_secs(12), connect).await {
+        Ok(Ok(session)) => session,
+        Ok(Err(error)) => {
+            let actual = observed_fingerprint
+                .lock()
+                .ok()
+                .and_then(|value| value.clone());
+            if actual.as_deref().is_some_and(|actual| actual != expected) {
+                return Err(DeployError::MissingCredential(
+                    "服务器身份指纹已变化，已阻止连接".to_string(),
+                ));
+            }
+            return Err(ssh_error("connect", &error));
+        }
+        Err(_) => {
+            return Err(DeployError::Command {
+                command: "ssh connect".to_string(),
+                message: "连接超时，请检查服务器地址、安全组和 SSH 端口".to_string(),
+            });
+        }
+    };
+
+    Ok(session)
 }
 
 pub async fn probe_host_identity(profile: &SshProfile) -> Result<SshHostIdentity> {
@@ -572,7 +716,10 @@ fn ssh_error(action: &str, error: &russh::Error) -> DeployError {
 
 #[cfg(test)]
 mod tests {
-    use super::{SshProfile, discover_identities_in, generate_managed_identity_in, host_key_gate};
+    use super::{
+        AUTHORIZED_KEYS_INSTALL_COMMAND, SshProfile, discover_identities_in,
+        generate_managed_identity_in, host_key_gate, identity_public_key,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -592,6 +739,9 @@ mod tests {
         let identities = discover_identities_in(home.path());
         assert_eq!(identities.len(), 1);
         assert_eq!(identities[0].path, generated.identity.path);
+        let public_key = identity_public_key(&generated.identity.path).expect("public key");
+        assert!(public_key.starts_with("ssh-ed25519 "));
+        assert!(!AUTHORIZED_KEYS_INSTALL_COMMAND.contains(&public_key));
     }
 
     #[test]
