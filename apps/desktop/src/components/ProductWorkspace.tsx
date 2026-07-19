@@ -30,7 +30,6 @@ import {
   cancelLocalPreviewStart,
   checkCnbRepositoryAccess,
   checkCnbSecretRepositoryAccess,
-  checkRegistryCredentials,
   checkSavedRegistryCredentials,
   checkServer,
   connectCnb,
@@ -48,6 +47,9 @@ import {
   getSecretStatus,
   inspectServerRouteConflicts,
   installServerKeyWithPassword,
+  listProjectEnvironments,
+  listProjectVersions,
+  listVersionValidations,
   listServers,
   loadRuntimeConfig,
   openStagingPreviewTunnel,
@@ -56,10 +58,12 @@ import {
   prepareLocalInfrastructure,
   preparePipelineIdentity,
   reapplyDeploymentRoutes,
+  replaceRegistryCredentials,
+  retryDeploymentCertificates,
   selectPrivateKey,
   setAppSetting,
+  setVersionValidation,
   setLocalInfrastructureService,
-  storeSecret,
   startLocalPreview,
   startLocalPreviewService,
   stopManagedLocalPortOwner,
@@ -69,10 +73,24 @@ import {
 } from "../api";
 import { issueFromProvider, issueFromUnknown } from "../lib/errors";
 import {
+  buildReleaseCenterModel,
+  buildReleaseModel,
+  projectSectionFromStoredScene as normalizeStoredProjectSection,
+  type ProjectSection as ReleaseProjectSection,
+  type ReleaseCenterModel,
+} from "../lib/release-model";
+import {
+  legacySetupStepBlocker,
+  recoveryTaskCopy,
+  setupTaskCopy,
+  type ReleaseSetupBlocker,
+} from "../lib/release-task-copy";
+import {
   deploymentNeedsActionStatus,
   deploymentVersionKey,
   friendlyVersionTitle,
   primaryVersionTitle,
+  verifiedRunIdsFromSetting,
   verifiedVersionKeysFromSetting,
   type ProjectSetupProgressStage,
 } from "../lib/projects";
@@ -85,11 +103,15 @@ import type {
   LocalDevelopmentSupport,
   LocalPreviewStatus,
   ProviderCheck,
+  PublicRouteStatus,
+  ProjectEnvironment,
+  ProjectVersion,
   RouteConflictCheck,
   RuntimeConfigFile,
   ServerForm,
   ServerResource,
   UserFacingIssue,
+  VersionValidation,
   WorkspacePreview,
 } from "../types";
 import { parseEnvFields, RuntimeConfigFields } from "./RuntimeConfigFields";
@@ -105,8 +127,24 @@ import {
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { Progress } from "./ui/progress";
+import { Sheet, SheetContent, SheetDescription, SheetTitle } from "./ui/sheet";
 
-type ProjectScene = "local" | "versions" | "test" | "production";
+export type ProjectSection = ReleaseProjectSection;
+// `test` and `production` are retained as contextual detail views so an old
+// saved route or an activity notification can resume exactly where it stopped.
+// They are no longer top-level navigation destinations.
+export type ProjectScene = ProjectSection | "test" | "production";
+type ReleaseTaskPanel = "settings" | "test" | "production";
+
+export function projectSectionForScene(scene: ProjectScene): ProjectSection {
+  return scene === "test" || scene === "production" ? "overview" : scene;
+}
+
+export function projectSectionFromStoredScene(
+  value: string | null | undefined,
+): ProjectSection | undefined {
+  return normalizeStoredProjectSection(value);
+}
 type LocalMilestone = "idle" | "success" | "warning";
 type StoredLocalIssue = {
   code: string;
@@ -119,10 +157,16 @@ type StoredLocalIssue = {
 const CNB_REQUIRED_PERMISSIONS = [
   { code: "repo-code:rw", label: "读写项目代码" },
   { code: "repo-cnb-history:r", label: "读取构建记录" },
+  { code: "repo-cnb-detail:r", label: "读取构建详情" },
   { code: "repo-manage:rw", label: "管理仓库设置" },
   { code: "repo-cnb-trigger:rw", label: "触发自动构建" },
   { code: "group-resource:rw", label: "创建代码仓库" },
 ] as const;
+type CnbAuthorizationFeedback = {
+  message: string;
+  title: string;
+  tone: "error" | "warning";
+};
 type LocalStartRetry = { kind: "all" } | { kind: "service"; serviceId: string };
 type ManagedPortConflict = {
   owner: string;
@@ -138,12 +182,14 @@ const EXTERNAL_STATUS_RECHECK_MS = 30_000;
 
 function CnbAuthorizationDialog({
   description,
+  feedback,
   fieldId,
   fieldLabel = "新的访问令牌",
   onOpenChange,
   onSubmit,
   onTokenChange,
   open,
+  repository,
   submitDisabled = false,
   submitLabel,
   title,
@@ -151,12 +197,14 @@ function CnbAuthorizationDialog({
   working,
 }: {
   description: string;
+  feedback?: CnbAuthorizationFeedback | null;
   fieldId: string;
   fieldLabel?: string;
   onOpenChange: (open: boolean) => void;
   onSubmit: () => void;
   onTokenChange: (token: string) => void;
   open: boolean;
+  repository?: string;
   submitDisabled?: boolean;
   submitLabel: string;
   title: string;
@@ -189,7 +237,13 @@ function CnbAuthorizationDialog({
   }
 
   return (
-    <Dialog onOpenChange={onOpenChange} open={open}>
+    <Dialog
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen && working) return;
+        onOpenChange(nextOpen);
+      }}
+      open={open}
+    >
       <DialogContent>
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
@@ -213,7 +267,7 @@ function CnbAuthorizationDialog({
         <div className="space-y-2">
           <div className="flex items-center justify-between gap-3">
             <p className="m-0 text-xs font-medium text-[var(--muted-foreground)]">
-              在创建令牌页面勾选这 5 项
+              授权范围：在创建令牌页面勾选这 6 项
             </p>
             <Button
               onClick={() => void copyRequiredPermissions()}
@@ -243,9 +297,40 @@ function CnbAuthorizationDialog({
             </p>
           ) : null}
         </div>
+        <div className="rounded-md border border-[var(--border)] px-3 py-2.5 text-xs leading-5">
+          <strong className="block text-sm">还要检查使用范围</strong>
+          <span className="mt-1 block text-[var(--muted-foreground)]">
+            {repository ? (
+              <>
+                CNB
+                令牌需要同时设置“授权范围”和“使用范围”。使用范围必须包含当前仓库{" "}
+                <code className="text-[11px]">{repository}</code>
+                ，或选择全部仓库。
+              </>
+            ) : (
+              "首次创建仓库时，使用范围请选择全部仓库；创建完成后也可以改为只包含对应仓库。"
+            )}
+          </span>
+        </div>
         <p className="m-0 text-xs leading-5 text-[var(--muted-foreground)]">
-          令牌只保存在系统密钥库，并供所有项目复用。连接时不会为了测试权限创建仓库或触发构建；真正使用前仍会再次核对。
+          令牌统一保存在本机系统密钥库，符合使用范围的项目可以复用。连接时不会为了测试权限创建仓库或触发构建；真正使用前仍会再次核对。
         </p>
+        {feedback ? (
+          <div
+            aria-live="polite"
+            className={`rounded-md border px-3 py-2.5 text-sm ${
+              feedback.tone === "error"
+                ? "border-[var(--destructive)]/35 bg-[var(--destructive)]/5"
+                : "border-[var(--warning)]/35 bg-[var(--warning-soft)]"
+            }`}
+            role="alert"
+          >
+            <strong className="block">{feedback.title}</strong>
+            <span className="mt-1 block text-xs leading-5 text-[var(--muted-foreground)]">
+              {feedback.message}
+            </span>
+          </div>
+        ) : null}
         <div className="space-y-1.5">
           <Label htmlFor={fieldId}>{fieldLabel}</Label>
           <Input
@@ -281,6 +366,54 @@ function CnbAuthorizationDialog({
   );
 }
 
+function cnbAuthorizationFeedbackMessage(error: unknown): string {
+  const issue = issueFromUnknown(error);
+  return issue.message === issue.title
+    ? issue.message
+    : `${issue.title}：${issue.message}`;
+}
+
+function stillNeedsCnbAuthorization(
+  run: DeploymentRun | null | undefined,
+): boolean {
+  if (!run || run.status !== "needs_action") return false;
+  if (["AD-CNB-101", "AD-CNB-103"].includes(run.issueCode ?? "")) return true;
+  return (
+    run.actionKind === "cnb-builds" &&
+    /授权|权限|令牌|scope|permission|access/i.test(run.message)
+  );
+}
+
+function cnbRepositoryAccessFailure(check: ProviderCheck): string | null {
+  if (check.ok) return null;
+  return `${check.code ?? "AD-CNB-103"}：${check.summary}`;
+}
+
+type CnbAuthorizationOpenReporter = (source: string, open: boolean) => void;
+
+export function updateCnbAuthorizationOpenSources(
+  sources: Set<string>,
+  source: string,
+  open: boolean,
+): boolean {
+  if (open) sources.add(source);
+  else sources.delete(source);
+  return sources.size > 0;
+}
+
+function useCnbAuthorizationDialogVisibility(
+  open: boolean,
+  source: string,
+  report?: CnbAuthorizationOpenReporter,
+) {
+  useEffect(() => {
+    report?.(source, open);
+    return () => {
+      if (open) report?.(source, false);
+    };
+  }, [open, report, source]);
+}
+
 function dnsHostRecord(host: string, providers: DnsProviderHint[]): string {
   const normalizedHost = host.trim().toLowerCase();
   const provider = [...providers]
@@ -305,6 +438,59 @@ export function dnsHostRecordLabel(
   return checking
     ? "正在识别主机记录"
     : "主机记录暂未识别，请以域名平台显示为准";
+}
+
+export function publicRouteStatusPresentation(
+  check: PublicRouteStatus | undefined,
+  checking: boolean,
+): {
+  state: "active" | "idle" | "success" | "warning";
+  status: string;
+} {
+  if (!check) {
+    return checking
+      ? { state: "active", status: "正在检查" }
+      : { state: "idle", status: "等待检查" };
+  }
+  if (check.reachable || check.phase === "ready") {
+    return { state: "success", status: "可以访问" };
+  }
+  if (check.phase === "dns") {
+    return { state: "warning", status: "DNS 未解析" };
+  }
+  if (check.phase === "https") {
+    return { state: "warning", status: "DNS 已生效，等待 HTTPS" };
+  }
+  if (check.phase === "tcp") {
+    return { state: "warning", status: "TCP/443 不可达" };
+  }
+  if (check.phase === "route-conflict") {
+    return { state: "warning", status: "正在使用旧服务" };
+  }
+  if (check.phase === "route-missing") {
+    return { state: "warning", status: "服务器尚未启用" };
+  }
+  if (check.phase === "check") {
+    return { state: "warning", status: "检查中断" };
+  }
+  if (check.phase === "domain-policy") {
+    return { state: "warning", status: "域名访问受限" };
+  }
+  if (check.phase === "application") {
+    return { state: "warning", status: "服务响应异常" };
+  }
+  return { state: "warning", status: "地址尚未就绪" };
+}
+
+export function certificateOnlyRouteFailure(
+  checks: PublicRouteStatus[],
+): boolean {
+  const failures = checks.filter(
+    (check) => !check.reachable && check.phase !== "ready",
+  );
+  return (
+    failures.length > 0 && failures.every((check) => check.phase === "https")
+  );
 }
 
 export function versionSetupStep(
@@ -372,15 +558,59 @@ function managedPortConflict(
   return { owner: match[1].trim(), port, retry };
 }
 
+function environmentCurrentRun(
+  environment: ProjectEnvironment | undefined,
+  runs: DeploymentRun[],
+) {
+  if (
+    !environment ||
+    (!environment.currentRunId && !environment.currentVersionKey)
+  ) {
+    return undefined;
+  }
+  const exact = environment.currentRunId
+    ? runs.find((run) => run.id === environment.currentRunId)
+    : undefined;
+  if (exact) return exact;
+  if (!environment.currentVersionKey) return undefined;
+
+  if (environment.environment === "staging") {
+    return runs.find(
+      (run) =>
+        run.environment === "staging" &&
+        run.status === "success" &&
+        run.actionKind !== "production-approval" &&
+        versionKey(run) === environment.currentVersionKey,
+    );
+  }
+  if (environment.environment === "production") {
+    const stagingRuns = runs.filter((run) => run.environment === "staging");
+    return runs.find(
+      (run) =>
+        run.environment === "production" &&
+        run.status === "success" &&
+        (versionKeyForSource(run.sourceRunId, stagingRuns) ===
+          environment.currentVersionKey ||
+          versionKey(run) === environment.currentVersionKey),
+    );
+  }
+  return undefined;
+}
+
 interface ProductWorkspaceProps {
   initialProductionVersionId?: string;
   initialScene?: ProjectScene;
+  initialTaskPanel?: ReleaseTaskPanel;
+  /** @deprecated Standalone previews may still provide one shared server. */
   initialServer?: ServerForm;
+  initialStagingServer?: ServerForm;
+  initialProductionServer?: ServerForm;
   onDeployTest: (
     server: ServerForm,
     repository: string,
     useCommittedCode?: boolean,
   ) => Promise<void>;
+  onCnbAuthorizationOpenChange?: (open: boolean) => void;
   onError: (message: string) => void;
   onPromote: (run: DeploymentRun, server: ServerForm) => Promise<void>;
   onRefresh: (run: DeploymentRun) => Promise<DeploymentRun>;
@@ -389,6 +619,8 @@ interface ProductWorkspaceProps {
   onSaveManifest: (manifestYaml: string) => Promise<boolean>;
   onSceneChange?: (scene: ProjectScene) => void;
   onServerChange: (server: ServerForm) => void;
+  onProductionServerChange?: (server: ServerForm) => void;
+  onStagingServerChange?: (server: ServerForm) => void;
   onSetupProgressChange?: () => void;
   onSyncVersions?: () => Promise<void>;
   path: string;
@@ -401,8 +633,12 @@ interface ProductWorkspaceProps {
 export function ProductWorkspace({
   initialProductionVersionId = "",
   initialScene,
+  initialTaskPanel,
   initialServer,
+  initialProductionServer,
+  initialStagingServer,
   onDeployTest,
+  onCnbAuthorizationOpenChange,
   onError,
   onPromote,
   onRefresh,
@@ -411,6 +647,8 @@ export function ProductWorkspace({
   onSaveManifest,
   onSceneChange,
   onServerChange,
+  onProductionServerChange,
+  onStagingServerChange,
   onSetupProgressChange,
   onSyncVersions,
   path,
@@ -419,17 +657,47 @@ export function ProductWorkspace({
   showRecognitionSummary = false,
   workspace,
 }: ProductWorkspaceProps) {
-  const [scene, setScene] = useState<ProjectScene>(initialScene ?? "local");
+  const cnbAuthorizationOpenSources = useRef(new Set<string>());
+  const reportCnbAuthorizationOpen = useCallback<CnbAuthorizationOpenReporter>(
+    (source, open) => {
+      onCnbAuthorizationOpenChange?.(
+        updateCnbAuthorizationOpenSources(
+          cnbAuthorizationOpenSources.current,
+          source,
+          open,
+        ),
+      );
+    },
+    [onCnbAuthorizationOpenChange],
+  );
+  useEffect(
+    () => () => {
+      cnbAuthorizationOpenSources.current.clear();
+      onCnbAuthorizationOpenChange?.(false);
+    },
+    [onCnbAuthorizationOpenChange],
+  );
+  const stagingServer = initialStagingServer ?? initialServer;
+  const productionServer = initialProductionServer ?? initialServer;
+  // App.tsx normally supplies the durable project section. A standalone
+  // workspace must still open on the release center, which is the product's
+  // default task surface rather than an implementation-specific environment.
+  const [scene, setScene] = useState<ProjectScene>(initialScene ?? "overview");
   // `initialScene` and `initialProductionVersionId` are navigation inputs for
   // this mounted workspace. The parent mirrors later scene changes so it can
   // restore them after a restart; those mirrored props must not reset a version
   // the user has just selected for publishing or restoring.
   const initialSceneRequest = useRef(initialScene);
   const initialProductionVersionRequest = useRef(initialProductionVersionId);
-  const [verifiedRunIds, setVerifiedRunIds] = useState<string[]>([]);
-  const [storedVerifiedVersionKeys, setStoredVerifiedVersionKeys] = useState<
-    string[]
+  const [versionValidations, setVersionValidations] = useState<
+    VersionValidation[]
   >([]);
+  const [projectEnvironments, setProjectEnvironments] = useState<
+    ProjectEnvironment[] | null
+  >(null);
+  const [projectVersions, setProjectVersions] = useState<
+    ProjectVersion[] | null
+  >(null);
   const [selectedVersionId, setSelectedVersionId] = useState(
     initialProductionVersionId,
   );
@@ -438,34 +706,93 @@ export function ProductWorkspace({
   const [versionSetupComplete, setVersionSetupComplete] = useState<
     boolean | null
   >(null);
+  const [releaseSetupBlocker, setReleaseSetupBlocker] =
+    useState<ReleaseSetupBlocker | null>(null);
+  const initialTaskPanelRequest = useRef(initialTaskPanel);
+  const [releaseTaskPanel, setReleaseTaskPanel] =
+    useState<ReleaseTaskPanel | null>(initialTaskPanel ?? null);
   const [versionSetupStartRequested, setVersionSetupStartRequested] =
     useState(false);
   const [productionWebSavePending, setProductionWebSavePending] =
+    useState(false);
+  const [testDeployStartRequested, setTestDeployStartRequested] =
     useState(false);
   const stagingAttempts = runs.filter(
     (run) =>
       run.environment === "staging" && run.actionKind !== "production-approval",
   );
-  const stagingRuns = collapseVersionRuns(stagingAttempts);
-  const staging = stagingAttempts[0];
-  const legacyVerifiedVersionKeys = stagingAttempts
-    .filter((run) => verifiedRunIds.includes(run.id))
-    .map(versionKey);
-  const verifiedVersionKeys = new Set([
-    ...storedVerifiedVersionKeys,
-    ...legacyVerifiedVersionKeys,
-  ]);
+  const hasSuccessfulStagingAttempt = stagingAttempts.some(
+    (run) => run.status === "success",
+  );
+  const legacyStagingRuns = collapseVersionRuns(stagingAttempts);
+  // During the migration, an older backend can legitimately return no
+  // first-class versions even though historical successful runs still exist.
+  // Once at least one Version exists (or there are no legacy successes), the
+  // Version collection becomes authoritative and failed attempts stay out.
+  const authoritativeVersions =
+    projectVersions &&
+    (projectVersions.length > 0 ||
+      !legacyStagingRuns.some((run) => run.status === "success"))
+      ? projectVersions
+      : null;
+  const stagingRuns = authoritativeVersions
+    ? authoritativeVersions.map((version) =>
+        deploymentRunForProjectVersion(
+          version,
+          stagingAttempts,
+          path,
+          workspace.inspection.project_name,
+        ),
+      )
+    : legacyStagingRuns;
+  const releaseRuns = authoritativeVersions
+    ? [
+        ...runs.filter(
+          (run) =>
+            !(
+              run.environment === "staging" &&
+              run.status === "success" &&
+              run.actionKind !== "production-approval"
+            ),
+        ),
+        ...stagingRuns,
+      ]
+    : runs;
+  const storedVerifiedVersionKeys = versionValidations
+    .filter((validation) => validation.state === "passed")
+    .map((validation) => validation.versionKey);
+  const rejectedVersionKeys = versionValidations
+    .filter((validation) => validation.state === "rejected")
+    .map((validation) => validation.versionKey);
+  const verifiedVersionKeys = new Set(storedVerifiedVersionKeys);
+  const releaseModel = buildReleaseModel(releaseRuns, verifiedVersionKeys);
+  const stagingEnvironment = projectEnvironments?.find(
+    (environment) => environment.environment === "staging",
+  );
+  const productionEnvironment = projectEnvironments?.find(
+    (environment) => environment.environment === "production",
+  );
+  const staging = releaseModel.staging.latestRun ?? undefined;
   const stagingVerified = Boolean(
     staging && verifiedVersionKeys.has(versionKey(staging)),
   );
-  const liveStaging = stagingAttempts.find(isDeployedRun);
-  const production = runs.find((run) => run.environment === "production");
-  const liveProduction = runs.find(
-    (run) => run.environment === "production" && isDeployedRun(run),
+  const stagingRejected = Boolean(
+    staging && rejectedVersionKeys.includes(versionKey(staging)),
   );
-  const liveProductionSourceKey = versionKeyForSource(
-    liveProduction?.sourceRunId,
-    stagingAttempts,
+  const liveStaging =
+    environmentCurrentRun(stagingEnvironment, releaseRuns) ??
+    releaseModel.staging.deployedRun ??
+    undefined;
+  const production = releaseModel.production.latestRun ?? undefined;
+  const liveProduction =
+    environmentCurrentRun(productionEnvironment, releaseRuns) ??
+    releaseModel.production.deployedRun ??
+    undefined;
+  const liveProductionSourceKey =
+    productionEnvironment?.currentVersionKey ??
+    versionKeyForSource(liveProduction?.sourceRunId, stagingAttempts);
+  const currentProductionVersion = stagingRuns.find(
+    (run) => versionKey(run) === liveProductionSourceKey,
   );
   const productionVersion = stagingRuns.find(
     (run) =>
@@ -488,17 +815,88 @@ export function ProductWorkspace({
     productionVersion ??
     verifiedRuns[0];
   const verifiedRunVersionKey = verifiedRun ? versionKey(verifiedRun) : "";
+  const releaseCenter = buildReleaseCenterModel({
+    setup: {
+      ready: versionSetupComplete === true,
+      nextStep:
+        versionSetupComplete === true
+          ? null
+          : (releaseSetupBlocker ?? "source-connection"),
+    },
+    runs: releaseRuns,
+    versionVerifications: stagingRuns.map((run) => {
+      const key = versionKey(run);
+      return {
+        versionKey: key,
+        state: rejectedVersionKeys.includes(key)
+          ? ("rejected" as const)
+          : verifiedVersionKeys.has(key)
+            ? ("passed" as const)
+            : ("awaiting" as const),
+      };
+    }),
+    productionWebPending: productionWebSavePending,
+    productionWebVersionKey: verifiedRunVersionKey || null,
+  });
   const settingKey = useMemo(
     () => `project.${encodeURIComponent(path)}`,
     [path],
   );
   const productionWebProgressKey = `${settingKey}.cnb-secret-progress.production`;
   const productionCandidateKey = `${settingKey}.production-pending-version`;
+  const rejectedVersionSettingKey = `${settingKey}.rejected-version`;
+  const setupStepKey = `${settingKey}.version-setup-step`;
+
+  const environmentRefreshKey = useMemo(
+    () =>
+      runs
+        .map((run) => `${run.id}:${run.status}:${run.updatedAt}`)
+        .sort()
+        .join("|"),
+    [runs],
+  );
 
   useEffect(() => {
+    let active = true;
+    void listProjectEnvironments(path)
+      .then((environments) => {
+        if (active) setProjectEnvironments(environments);
+      })
+      .catch(() => {
+        // Older backends do not expose environment pointers. Keep the
+        // deployment-run fallback so an upgrade never empties a healthy card.
+        if (active) setProjectEnvironments(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [environmentRefreshKey, path]);
+
+  useEffect(() => {
+    let active = true;
+    void listProjectVersions(path)
+      .then((versions) => {
+        if (active) setProjectVersions(versions);
+      })
+      .catch(() => {
+        // Keep the successful-run compatibility read for a single upgrade
+        // cycle; a slow or older backend must not make known versions vanish.
+        if (active) setProjectVersions(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [environmentRefreshKey, path]);
+
+  useEffect(() => {
+    setProjectEnvironments(null);
+    setProjectVersions(null);
+    setReleaseTaskPanel(initialTaskPanelRequest.current ?? null);
     setProjectSettingsLoaded(false);
     setVersionSetupComplete(null);
+    setReleaseSetupBlocker(null);
     setProductionWebSavePending(false);
+    setVersionValidations([]);
     const sceneKey = `${settingKey}.scene`;
     const runKey = `${settingKey}.verified-run`;
     const verifiedVersionSettingKey = `${settingKey}.verified-version`;
@@ -507,50 +905,102 @@ export function ProductWorkspace({
     const keys = [
       runKey,
       verifiedVersionSettingKey,
+      rejectedVersionSettingKey,
       milestoneKey,
       setupKey,
+      setupStepKey,
       productionWebProgressKey,
       productionCandidateKey,
     ];
     if (!initialSceneRequest.current) keys.push(sceneKey);
-    getAppSettings(keys)
-      .then((settings) => {
+    Promise.all([
+      getAppSettings(keys),
+      listVersionValidations(path).catch((): VersionValidation[] => []),
+    ])
+      .then(async ([settings, persistedValidations]) => {
         const storedScene = settings[sceneKey] ?? null;
         const storedRun = settings[runKey] ?? null;
         const storedVersions = settings[verifiedVersionSettingKey] ?? null;
+        const storedRejectedVersions =
+          settings[rejectedVersionSettingKey] ?? null;
         const storedLocalMilestone = settings[milestoneKey] ?? null;
         const storedVersionSetup = settings[setupKey] ?? null;
+        const storedSetupStep = settings[setupStepKey] ?? null;
         const storedProductionWebProgress =
           settings[productionWebProgressKey] ?? null;
         const storedProductionCandidate =
           settings[productionCandidateKey] ?? null;
         if (initialSceneRequest.current) {
           setScene(initialSceneRequest.current);
-        } else if (
-          storedScene &&
-          ["local", "versions", "test", "production"].includes(storedScene)
-        ) {
-          setScene(storedScene as ProjectScene);
-        }
-        if (storedRun) {
-          try {
-            const parsed = JSON.parse(storedRun) as unknown;
-            setVerifiedRunIds(
-              Array.isArray(parsed)
-                ? parsed.filter(
-                    (item): item is string => typeof item === "string",
-                  )
-                : [storedRun],
-            );
-          } catch {
-            setVerifiedRunIds([storedRun]);
-          }
         } else {
-          setVerifiedRunIds([]);
+          setScene(projectSectionFromStoredScene(storedScene) ?? "overview");
         }
-        setStoredVerifiedVersionKeys(
+        // Version validation is now a durable domain record. Older releases
+        // stored the same decision in app settings, so migrate only versions
+        // that do not already have an authoritative backend decision. If a
+        // migration write fails, keep that legacy decision for this session so
+        // upgrading never makes an already approved version disappear.
+        const validationsByVersion = new Map(
+          persistedValidations.map((validation) => [
+            validation.versionKey,
+            validation,
+          ]),
+        );
+        const migrationCandidates = new Map<
+          string,
+          { run: DeploymentRun; state: "passed" | "rejected" }
+        >();
+        const legacyPassedRunIds = verifiedRunIdsFromSetting(storedRun);
+        const legacyPassedKeys = new Set(
           verifiedVersionKeysFromSetting(storedVersions),
         );
+        for (const runId of legacyPassedRunIds) {
+          const run = stagingAttempts.find(
+            (candidate) =>
+              candidate.id === runId && candidate.status === "success",
+          );
+          if (run) legacyPassedKeys.add(versionKey(run));
+        }
+        for (const key of legacyPassedKeys) {
+          if (validationsByVersion.has(key)) continue;
+          const run = stagingAttempts.find(
+            (candidate) =>
+              candidate.status === "success" && versionKey(candidate) === key,
+          );
+          if (run) migrationCandidates.set(key, { run, state: "passed" });
+        }
+        for (const key of verifiedVersionKeysFromSetting(
+          storedRejectedVersions,
+        )) {
+          if (validationsByVersion.has(key)) continue;
+          const run = stagingAttempts.find(
+            (candidate) =>
+              candidate.status === "success" && versionKey(candidate) === key,
+          );
+          if (run) migrationCandidates.set(key, { run, state: "rejected" });
+        }
+        await Promise.all(
+          Array.from(migrationCandidates.entries()).map(
+            async ([key, candidate]) => {
+              try {
+                const migrated = await setVersionValidation(
+                  path,
+                  candidate.run.id,
+                  candidate.state,
+                );
+                validationsByVersion.set(key, migrated);
+              } catch {
+                validationsByVersion.set(key, {
+                  versionKey: key,
+                  state: candidate.state,
+                  runId: candidate.run.id,
+                  verifiedAt: "",
+                });
+              }
+            },
+          ),
+        );
+        setVersionValidations(Array.from(validationsByVersion.values()));
         // A version choice is not a durable project preference. Preserve it
         // only while the user is paused at the external production web-save
         // checkpoint; otherwise reopen on the version that is actually online
@@ -573,7 +1023,16 @@ export function ProductWorkspace({
             : "idle",
         );
         setVersionSetupComplete(
-          storedVersionSetup === "true" || stagingAttempts.length > 0,
+          storedVersionSetup === "true" || hasSuccessfulStagingAttempt,
+        );
+        setReleaseSetupBlocker(
+          storedVersionSetup === "true" || hasSuccessfulStagingAttempt
+            ? null
+            : inferredReleaseSetupBlocker(
+                workspace.manifestYaml,
+                stagingServer,
+                storedSetupStep,
+              ),
         );
         setProductionWebSavePending(
           storedProductionWebProgress === "save-page-opened",
@@ -581,65 +1040,99 @@ export function ProductWorkspace({
       })
       .catch(() => undefined)
       .finally(() => setProjectSettingsLoaded(true));
-  }, [productionCandidateKey, productionWebProgressKey, settingKey]);
-
-  useEffect(() => {
-    if (stagingAttempts.length > 0) setVersionSetupComplete(true);
-  }, [stagingAttempts.length]);
-
-  useEffect(() => {
-    if (!projectSettingsLoaded || !legacyVerifiedVersionKeys.length) return;
-    const next = Array.from(
-      new Set([...storedVerifiedVersionKeys, ...legacyVerifiedVersionKeys]),
-    );
-    if (next.length === storedVerifiedVersionKeys.length) return;
-    setStoredVerifiedVersionKeys(next);
-    void setAppSetting(`${settingKey}.verified-version`, JSON.stringify(next));
   }, [
-    legacyVerifiedVersionKeys.join("\u0000"),
-    projectSettingsLoaded,
+    productionCandidateKey,
+    productionWebProgressKey,
+    rejectedVersionSettingKey,
     settingKey,
-    storedVerifiedVersionKeys.join("\u0000"),
+    setupStepKey,
+    path,
   ]);
+
+  useEffect(() => {
+    if (hasSuccessfulStagingAttempt) {
+      setVersionSetupComplete(true);
+      setReleaseSetupBlocker(null);
+    }
+  }, [hasSuccessfulStagingAttempt]);
+
+  function selectProductionVersion(selectedProductionVersion = "") {
+    setSelectedVersionId(selectedProductionVersion);
+    const selectedRun = stagingRuns.find(
+      (run) => run.id === selectedProductionVersion,
+    );
+    if (selectedRun) {
+      void setAppSetting(productionCandidateKey, versionKey(selectedRun));
+    }
+  }
+
+  function openReleaseTaskPanel(
+    next: ReleaseTaskPanel,
+    selectedProductionVersion = "",
+  ) {
+    if (next !== "test") setTestDeployStartRequested(false);
+    if (next === "production") {
+      selectProductionVersion(selectedProductionVersion);
+    }
+    setReleaseTaskPanel(next);
+  }
 
   function switchScene(
     next: ProjectScene,
     selectedProductionVersion = "",
     startVersionSetup = false,
   ) {
+    setReleaseTaskPanel(null);
+    if (next !== "test") setTestDeployStartRequested(false);
     if (next === "production") {
-      setSelectedVersionId(selectedProductionVersion);
-      const selectedRun = stagingRuns.find(
-        (run) => run.id === selectedProductionVersion,
-      );
-      if (selectedRun) {
-        void setAppSetting(productionCandidateKey, versionKey(selectedRun));
-      }
+      selectProductionVersion(selectedProductionVersion);
     }
     setVersionSetupStartRequested(
       next === "versions" ? startVersionSetup : false,
     );
     setScene(next);
     onSceneChange?.(next);
-    void setAppSetting(`${settingKey}.scene`, next);
+    void setAppSetting(`${settingKey}.scene`, projectSectionForScene(next));
+  }
+
+  function updateStagingServer(server: ServerForm) {
+    onServerChange(server);
+    onStagingServerChange?.(server);
+  }
+
+  function updateProductionServer(server: ServerForm) {
+    onProductionServerChange?.(server);
   }
 
   async function verifyTest(run: DeploymentRun) {
-    const next = Array.from(new Set([run.id, ...verifiedRunIds]));
-    const nextVersions = Array.from(
-      new Set([versionKey(run), ...storedVerifiedVersionKeys]),
-    );
-    setVerifiedRunIds(next);
-    setStoredVerifiedVersionKeys(nextVersions);
-    setSelectedVersionId(run.id);
-    await Promise.all([
-      setAppSetting(`${settingKey}.verified-run`, JSON.stringify(next)),
-      setAppSetting(
-        `${settingKey}.verified-version`,
-        JSON.stringify(nextVersions),
-      ),
-    ]);
-    onSetupProgressChange?.();
+    try {
+      const validation = await setVersionValidation(path, run.id, "passed");
+      setVersionValidations((current) => [
+        validation,
+        ...current.filter(
+          (candidate) => candidate.versionKey !== validation.versionKey,
+        ),
+      ]);
+      setSelectedVersionId(run.id);
+      onSetupProgressChange?.();
+    } catch (error) {
+      onError(issueFromUnknown(error).message);
+    }
+  }
+
+  async function rejectTest(run: DeploymentRun) {
+    try {
+      const validation = await setVersionValidation(path, run.id, "rejected");
+      setVersionValidations((current) => [
+        validation,
+        ...current.filter(
+          (candidate) => candidate.versionKey !== validation.versionKey,
+        ),
+      ]);
+      onSetupProgressChange?.();
+    } catch (error) {
+      onError(issueFromUnknown(error).message);
+    }
   }
 
   function updateLocalMilestone(next: LocalMilestone) {
@@ -703,21 +1196,36 @@ export function ProductWorkspace({
 
       <main className="min-h-0 overflow-auto">
         <div className="mx-auto w-full max-w-[1060px] px-6 py-7">
-          <SceneTabs
-            localMilestone={localMilestone}
-            production={production}
-            productionWebSavePending={productionWebSavePending}
-            restoring={!projectSettingsLoaded}
-            scene={scene}
-            staging={staging}
-            stagingVerified={stagingVerified}
-            setupComplete={versionSetupComplete}
-            versionCount={availableVersionRuns(stagingRuns).length}
-            verifiedCount={verifiedRuns.length}
-            onChange={switchScene}
-          />
+          <ProjectNavigation onChange={switchScene} scene={scene} />
           {!projectSettingsLoaded ? (
             <ProjectSceneRestoring scene={scene} />
+          ) : scene === "overview" ? (
+            <ReleaseOverviewScene
+              liveProduction={liveProduction}
+              liveStaging={liveStaging}
+              onOpenProduction={(runId = "") =>
+                openReleaseTaskPanel("production", runId)
+              }
+              onOpenSettings={() => openReleaseTaskPanel("settings")}
+              onOpenTest={() => openReleaseTaskPanel("test")}
+              onStartTest={() => {
+                setTestDeployStartRequested(true);
+                openReleaseTaskPanel("test");
+              }}
+              onOpenVersions={() => switchScene("versions")}
+              production={production}
+              productionEnvironment={productionEnvironment}
+              productionWebSavePending={productionWebSavePending}
+              releaseCenter={releaseCenter}
+              setupComplete={versionSetupComplete === true}
+              staging={staging}
+              stagingEnvironment={stagingEnvironment}
+              stagingRejected={stagingRejected}
+              stagingRuns={stagingRuns}
+              stagingVerified={stagingVerified}
+              verifiedRuns={verifiedRuns}
+              workspace={workspace}
+            />
           ) : scene === "local" ? (
             <LocalScene
               localMilestone={localMilestone}
@@ -725,7 +1233,7 @@ export function ProductWorkspace({
               onMilestoneChange={updateLocalMilestone}
               onPrepareDeployment={() => {
                 onRecognitionDismiss?.();
-                switchScene("versions", "", true);
+                switchScene("settings");
               }}
               onReselectProject={onReselectProject}
               onSaveManifest={onSaveManifest}
@@ -736,9 +1244,12 @@ export function ProductWorkspace({
             />
           ) : scene === "versions" ? (
             <VersionScene
-              initialServer={initialServer}
-              initialStartRequested={versionSetupStartRequested}
+              cnbAuthorizationSource="scene-versions"
+              deploymentAttempts={stagingAttempts}
+              initialServer={stagingServer}
+              initialStartRequested={false}
               onError={onError}
+              onCnbAuthorizationOpenChange={reportCnbAuthorizationOpen}
               onOpenProduction={(run) => {
                 switchScene("production", run.id);
               }}
@@ -746,8 +1257,14 @@ export function ProductWorkspace({
                 setVersionSetupComplete(true);
                 switchScene("test");
               }}
+              onOpenSettings={() => switchScene("settings")}
+              onSettingsDone={() => {
+                setVersionSetupComplete(true);
+                switchScene("overview");
+              }}
               onSaveManifest={onSaveManifest}
-              onServerChange={onServerChange}
+              onServerChange={updateStagingServer}
+              onSetupBlockerChange={setReleaseSetupBlocker}
               onSetupProgressChange={onSetupProgressChange}
               onSync={onSyncVersions ?? (async () => undefined)}
               path={path}
@@ -756,242 +1273,816 @@ export function ProductWorkspace({
               productionWebSaveSourceKey={
                 productionWebSavePending ? verifiedRunVersionKey : ""
               }
+              rejectedVersionKeys={rejectedVersionKeys}
               runs={stagingRuns}
               saving={saving}
-              testSourceKey={liveStaging ? versionKey(liveStaging) : ""}
+              testSourceKey={
+                stagingEnvironment?.currentVersionKey ??
+                (liveStaging ? versionKey(liveStaging) : "")
+              }
               verifiedRunIds={verifiedVersionRunIds}
+              view="versions"
+              workspace={workspace}
+            />
+          ) : scene === "settings" ? (
+            <VersionScene
+              cnbAuthorizationSource="scene-settings"
+              deploymentAttempts={stagingAttempts}
+              initialServer={stagingServer}
+              initialStartRequested={versionSetupStartRequested}
+              onError={onError}
+              onCnbAuthorizationOpenChange={reportCnbAuthorizationOpen}
+              onOpenProduction={(run) => {
+                switchScene("production", run.id);
+              }}
+              onOpenTest={() => {
+                setVersionSetupComplete(true);
+                switchScene("overview");
+              }}
+              onOpenSettings={() => undefined}
+              onSettingsDone={() => {
+                setVersionSetupComplete(true);
+                switchScene("overview");
+              }}
+              onSaveManifest={onSaveManifest}
+              onServerChange={updateStagingServer}
+              onSetupBlockerChange={setReleaseSetupBlocker}
+              onSetupProgressChange={onSetupProgressChange}
+              onSync={onSyncVersions ?? (async () => undefined)}
+              path={path}
+              productionRun={liveProduction}
+              productionSourceKey={liveProductionSourceKey}
+              productionWebSaveSourceKey={
+                productionWebSavePending ? verifiedRunVersionKey : ""
+              }
+              rejectedVersionKeys={rejectedVersionKeys}
+              runs={stagingRuns}
+              saving={saving}
+              testSourceKey={
+                stagingEnvironment?.currentVersionKey ??
+                (liveStaging ? versionKey(liveStaging) : "")
+              }
+              verifiedRunIds={verifiedVersionRunIds}
+              view="settings"
               workspace={workspace}
             />
           ) : scene === "test" ? (
-            <TestScene
-              blockingProductionRun={
-                activeProductionTask &&
-                (!staging || activeProductionSourceKey !== versionKey(staging))
-                  ? activeProductionTask
-                  : undefined
-              }
-              initialServer={initialServer}
-              onDeploy={onDeployTest}
-              onError={onError}
-              onOpenProduction={() => {
-                if (productionWebSavePending && verifiedRun) {
-                  switchScene("production", verifiedRun.id);
-                } else if (activeProductionTask) {
-                  switchScene("production", productionVersion?.id ?? "");
-                } else if (staging) {
-                  switchScene("production", staging.id);
+            <>
+              <ContextBackButton onClick={() => switchScene("overview")} />
+              <TestScene
+                blockingProductionRun={
+                  activeProductionTask &&
+                  (!staging ||
+                    activeProductionSourceKey !== versionKey(staging))
+                    ? activeProductionTask
+                    : undefined
                 }
-              }}
-              onOpenSetup={() => switchScene("versions", "", true)}
-              onRefresh={onRefresh}
-              onVerify={verifyTest}
-              path={path}
-              productionRun={
-                staging &&
-                production &&
-                versionKeyForSource(production.sourceRunId, stagingAttempts) ===
-                  versionKey(staging)
-                  ? production
-                  : undefined
-              }
-              productionWebSaveVersionKey={
-                productionWebSavePending ? verifiedRunVersionKey : ""
-              }
-              run={staging}
-              setupComplete={versionSetupComplete}
-              verified={stagingVerified}
-              workspace={workspace}
-            />
+                initialServer={stagingServer}
+                initialStartRequested={testDeployStartRequested}
+                onDeploy={onDeployTest}
+                onError={onError}
+                cnbAuthorizationSource="scene-test"
+                onCnbAuthorizationOpenChange={reportCnbAuthorizationOpen}
+                onOpenProduction={() => {
+                  if (productionWebSavePending && verifiedRun) {
+                    switchScene("production", verifiedRun.id);
+                  } else if (activeProductionTask) {
+                    switchScene("production", productionVersion?.id ?? "");
+                  } else if (staging) {
+                    switchScene("production", staging.id);
+                  }
+                }}
+                onOpenSetup={() => switchScene("settings")}
+                onRefresh={onRefresh}
+                onReject={rejectTest}
+                onVerify={verifyTest}
+                onStartHandled={() => setTestDeployStartRequested(false)}
+                path={path}
+                productionRun={
+                  staging &&
+                  production &&
+                  versionKeyForSource(
+                    production.sourceRunId,
+                    stagingAttempts,
+                  ) === versionKey(staging)
+                    ? production
+                    : undefined
+                }
+                productionWebSaveVersionKey={
+                  productionWebSavePending ? verifiedRunVersionKey : ""
+                }
+                run={staging}
+                rejected={stagingRejected}
+                setupComplete={versionSetupComplete}
+                verified={stagingVerified}
+                workspace={workspace}
+              />
+            </>
           ) : (
-            <ProductionScene
-              currentTestVersion={liveStaging}
-              initialWebSavePending={productionWebSavePending}
-              initialServer={initialServer}
-              key={
-                initialServer
-                  ? `${initialServer.user}@${initialServer.host}:${initialServer.port}`
-                  : "production-server-restoring"
-              }
-              onError={onError}
-              onPromote={onPromote}
-              onProgressChange={refreshProductionWebSaveProgress}
-              onRefresh={onRefresh}
-              onSaveManifest={onSaveManifest}
-              onShowVersions={() => switchScene("versions", "", true)}
-              onShowTest={() => switchScene("test")}
-              path={path}
-              production={production}
-              productionVersion={productionVersion}
-              saving={saving}
-              setupComplete={versionSetupComplete === true}
-              verifiedRun={verifiedRun}
-              verifiedRuns={verifiedRuns}
-              onSelectVersion={(runId) => {
-                setSelectedVersionId(runId);
-              }}
-              workspace={workspace}
-            />
+            <>
+              <ContextBackButton onClick={() => switchScene("overview")} />
+              <ProductionScene
+                cnbAuthorizationSource="scene-production"
+                currentTestVersion={liveStaging}
+                initialWebSavePending={productionWebSavePending}
+                initialServer={productionServer}
+                key={
+                  productionServer
+                    ? `${productionServer.user}@${productionServer.host}:${productionServer.port}`
+                    : "production-server-restoring"
+                }
+                onError={onError}
+                onCnbAuthorizationOpenChange={reportCnbAuthorizationOpen}
+                onPromote={onPromote}
+                onProgressChange={refreshProductionWebSaveProgress}
+                onServerChange={updateProductionServer}
+                onRefresh={onRefresh}
+                onSaveManifest={onSaveManifest}
+                onShowSettings={() => switchScene("settings")}
+                onShowVersions={() => switchScene("versions")}
+                onShowTest={() => switchScene("test")}
+                path={path}
+                production={production}
+                currentProductionVersion={currentProductionVersion}
+                productionVersion={productionVersion}
+                saving={saving}
+                setupComplete={versionSetupComplete === true}
+                verifiedRun={verifiedRun}
+                verifiedRuns={verifiedRuns}
+                onSelectVersion={(runId) => {
+                  setSelectedVersionId(runId);
+                }}
+                workspace={workspace}
+              />
+            </>
           )}
+          <Sheet
+            onOpenChange={(open) => {
+              if (!open) {
+                setReleaseTaskPanel(null);
+                setTestDeployStartRequested(false);
+              }
+            }}
+            open={releaseTaskPanel !== null}
+          >
+            <SheetContent className="sm:w-[min(820px,calc(100vw-32px))] sm:max-w-[820px]">
+              <SheetTitle className="sr-only">
+                {releaseTaskPanel === "settings"
+                  ? "完成当前上线设置"
+                  : releaseTaskPanel === "test"
+                    ? "测试环境任务"
+                    : "正式环境任务"}
+              </SheetTitle>
+              <SheetDescription className="sr-only">
+                在发布中心原地完成当前任务，关闭后仍会回到同一项目状态。
+              </SheetDescription>
+              {releaseTaskPanel === "settings" ? (
+                <VersionScene
+                  cnbAuthorizationSource="panel-settings"
+                  deploymentAttempts={stagingAttempts}
+                  focusCurrentTask
+                  initialServer={stagingServer}
+                  initialStartRequested={versionSetupStartRequested}
+                  onError={onError}
+                  onCnbAuthorizationOpenChange={reportCnbAuthorizationOpen}
+                  onOpenProduction={(run) =>
+                    openReleaseTaskPanel("production", run.id)
+                  }
+                  onOpenTest={() => {
+                    setVersionSetupComplete(true);
+                    openReleaseTaskPanel("test");
+                  }}
+                  onOpenSettings={() => undefined}
+                  onSettingsDone={() => {
+                    setVersionSetupComplete(true);
+                    setReleaseTaskPanel(null);
+                  }}
+                  onSaveManifest={onSaveManifest}
+                  onServerChange={updateStagingServer}
+                  onSetupBlockerChange={setReleaseSetupBlocker}
+                  onSetupProgressChange={onSetupProgressChange}
+                  onSync={onSyncVersions ?? (async () => undefined)}
+                  path={path}
+                  productionRun={liveProduction}
+                  productionSourceKey={liveProductionSourceKey}
+                  productionWebSaveSourceKey={
+                    productionWebSavePending ? verifiedRunVersionKey : ""
+                  }
+                  rejectedVersionKeys={rejectedVersionKeys}
+                  runs={stagingRuns}
+                  saving={saving}
+                  testSourceKey={
+                    stagingEnvironment?.currentVersionKey ??
+                    (liveStaging ? versionKey(liveStaging) : "")
+                  }
+                  verifiedRunIds={verifiedVersionRunIds}
+                  view="settings"
+                  workspace={workspace}
+                />
+              ) : releaseTaskPanel === "test" ? (
+                <TestScene
+                  blockingProductionRun={
+                    activeProductionTask &&
+                    (!staging ||
+                      activeProductionSourceKey !== versionKey(staging))
+                      ? activeProductionTask
+                      : undefined
+                  }
+                  initialServer={stagingServer}
+                  initialCnbAuthorizationOpen={Boolean(
+                    releaseCenter.phase === "recover-test-task" &&
+                    ["AD-CNB-101", "AD-CNB-103"].includes(
+                      releaseCenter.pendingTask?.run.issueCode ?? "",
+                    ),
+                  )}
+                  initialStartRequested={testDeployStartRequested}
+                  onDeploy={onDeployTest}
+                  onError={onError}
+                  cnbAuthorizationSource="panel-test"
+                  onCnbAuthorizationOpenChange={reportCnbAuthorizationOpen}
+                  onOpenProduction={() => {
+                    if (productionWebSavePending && verifiedRun) {
+                      openReleaseTaskPanel("production", verifiedRun.id);
+                    } else if (activeProductionTask) {
+                      openReleaseTaskPanel(
+                        "production",
+                        productionVersion?.id ?? "",
+                      );
+                    } else if (staging) {
+                      openReleaseTaskPanel("production", staging.id);
+                    }
+                  }}
+                  onOpenSetup={() => openReleaseTaskPanel("settings")}
+                  onRefresh={onRefresh}
+                  onReject={rejectTest}
+                  onVerify={verifyTest}
+                  onStartHandled={() => setTestDeployStartRequested(false)}
+                  path={path}
+                  productionRun={
+                    staging &&
+                    production &&
+                    versionKeyForSource(
+                      production.sourceRunId,
+                      stagingAttempts,
+                    ) === versionKey(staging)
+                      ? production
+                      : undefined
+                  }
+                  productionWebSaveVersionKey={
+                    productionWebSavePending ? verifiedRunVersionKey : ""
+                  }
+                  run={staging}
+                  rejected={stagingRejected}
+                  setupComplete={versionSetupComplete}
+                  verified={stagingVerified}
+                  workspace={workspace}
+                />
+              ) : releaseTaskPanel === "production" ? (
+                <ProductionScene
+                  cnbAuthorizationSource="panel-production"
+                  currentTestVersion={liveStaging}
+                  initialWebSavePending={productionWebSavePending}
+                  initialCnbAuthorizationOpen={Boolean(
+                    releaseCenter.phase === "recover-production-task" &&
+                    ["AD-CNB-101", "AD-CNB-103"].includes(
+                      releaseCenter.pendingTask?.run.issueCode ?? "",
+                    ),
+                  )}
+                  initialServer={productionServer}
+                  key={
+                    productionServer
+                      ? `${productionServer.user}@${productionServer.host}:${productionServer.port}`
+                      : "production-server-restoring-panel"
+                  }
+                  onError={onError}
+                  onCnbAuthorizationOpenChange={reportCnbAuthorizationOpen}
+                  onPromote={onPromote}
+                  onProgressChange={refreshProductionWebSaveProgress}
+                  onServerChange={updateProductionServer}
+                  onRefresh={onRefresh}
+                  onSaveManifest={onSaveManifest}
+                  onShowSettings={() => openReleaseTaskPanel("settings")}
+                  onShowVersions={() => switchScene("versions")}
+                  onShowTest={() => openReleaseTaskPanel("test")}
+                  path={path}
+                  production={production}
+                  currentProductionVersion={currentProductionVersion}
+                  productionVersion={productionVersion}
+                  saving={saving}
+                  setupComplete={versionSetupComplete === true}
+                  verifiedRun={verifiedRun}
+                  verifiedRuns={verifiedRuns}
+                  onSelectVersion={(runId) => {
+                    setSelectedVersionId(runId);
+                  }}
+                  workspace={workspace}
+                />
+              ) : null}
+            </SheetContent>
+          </Sheet>
         </div>
       </main>
     </div>
   );
 }
 
-function SceneTabs({
-  localMilestone,
+function ProjectNavigation({
   onChange,
-  production,
-  productionWebSavePending,
-  restoring,
   scene,
-  staging,
-  stagingVerified,
-  setupComplete,
-  verifiedCount,
-  versionCount,
 }: {
-  localMilestone: LocalMilestone;
   onChange: (scene: ProjectScene) => void;
-  production?: DeploymentRun;
-  productionWebSavePending: boolean;
-  restoring: boolean;
   scene: ProjectScene;
-  staging?: DeploymentRun;
-  stagingVerified: boolean;
-  setupComplete: boolean | null;
-  verifiedCount: number;
-  versionCount: number;
 }) {
-  const items: Array<{
-    key: ProjectScene;
-    label: string;
-    status: string;
-    tone: "idle" | "active" | "success" | "warning";
-  }> = [
-    {
-      key: "local",
-      label: "在本机运行",
-      status:
-        localMilestone === "success"
-          ? "上次运行成功"
-          : localMilestone === "warning"
-            ? "上次启动未完成"
-            : "快捷启停与配置检核",
-      tone: localMilestone,
-    },
-    {
-      key: "versions",
-      label: "管理版本",
-      status: versionCount
-        ? `${versionCount} 个版本 · ${verifiedCount} 个测试通过`
-        : "等待生成版本",
-      tone: verifiedCount ? "success" : versionCount ? "active" : "idle",
-    },
-    {
-      key: "test",
-      label: "部署测试版",
-      status: stagingVerified
-        ? "测试已通过"
-        : staging
-          ? staging.status === "success"
-            ? "等待确认测试结果"
-            : deploymentStatus(staging)
-          : setupComplete === null
-            ? "正在确认"
-            : setupComplete
-              ? "等待首次部署"
-              : "还差上线设置",
-      tone: stagingVerified
-        ? "success"
-        : staging?.status === "success"
-          ? "active"
-          : staging?.status === "failed" || setupComplete === false
-            ? "warning"
-            : "idle",
-    },
-    {
-      key: "production",
-      label: "发布正式版",
-      status: production
-        ? production.status === "success"
-          ? "正式版可以访问"
-          : deploymentStatus(production)
-        : productionWebSavePending
-          ? "还差网页保存"
-          : verifiedCount
-            ? `${verifiedCount} 个测试通过版本`
-            : "尚未发布",
-      tone:
-        production?.status === "success"
-          ? "success"
-          : productionWebSavePending
-            ? "warning"
-            : verifiedCount
-              ? "active"
-              : "idle",
-    },
+  const activeSection = projectSectionForScene(scene);
+  const items: Array<{ key: ProjectSection; label: string }> = [
+    { key: "overview", label: "发布中心" },
+    { key: "local", label: "在本机运行" },
+    { key: "versions", label: "版本" },
+    { key: "settings", label: "项目设置" },
   ];
-  const visibleItems = restoring
-    ? items.map((item) => ({
-        ...item,
-        status: "正在恢复",
-        tone: "idle" as const,
-      }))
-    : items;
   return (
     <nav
-      aria-label="项目场景"
-      className="mb-8 grid grid-cols-4 gap-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] p-1 max-[760px]:grid-cols-2"
+      aria-label="项目导航"
+      className="mb-8 flex items-center gap-6 border-b border-[var(--border)] max-[760px]:grid max-[760px]:grid-cols-2 max-[760px]:gap-x-4"
     >
-      {visibleItems.map((item) => (
+      {items.map((item) => (
         <button
-          aria-current={scene === item.key ? "page" : undefined}
-          className={`flex min-h-[62px] items-center justify-between gap-3 rounded-md px-4 text-left outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus)] ${
-            scene === item.key
-              ? "bg-[var(--muted)] shadow-sm"
-              : "hover:bg-[var(--muted)]/60"
+          aria-current={activeSection === item.key ? "page" : undefined}
+          className={`relative -mb-px min-h-11 border-b-2 px-0.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus)] ${
+            activeSection === item.key
+              ? "border-[var(--foreground)] font-semibold text-[var(--foreground)]"
+              : "border-transparent text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
           }`}
           key={item.key}
           onClick={() => onChange(item.key)}
           type="button"
         >
-          <span>
-            <strong className="block text-sm font-semibold">
-              {item.label}
-            </strong>
-            <span className="mt-1 block text-[11px] text-[var(--muted-foreground)]">
-              {item.status}
-            </span>
-          </span>
-          <span
-            data-status={item.tone}
-            aria-hidden="true"
-            className={`a11y-status-dot size-2 rounded-full ${
-              item.tone === "success"
-                ? "bg-[var(--success)]"
-                : item.tone === "warning"
-                  ? "bg-[var(--warning)]"
-                  : item.tone === "active"
-                    ? "bg-[var(--accent)]"
-                    : "bg-[var(--muted-strong)]"
-            }`}
-          />
+          {item.label}
         </button>
       ))}
     </nav>
   );
 }
 
+function ContextBackButton({ onClick }: { onClick: () => void }) {
+  return (
+    <Button className="mb-5" onClick={onClick} size="sm" variant="ghost">
+      ← 返回发布中心
+    </Button>
+  );
+}
+
+function environmentOnlineVersionTitle(
+  environment: ProjectEnvironment | undefined,
+  run: DeploymentRun | undefined,
+) {
+  if (run) return versionTitle(run);
+  const key = environment?.currentVersionKey;
+  if (!key) return null;
+  if (key.startsWith("commit:")) return `代码 ${key.slice(7, 15)}`;
+  if (key.startsWith("candidate:")) return key.slice(10);
+  const digest = key.match(/sha256:([a-f0-9]{12})[a-f0-9]*/i)?.[1];
+  if (digest) return `镜像 ${digest}`;
+  return "已有在线版本";
+}
+
+function ReleaseOverviewScene({
+  liveProduction,
+  liveStaging,
+  onOpenProduction,
+  onOpenSettings,
+  onOpenTest,
+  onStartTest,
+  onOpenVersions,
+  production,
+  productionEnvironment,
+  productionWebSavePending,
+  releaseCenter,
+  setupComplete,
+  staging,
+  stagingEnvironment,
+  stagingRejected,
+  stagingRuns,
+  stagingVerified,
+  verifiedRuns,
+  workspace,
+}: {
+  liveProduction?: DeploymentRun;
+  liveStaging?: DeploymentRun;
+  onOpenProduction: (runId?: string) => void;
+  onOpenSettings: () => void;
+  onOpenTest: () => void;
+  onStartTest: () => void;
+  onOpenVersions: () => void;
+  production?: DeploymentRun;
+  productionEnvironment?: ProjectEnvironment;
+  productionWebSavePending: boolean;
+  releaseCenter: ReleaseCenterModel;
+  setupComplete: boolean;
+  staging?: DeploymentRun;
+  stagingEnvironment?: ProjectEnvironment;
+  stagingRejected: boolean;
+  stagingRuns: DeploymentRun[];
+  stagingVerified: boolean;
+  verifiedRuns: DeploymentRun[];
+  workspace: WorkspacePreview;
+}) {
+  const productionVersionKey =
+    productionEnvironment?.currentVersionKey ??
+    versionKeyForSource(liveProduction?.sourceRunId, stagingRuns);
+  const candidate = verifiedRuns.find(
+    (run) => versionKey(run) !== productionVersionKey,
+  );
+  const stagingActive = Boolean(
+    staging && ["queued", "running"].includes(staging.status),
+  );
+  const stagingNeedsAction = Boolean(
+    staging && ["failed", "needs_action"].includes(staging.status),
+  );
+  const productionActive = Boolean(
+    production && ["queued", "running"].includes(production.status),
+  );
+  const productionNeedsAction = Boolean(
+    production && ["failed", "needs_action"].includes(production.status),
+  );
+  const testAddresses = environmentAddresses(workspace, "staging");
+  const productionAddresses = environmentAddresses(workspace, "production");
+  const stagingOnlineTitle = environmentOnlineVersionTitle(
+    stagingEnvironment,
+    liveStaging,
+  );
+  const productionOnlineRun =
+    stagingRuns.find((run) => versionKey(run) === productionVersionKey) ??
+    liveProduction;
+  const productionOnlineTitle = environmentOnlineVersionTitle(
+    productionEnvironment,
+    productionOnlineRun,
+  );
+  const testAction = { label: "查看详情", onClick: onOpenTest };
+  const productionAction =
+    production ||
+    liveProduction ||
+    productionEnvironment?.currentVersionKey ||
+    candidate
+      ? {
+          label: "查看详情",
+          onClick: () => onOpenProduction(candidate?.id ?? ""),
+        }
+      : undefined;
+
+  return (
+    <div>
+      <PageHeading
+        action={
+          <Button onClick={onOpenVersions} size="sm" variant="secondary">
+            <Tags />
+            查看全部版本
+          </Button>
+        }
+        description="先看两个环境现在是什么状态；需要你操作时，这里只保留一个明确的下一步。"
+        title="发布中心"
+      />
+
+      <ReleaseCenterTaskCard
+        model={releaseCenter}
+        onOpenProduction={onOpenProduction}
+        onOpenSettings={onOpenSettings}
+        onOpenTest={onOpenTest}
+        onStartTest={onStartTest}
+      />
+
+      <div className="grid grid-cols-2 gap-4 max-[760px]:grid-cols-1">
+        <EnvironmentOverviewCard
+          action={testAction}
+          address={testAddresses[0]?.url ?? "尚未生成测试地址"}
+          detail={
+            stagingNeedsAction && stagingOnlineTitle
+              ? `上次更新未完成，仍在运行 ${stagingOnlineTitle}`
+              : stagingOnlineTitle
+                ? stagingOnlineTitle
+                : "还没有部署版本"
+          }
+          environment="测试环境"
+          status={
+            stagingActive
+              ? deploymentStatus(staging!)
+              : stagingNeedsAction
+                ? deploymentStatus(staging!)
+                : stagingEnvironment?.currentVersionKey &&
+                    stagingEnvironment.status !== "healthy"
+                  ? "状态待确认"
+                  : stagingRejected
+                    ? "测试未通过"
+                    : stagingVerified
+                      ? "测试已通过"
+                      : staging?.status === "success"
+                        ? "等待你确认"
+                        : setupComplete
+                          ? "等待首次部署"
+                          : "尚未准备"
+          }
+          tone={
+            stagingNeedsAction || stagingRejected
+              ? "warning"
+              : stagingActive
+                ? "active"
+                : stagingEnvironment?.currentVersionKey &&
+                    stagingEnvironment.status !== "healthy"
+                  ? "idle"
+                  : stagingVerified
+                    ? "success"
+                    : "idle"
+          }
+        />
+        <EnvironmentOverviewCard
+          action={productionAction}
+          address={productionAddresses[0]?.url ?? "尚未设置正式地址"}
+          detail={
+            productionOnlineTitle ? productionOnlineTitle : "还没有正式版本"
+          }
+          environment="正式环境"
+          status={
+            productionActive
+              ? deploymentStatus(production!)
+              : productionNeedsAction
+                ? deploymentStatus(production!)
+                : productionWebSavePending
+                  ? "等待继续发布"
+                  : productionEnvironment?.currentVersionKey
+                    ? productionEnvironment.status === "healthy"
+                      ? "运行正常"
+                      : "状态待确认"
+                    : production?.status === "success"
+                      ? "运行正常"
+                      : candidate
+                        ? "有版本可以发布"
+                        : "尚未发布"
+          }
+          tone={
+            productionNeedsAction || productionWebSavePending
+              ? "warning"
+              : productionActive
+                ? "active"
+                : productionEnvironment?.currentVersionKey
+                  ? productionEnvironment.status === "healthy"
+                    ? "success"
+                    : "idle"
+                  : production?.status === "success"
+                    ? "success"
+                    : candidate
+                      ? "active"
+                      : "idle"
+          }
+        />
+      </div>
+
+      <Section
+        title="自动更新"
+        trailing={setupComplete ? "已设置" : "等待设置"}
+      >
+        <div className="flex items-center justify-between gap-5">
+          <div>
+            <strong className="block text-sm">
+              主分支更新后自动生成版本并部署到测试环境
+            </strong>
+            <span className="mt-1 block text-xs leading-5 text-[var(--muted-foreground)]">
+              正式环境不会自动更新；只有测试通过的版本，才会在这里出现发布按钮。
+            </span>
+          </div>
+          {candidate ? (
+            <span className="shrink-0 rounded-full bg-[var(--success-soft)] px-3 py-1 text-xs text-[var(--success)]">
+              {versionTitle(candidate)} 可发布
+            </span>
+          ) : null}
+        </div>
+      </Section>
+    </div>
+  );
+}
+
+function EnvironmentOverviewCard({
+  action,
+  address,
+  detail,
+  environment,
+  status,
+  tone,
+}: {
+  action?: { label: string; onClick: () => void };
+  address: string;
+  detail: string;
+  environment: string;
+  status: string;
+  tone: "idle" | "active" | "success" | "warning";
+}) {
+  return (
+    <section className="rounded-lg border border-[var(--border)] bg-[var(--surface)] p-5">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <span className="text-xs text-[var(--muted-foreground)]">
+            {environment}
+          </span>
+          <h2 className="mb-0 mt-1 text-lg font-semibold">{status}</h2>
+        </div>
+        <span
+          aria-label={status}
+          className={`mt-1 size-2.5 rounded-full ${
+            tone === "success"
+              ? "bg-[var(--success)]"
+              : tone === "warning"
+                ? "bg-[var(--warning)]"
+                : tone === "active"
+                  ? "bg-[var(--accent)]"
+                  : "bg-[var(--muted-strong)]"
+          }`}
+        />
+      </div>
+      <div className="mt-5 border-t border-[var(--border)] pt-4">
+        <strong className="block truncate text-sm">{detail}</strong>
+        <span
+          className="mt-1 block truncate text-xs text-[var(--muted-foreground)]"
+          title={address}
+        >
+          {address}
+        </span>
+      </div>
+      {action ? (
+        <Button
+          aria-label={`${environment}：${status}，${action.label}`}
+          className="mt-5 w-full"
+          onClick={action.onClick}
+          size="sm"
+          variant="secondary"
+        >
+          {action.label}
+        </Button>
+      ) : null}
+    </section>
+  );
+}
+
+function ReleaseCenterTaskCard({
+  model,
+  onOpenProduction,
+  onOpenSettings,
+  onOpenTest,
+  onStartTest,
+}: {
+  model: ReleaseCenterModel;
+  onOpenProduction: (runId?: string) => void;
+  onOpenSettings: () => void;
+  onOpenTest: () => void;
+  onStartTest: () => void;
+}) {
+  const version = model.currentVersion
+    ? versionTitle(model.currentVersion.run)
+    : "";
+  const exactSetupCopy = setupTaskCopy(model.setup.nextStep);
+  const recoveryEnvironment =
+    model.phase === "recover-production-task" ? "production" : "staging";
+  const exactRecoveryCopy = recoveryTaskCopy(
+    model.pendingTask?.run,
+    recoveryEnvironment,
+  );
+  const productionWebRecoveryCopy = model.productionWebPending
+    ? {
+        title: "正式版还差网页保存",
+        message:
+          "去代码平台网页粘贴并保存已经准备好的正式配置；完成后会继续同一个版本。",
+        action: "继续网页保存",
+      }
+    : exactRecoveryCopy;
+  const copy: Record<
+    ReleaseCenterModel["phase"],
+    { title: string; message: string; action: string | null }
+  > = {
+    setup: {
+      title:
+        model.primaryAction.kind === "start-test-deployment"
+          ? "准备生成第一个测试版"
+          : exactSetupCopy.title,
+      message:
+        model.primaryAction.kind === "start-test-deployment"
+          ? "项目已经准备好。现在可以生成第一个版本并部署到测试环境。"
+          : exactSetupCopy.message,
+      action:
+        model.primaryAction.kind === "start-test-deployment"
+          ? "生成第一个测试版"
+          : exactSetupCopy.action,
+    },
+    "build-deploy-progress": {
+      title: version ? `${version} 正在生成测试版` : "正在生成测试版",
+      message: "任务会保留当前进度，可以离开页面后再回来查看。",
+      action: "查看进度",
+    },
+    "recover-test-task": {
+      ...exactRecoveryCopy,
+    },
+    "awaiting-test": {
+      title: version ? `${version} 等待确认` : "测试版等待确认",
+      message: "先打开测试地址确认主要功能，再记录测试通过或测试有问题。",
+      action: "打开并确认测试版",
+    },
+    "test-rejected": {
+      title: version ? `${version} 暂不发布` : "这个版本暂不发布",
+      message:
+        "测试问题已经记录。修改代码并更新主分支后，系统会自动生成一个新版本。",
+      action: null,
+    },
+    eligible: {
+      title: version ? `${version} 已经可以发布` : "这个版本已经可以发布",
+      message: "正式版会使用测试通过的同一个版本，不会重新构建。",
+      action: "发布到正式环境",
+    },
+    "production-progress": {
+      title: version ? `${version} 正在发布正式版` : "正在发布正式版",
+      message: "当前正式版在切换成功前会继续运行。",
+      action: "查看发布进度",
+    },
+    "recover-production-task": {
+      ...productionWebRecoveryCopy,
+    },
+    healthy: {
+      title: "正式版运行正常",
+      message: version ? `当前运行 ${version}。` : "当前正式环境运行正常。",
+      action: "查看正式环境",
+    },
+  };
+  const current = copy[model.phase];
+  const warning =
+    model.phase === "setup" ||
+    model.phase === "recover-test-task" ||
+    model.phase === "recover-production-task" ||
+    model.phase === "test-rejected";
+  const success = model.phase === "eligible" || model.phase === "healthy";
+
+  function performPrimaryAction() {
+    switch (model.primaryAction.kind) {
+      case "continue-setup":
+        onOpenSettings();
+        break;
+      case "start-test-deployment":
+        onStartTest();
+        break;
+      case "publish-version":
+      case "view-production-progress":
+      case "recover-production-task":
+      case "view-production":
+        onOpenProduction(model.currentVersion?.run.id ?? "");
+        break;
+      case "wait-for-new-version":
+        break;
+      default:
+        onOpenTest();
+    }
+  }
+
+  return (
+    <section
+      aria-label="当前发布任务"
+      className={`mb-5 rounded-lg border px-5 py-5 ${warning ? "border-[var(--warning)]/35 bg-[var(--warning-soft)]" : success ? "border-[var(--success)]/25 bg-[var(--success-soft)]" : "border-[var(--accent)]/25 bg-[var(--info-soft)]"}`}
+    >
+      <div className="flex items-center justify-between gap-5 max-[760px]:flex-col max-[760px]:items-stretch">
+        <div>
+          <span className="text-xs font-medium text-[var(--muted-foreground)]">
+            当前要做的事
+          </span>
+          <h2 className="mb-0 mt-1 text-lg font-semibold">{current.title}</h2>
+          <p className="mb-0 mt-2 text-sm leading-6 text-[var(--muted-foreground)]">
+            {current.message}
+          </p>
+        </div>
+        {current.action ? (
+          <Button className="shrink-0" onClick={performPrimaryAction}>
+            {current.action}
+          </Button>
+        ) : (
+          <span className="shrink-0 rounded-full bg-[var(--surface)] px-3 py-1 text-xs text-[var(--muted-foreground)]">
+            等待代码更新
+          </span>
+        )}
+      </div>
+    </section>
+  );
+}
+
 function ProjectSceneRestoring({ scene }: { scene: ProjectScene }) {
   const copy: Record<ProjectScene, { description: string; title: string }> = {
+    overview: {
+      title: "发布中心",
+      description: "正在恢复测试环境、正式环境和可发布版本。",
+    },
     local: {
       title: "在本机运行",
       description: "正在恢复上次运行状态和必要配置。",
     },
     versions: {
-      title: "管理版本",
+      title: "版本",
       description: "正在恢复测试结果和版本记录。",
+    },
+    settings: {
+      title: "项目设置",
+      description: "正在恢复连接、环境和自动部署设置。",
     },
     test: {
       title: "部署测试版",
@@ -2066,57 +3157,76 @@ function LocalScene({
 }
 
 function VersionScene({
+  cnbAuthorizationSource,
+  deploymentAttempts,
+  focusCurrentTask = false,
   initialServer,
   initialStartRequested,
   onError,
+  onCnbAuthorizationOpenChange,
   onOpenProduction,
+  onOpenSettings,
   onOpenTest,
+  onSettingsDone,
   onSaveManifest,
   onServerChange,
+  onSetupBlockerChange,
   onSetupProgressChange,
   onSync,
   path,
   productionRun,
   productionSourceKey,
   productionWebSaveSourceKey,
+  rejectedVersionKeys,
   runs,
   saving,
   testSourceKey,
   verifiedRunIds,
+  view,
   workspace,
 }: {
+  cnbAuthorizationSource: string;
+  deploymentAttempts: DeploymentRun[];
+  focusCurrentTask?: boolean;
   initialServer?: ServerForm;
   initialStartRequested: boolean;
   onError: (message: string) => void;
+  onCnbAuthorizationOpenChange: CnbAuthorizationOpenReporter;
   onOpenProduction: (run: DeploymentRun) => void;
+  onOpenSettings: () => void;
   onOpenTest: () => void;
+  onSettingsDone: () => void;
   onSaveManifest: (manifestYaml: string) => Promise<boolean>;
   onServerChange: (server: ServerForm) => void;
+  onSetupBlockerChange?: (blocker: ReleaseSetupBlocker | null) => void;
   onSetupProgressChange?: () => void;
   onSync: () => Promise<void>;
   path: string;
   productionRun?: DeploymentRun;
   productionSourceKey: string;
   productionWebSaveSourceKey: string;
+  rejectedVersionKeys: string[];
   runs: DeploymentRun[];
   saving: boolean;
   testSourceKey: string;
   verifiedRunIds: string[];
+  view: "settings" | "versions";
   workspace: WorkspacePreview;
 }) {
-  const [showSetup, setShowSetup] = useState(true);
+  const [showSetup, setShowSetup] = useState(view === "settings");
   const [setupLoaded, setSetupLoaded] = useState(false);
-  const [setupStarted, setSetupStarted] = useState(false);
+  const [setupStarted, setSetupStarted] = useState(view === "settings");
+  const [setupAlreadyComplete, setSetupAlreadyComplete] = useState(false);
   const [openStep, setOpenStep] = useState<VersionSetupStep | "">("repository");
-  const [repository, setRepository] = useState(() => {
-    const configured = readRepository(workspace.manifestYaml);
-    return usableRepository(configured)
-      ? configured
-      : (runs[0]?.repository ?? configured);
-  });
-  const [repositoryReady, setRepositoryReady] = useState(() =>
-    usableRepository(repository),
-  );
+  const configuredRepository = readRepository(workspace.manifestYaml);
+  const restoredRepository = usableRepository(configuredRepository)
+    ? configuredRepository
+    : (runs[0]?.repository ?? configuredRepository);
+  const [repository, setRepository] = useState(() => restoredRepository);
+  // A saved repository slug is only an address. It does not prove that the
+  // current token can read code, build history/details and deployment setup.
+  const [repositoryReady, setRepositoryReady] = useState(false);
+  const restoredRepositoryRef = useRef(restoredRepository);
   const [registryReady, setRegistryReady] = useState(false);
   const [registryChecking, setRegistryChecking] = useState(true);
   const [server, setServer] = useState<ServerForm | undefined>(initialServer);
@@ -2145,24 +3255,35 @@ function VersionScene({
   const setupKey = `project.${encodeURIComponent(path)}.version-setup-complete`;
   const setupActiveKey = `project.${encodeURIComponent(path)}.version-setup-active`;
   const setupStepKey = `project.${encodeURIComponent(path)}.version-setup-step`;
-  const hasDeploymentHistory = runs.length > 0;
+  // A failed or interrupted first attempt is not proof that project setup is
+  // complete. Only a successful test deployment is a trustworthy legacy
+  // fallback when the explicit setup marker is missing.
+  const hasDeploymentHistory = runs.some(
+    (run) => run.environment === "staging" && run.status === "success",
+  );
 
   useEffect(() => setServer(initialServer), [initialServer]);
   useEffect(() => {
-    const configured = readRepository(workspace.manifestYaml);
-    const next = usableRepository(configured)
-      ? configured
-      : (runs[0]?.repository ?? configured);
-    setRepository(next);
-    setRepositoryReady(usableRepository(next));
-  }, [runs, workspace.manifestYaml]);
+    if (restoredRepositoryRef.current === restoredRepository) return;
+    restoredRepositoryRef.current = restoredRepository;
+    // saveRepository may have already moved local state to this exact value
+    // after a successful capability check. Do not turn that success back into
+    // an unchecked state when the parent subsequently supplies the saved YAML.
+    if (repository === restoredRepository) return;
+    setRepository(restoredRepository);
+    setRepositoryReady(false);
+  }, [repository, restoredRepository]);
+  const cnbRegistryRepositoryReady =
+    readRegistry(workspace.manifestYaml).kind === "cnb"
+      ? repositoryReady
+      : null;
   useEffect(() => {
     const registry = readRegistry(workspace.manifestYaml);
     if (registry.kind === "cnb") {
       // CNB stores images alongside the real code repository. A placeholder
       // such as `owner/project` is only a template value, not a usable version
       // location, so it must not make the second setup step look complete.
-      setRegistryReady(repositoryReady);
+      setRegistryReady(Boolean(cnbRegistryRepositoryReady));
       setRegistryChecking(false);
       return;
     }
@@ -2176,6 +3297,7 @@ function VersionScene({
     ])
       .then(([username, password, verifiedEndpoint]) => {
         const ready =
+          usableRegistryNamespace(registry.namespace) &&
           username.stored &&
           password.stored &&
           verifiedEndpoint === registry.endpoint;
@@ -2193,13 +3315,13 @@ function VersionScene({
     return () => {
       active = false;
     };
-  }, [repositoryReady, workspace.manifestYaml]);
+  }, [cnbRegistryRepositoryReady, workspace.manifestYaml]);
   useEffect(() => {
     const registry = readRegistry(workspace.manifestYaml);
     if (
       !setupStarted ||
       registry.kind !== "cnb" ||
-      workspace.manifestExists ||
+      (workspace.manifestExists && !workspace.adoption.freshDraft) ||
       automaticRegistryReuseStarted.current
     )
       return;
@@ -2248,21 +3370,28 @@ function VersionScene({
   }, [
     onSaveManifest,
     setupStarted,
+    workspace.adoption.freshDraft,
     workspace.manifestExists,
     workspace.manifestYaml,
   ]);
   useEffect(() => {
     Promise.all([getAppSetting(setupKey), getAppSetting(setupActiveKey)])
-      .then(([value, activeSetup]) => {
-        setShowSetup(value !== "true" && runs.length === 0);
-        setSetupStarted(initialStartRequested || activeSetup === "true");
+      .then(([completedSetup, activeSetup]) => {
+        setSetupAlreadyComplete(completedSetup === "true");
+        setShowSetup(view === "settings");
+        setSetupStarted(
+          view === "settings" ||
+            initialStartRequested ||
+            activeSetup === "true",
+        );
       })
       .catch(() => {
-        setShowSetup(true);
-        setSetupStarted(initialStartRequested);
+        setSetupAlreadyComplete(false);
+        setShowSetup(view === "settings");
+        setSetupStarted(view === "settings" || initialStartRequested);
       })
       .finally(() => setSetupLoaded(true));
-  }, [initialStartRequested, runs.length, setupActiveKey, setupKey]);
+  }, [initialStartRequested, setupActiveKey, setupKey, view]);
   useEffect(() => {
     if (!setupLoaded || showSetup || syncedProject.current === path) return;
     syncedProject.current = path;
@@ -2337,6 +3466,24 @@ function VersionScene({
         : "remote";
   const remainingSetupSteps = 4 - completed;
   const setupChecking = registryChecking || testEnvironmentChecking;
+  const currentSetupBlocker: ReleaseSetupBlocker | null = !repositoryReady
+    ? "source-connection"
+    : !registryReady
+      ? "registry-connection"
+      : !server
+        ? "test-server"
+        : runtimeConfigReady !== true
+          ? "test-config"
+          : !addressReady
+            ? "test-address"
+            : !cloudConfigReady
+              ? "automation"
+              : null;
+  const focusedSetupCopy = setupTaskCopy(currentSetupBlocker);
+  useEffect(() => {
+    if (setupChecking) return;
+    onSetupBlockerChange?.(currentSetupBlocker);
+  }, [currentSetupBlocker, onSetupBlockerChange, setupChecking]);
   const setupProgressLabel = setupChecking
     ? `${completed} 项已准备 · 后台确认中`
     : remainingSetupSteps
@@ -2353,6 +3500,7 @@ function VersionScene({
       !setupLoaded ||
       !setupStarted ||
       !showSetup ||
+      setupAlreadyComplete ||
       hasDeploymentHistory ||
       (repositoryReady && registryChecking) ||
       setupOpenStepAligned.current === path
@@ -2375,6 +3523,7 @@ function VersionScene({
       !setupLoaded ||
       !setupStarted ||
       !showSetup ||
+      setupAlreadyComplete ||
       hasDeploymentHistory ||
       (repositoryReady && registryChecking)
     )
@@ -2413,6 +3562,7 @@ function VersionScene({
       !setupLoaded ||
       !setupStarted ||
       !showSetup ||
+      setupAlreadyComplete ||
       hasDeploymentHistory ||
       setupChecking ||
       !ready ||
@@ -2425,9 +3575,10 @@ function VersionScene({
       setAppSetting(setupActiveKey, "false"),
     ])
       .then(() => {
+        setSetupAlreadyComplete(true);
         setShowSetup(false);
         onSetupProgressChange?.();
-        onOpenTest();
+        onSettingsDone();
       })
       .catch((error) => {
         automaticSetupFinishStarted.current = false;
@@ -2436,9 +3587,10 @@ function VersionScene({
   }, [
     hasDeploymentHistory,
     onError,
-    onOpenTest,
+    onSettingsDone,
     ready,
     setupChecking,
+    setupAlreadyComplete,
     setupActiveKey,
     setupKey,
     setupLoaded,
@@ -2481,7 +3633,7 @@ function VersionScene({
 
   async function finishSetup() {
     if (hasDeploymentHistory) {
-      setShowSetup(false);
+      onSettingsDone();
       return;
     }
     if (!ready) return;
@@ -2489,9 +3641,10 @@ function VersionScene({
       setAppSetting(setupKey, "true"),
       setAppSetting(setupActiveKey, "false"),
     ]);
+    setSetupAlreadyComplete(true);
     setShowSetup(false);
     onSetupProgressChange?.();
-    onOpenTest();
+    onSettingsDone();
   }
 
   async function sync() {
@@ -2521,7 +3674,7 @@ function VersionScene({
     return (
       <div className="flex min-h-64 items-center justify-center text-sm text-[var(--muted-foreground)]">
         <LoaderCircle className="mr-2 size-4 animate-spin-slow" />
-        正在读取版本设置
+        正在读取项目设置
       </div>
     );
   }
@@ -2531,7 +3684,7 @@ function VersionScene({
       <div>
         <PageHeading
           description="这里保存每次可以测试或发布的项目版本。首次只需完成一遍设置。"
-          title="管理版本"
+          title="版本"
         />
         <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-6 py-12 text-center">
           <Tags className="mx-auto size-9 text-[var(--subtle-foreground)]" />
@@ -2555,12 +3708,17 @@ function VersionScene({
       <div>
         <PageHeading
           description={
-            hasDeploymentHistory
-              ? "这些设置通常只做一次；修改后，后续版本仍会自动生成。"
-              : "完成后，把准备上线的代码合并到项目主分支，系统会自动生成版本并更新测试版。"
+            focusCurrentTask
+              ? focusedSetupCopy.message
+              : "代码平台、镜像仓库、运行环境和自动部署都在这里维护；授权失效时也从这里直接更换。"
           }
-          title={hasDeploymentHistory ? "上线设置" : "完成一次上线设置"}
+          title={focusCurrentTask ? focusedSetupCopy.title : "项目设置"}
         />
+        {!focusCurrentTask || currentSetupBlocker === "test-config" ? (
+          <div className="mb-5 rounded-lg border border-[var(--accent)]/20 bg-[var(--info-soft)] px-4 py-3 text-xs leading-5 text-[var(--muted-foreground)]">
+            测试和正式环境使用的运行配置会引用配置中心中的配置项，不需要在每次部署时重新填写。
+          </div>
+        ) : null}
         <div className="mb-4 flex justify-end">
           <span className="rounded-full bg-[var(--muted)] px-3 py-1 text-xs text-[var(--muted-foreground)]">
             <span className="flex items-center gap-1.5">
@@ -2572,7 +3730,7 @@ function VersionScene({
           </span>
         </div>
         <div className="space-y-3">
-          {foundationsCollapsed ? (
+          {!focusCurrentTask && foundationsCollapsed ? (
             <button
               className="flex min-h-[56px] w-full items-center justify-between gap-4 rounded-lg border border-[var(--success)]/20 bg-[var(--success-soft)] px-4 text-left outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus)]"
               onClick={() => setFoundationsExpanded(true)}
@@ -2583,7 +3741,7 @@ function VersionScene({
                 <span>
                   <strong className="block text-sm">前 3 项已准备</strong>
                   <span className="mt-0.5 block text-xs text-[var(--muted-foreground)]">
-                    代码平台、版本文件和测试环境
+                    代码平台、镜像仓库和测试环境
                   </span>
                 </span>
               </span>
@@ -2593,189 +3751,202 @@ function VersionScene({
             </button>
           ) : (
             <>
-              <PreparationStep
-                current={pendingSetupStep === "repository"}
-                description="保存项目代码，并自动发现准备上线的更新"
-                done={repositoryReady}
-                index={1}
-                name="连接代码平台"
-                onOpen={() => setOpenStep("repository")}
-                open={openStep === "repository"}
-              >
-                <RepositoryPreparation
-                  onError={onError}
-                  onReady={(next) => {
-                    if (next) setRepository(next);
-                    if (next && !repositoryReady && openStep === "repository")
-                      setOpenStep(
-                        registryReady ||
-                          readRegistry(workspace.manifestYaml).kind === "cnb"
-                          ? testEnvironmentReady
-                            ? "remote"
-                            : "test-environment"
-                          : "registry",
-                      );
-                    setRepositoryReady(Boolean(next));
-                  }}
-                  onSaveManifest={onSaveManifest}
-                  repository={repository}
-                  workspace={workspace}
-                />
-              </PreparationStep>
-              <PreparationStep
-                checking={registryChecking}
-                current={pendingSetupStep === "registry"}
-                description="保存每次可以部署的项目版本"
-                done={registryReady}
-                index={2}
-                name="保存项目版本"
-                onOpen={() => setOpenStep("registry")}
-                open={openStep === "registry"}
-              >
-                {registryChecking ? (
-                  <div className="flex min-h-20 items-center justify-center gap-2 text-sm text-[var(--muted-foreground)]">
-                    <LoaderCircle className="size-4 animate-spin-slow" />
-                    正在确认项目版本保存位置
-                  </div>
-                ) : (
-                  <RegistryPreparation
+              {!focusCurrentTask || pendingSetupStep === "repository" ? (
+                <PreparationStep
+                  current={pendingSetupStep === "repository"}
+                  description="保存项目代码，并自动发现准备上线的更新"
+                  done={repositoryReady}
+                  index={1}
+                  name="连接代码平台"
+                  onOpen={() => setOpenStep("repository")}
+                  open={openStep === "repository"}
+                >
+                  <RepositoryPreparation
+                    cnbAuthorizationSource={cnbAuthorizationSource}
+                    onCnbAuthorizationOpenChange={onCnbAuthorizationOpenChange}
                     onError={onError}
                     onReady={(next) => {
-                      if (next && !registryReady && openStep === "registry")
+                      if (next) setRepository(next);
+                      if (next && !repositoryReady && openStep === "repository")
                         setOpenStep(
-                          !repositoryReady
-                            ? "repository"
-                            : testEnvironmentReady
+                          registryReady ||
+                            readRegistry(workspace.manifestYaml).kind === "cnb"
+                            ? testEnvironmentReady
                               ? "remote"
-                              : "test-environment",
+                              : "test-environment"
+                            : "registry",
                         );
-                      setRegistryReady(next);
+                      setRepositoryReady(Boolean(next));
                     }}
                     onSaveManifest={onSaveManifest}
-                    readyFromParent={registryReady}
+                    repository={repository}
                     workspace={workspace}
                   />
-                )}
-              </PreparationStep>
-              <PreparationStep
-                checking={testEnvironmentChecking}
-                current={pendingSetupStep === "test-environment"}
-                description="复用服务器并补齐测试配置"
-                done={displayedTestEnvironmentReady}
-                index={3}
-                name="准备测试环境"
-                onOpen={() => {
-                  setTestEnvironmentReviewResolved(false);
-                  setOpenStep("test-environment");
-                }}
-                open={openStep === "test-environment"}
-              >
-                {!repositoryReady || !registryReady ? (
-                  <SetupDependencyNotice
-                    message="连接代码平台后，系统会自动准备项目版本，再带你连接测试服务器。"
-                    title="先完成前面的项目设置"
-                  />
-                ) : testEnvironmentRestoring ? (
-                  <div className="flex min-h-24 items-center justify-center gap-2 text-sm text-[var(--muted-foreground)]">
-                    <LoaderCircle className="size-4 animate-spin-slow" />
-                    正在恢复已保存的测试环境
-                  </div>
-                ) : (
-                  <div className="space-y-5">
-                    <ServerPreparation
-                      initialServer={server}
+                </PreparationStep>
+              ) : null}
+              {!focusCurrentTask || pendingSetupStep === "registry" ? (
+                <PreparationStep
+                  checking={registryChecking}
+                  current={pendingSetupStep === "registry"}
+                  description="保存构建后的不可变镜像，供测试和正式环境选择"
+                  done={registryReady}
+                  index={2}
+                  name="连接镜像仓库"
+                  onOpen={() => setOpenStep("registry")}
+                  open={openStep === "registry"}
+                >
+                  {registryChecking ? (
+                    <div className="flex min-h-20 items-center justify-center gap-2 text-sm text-[var(--muted-foreground)]">
+                      <LoaderCircle className="size-4 animate-spin-slow" />
+                      正在确认项目版本保存位置
+                    </div>
+                  ) : (
+                    <RegistryPreparation
                       onError={onError}
                       onReady={(next) => {
-                        setServer(next);
-                        onServerChange(next);
+                        if (next && !registryReady && openStep === "registry")
+                          setOpenStep(
+                            !repositoryReady
+                              ? "repository"
+                              : testEnvironmentReady
+                                ? "remote"
+                                : "test-environment",
+                          );
+                        setRegistryReady(next);
                       }}
-                      path={path}
+                      onSaveManifest={onSaveManifest}
+                      readyFromParent={registryReady}
+                      workspace={workspace}
                     />
-                    {server ? (
-                      <div className="border-t border-[var(--border)] pt-4">
-                        <RuntimeConfigFields
-                          environment="staging"
-                          onError={onError}
-                          onMarkOptional={(key) =>
-                            onSaveManifest(
-                              runtimeVariableOptionalManifest(
-                                workspace.manifestYaml,
-                                key,
-                              ),
-                            )
-                          }
-                          onReadyChange={handleRuntimeConfigReady}
-                          path={path}
-                          server={server}
-                          secretVariables={workspace.inspection.environment_variables
-                            .filter((item) => item.secret)
-                            .map((item) => item.name)}
-                          verifiedReady={runtimeConfigReady === true}
-                        />
-                      </div>
-                    ) : null}
-                    {server && runtimeConfigReady === true ? (
-                      <div className="border-t border-[var(--border)] pt-4">
-                        <TestAddressPreparation
-                          onReadyChange={setAddressReady}
-                          onSaveManifest={onSaveManifest}
-                          saving={saving}
-                          server={server}
-                          workspace={workspace}
-                        />
-                      </div>
-                    ) : null}
-                  </div>
-                )}
-              </PreparationStep>
+                  )}
+                </PreparationStep>
+              ) : null}
+              {!focusCurrentTask || pendingSetupStep === "test-environment" ? (
+                <PreparationStep
+                  checking={testEnvironmentChecking}
+                  current={pendingSetupStep === "test-environment"}
+                  description="复用服务器并补齐测试配置"
+                  done={displayedTestEnvironmentReady}
+                  index={3}
+                  name="准备测试环境"
+                  onOpen={() => {
+                    setTestEnvironmentReviewResolved(false);
+                    setOpenStep("test-environment");
+                  }}
+                  open={openStep === "test-environment"}
+                >
+                  {!repositoryReady || !registryReady ? (
+                    <SetupDependencyNotice
+                      message="连接代码平台后，系统会自动准备项目版本，再带你连接测试服务器。"
+                      title="先完成前面的项目设置"
+                    />
+                  ) : testEnvironmentRestoring ? (
+                    <div className="flex min-h-24 items-center justify-center gap-2 text-sm text-[var(--muted-foreground)]">
+                      <LoaderCircle className="size-4 animate-spin-slow" />
+                      正在恢复已保存的测试环境
+                    </div>
+                  ) : (
+                    <div className="space-y-5">
+                      <ServerPreparation
+                        environment="staging"
+                        initialServer={server}
+                        onError={onError}
+                        onReady={(next) => {
+                          setServer(next);
+                          onServerChange(next);
+                        }}
+                        path={path}
+                      />
+                      {server ? (
+                        <div className="border-t border-[var(--border)] pt-4">
+                          <RuntimeConfigFields
+                            environment="staging"
+                            onError={onError}
+                            onMarkOptional={(key) =>
+                              onSaveManifest(
+                                runtimeVariableOptionalManifest(
+                                  workspace.manifestYaml,
+                                  key,
+                                ),
+                              )
+                            }
+                            onReadyChange={handleRuntimeConfigReady}
+                            path={path}
+                            server={server}
+                            secretVariables={workspace.inspection.environment_variables
+                              .filter((item) => item.secret)
+                              .map((item) => item.name)}
+                            verifiedReady={runtimeConfigReady === true}
+                          />
+                        </div>
+                      ) : null}
+                      {server && runtimeConfigReady === true ? (
+                        <div className="border-t border-[var(--border)] pt-4">
+                          <TestAddressPreparation
+                            onReadyChange={setAddressReady}
+                            onSaveManifest={onSaveManifest}
+                            saving={saving}
+                            server={server}
+                            workspace={workspace}
+                          />
+                        </div>
+                      ) : null}
+                    </div>
+                  )}
+                </PreparationStep>
+              ) : null}
             </>
           )}
-          <PreparationStep
-            activeLabel="需要你完成"
-            current={pendingSetupStep === "remote"}
-            description="代码合并到主分支后，自动生成版本并更新测试版"
-            done={cloudConfigReady}
-            index={4}
-            name="开启自动部署"
-            onOpen={() => setOpenStep("remote")}
-            open={openStep === "remote"}
-          >
-            {!repositoryReady ||
-            !registryReady ||
-            !displayedTestEnvironmentReady ? (
-              <SetupDependencyNotice
-                message="系统会依次带你完成代码平台、项目版本和测试环境；准备好后再开启自动部署。"
-                title="先完成前面的上线设置"
-              />
-            ) : (
-              <CnbSecretSetup
-                environment="staging"
-                onError={onError}
-                onProgressChange={onSetupProgressChange}
-                onReadyChange={setCloudConfigReady}
-                onSaveManifest={onSaveManifest}
-                path={path}
-                runtimeReady={runtimeConfigReady === true && registryReady}
-                server={server}
-                workspace={workspace}
-              />
-            )}
-          </PreparationStep>
+          {!focusCurrentTask || pendingSetupStep === "remote" ? (
+            <PreparationStep
+              activeLabel="需要你完成"
+              current={pendingSetupStep === "remote"}
+              description="代码合并到主分支后，自动生成版本并更新测试版"
+              done={cloudConfigReady}
+              index={4}
+              name="开启自动部署"
+              onOpen={() => setOpenStep("remote")}
+              open={openStep === "remote"}
+            >
+              {!repositoryReady ||
+              !registryReady ||
+              !displayedTestEnvironmentReady ? (
+                <SetupDependencyNotice
+                  message="系统会依次带你完成代码平台、项目版本和测试环境；准备好后再开启自动部署。"
+                  title="先完成前面的上线设置"
+                />
+              ) : (
+                <CnbSecretSetup
+                  environment="staging"
+                  onError={onError}
+                  onProgressChange={onSetupProgressChange}
+                  onReadyChange={setCloudConfigReady}
+                  onSaveManifest={onSaveManifest}
+                  path={path}
+                  runtimeReady={runtimeConfigReady === true && registryReady}
+                  server={server}
+                  workspace={workspace}
+                />
+              )}
+            </PreparationStep>
+          ) : null}
         </div>
         <div className="mt-6 flex justify-end border-t border-[var(--border)] pt-5">
           {hasDeploymentHistory ? (
             <Button onClick={() => void finishSetup()}>
               <Check />
-              返回版本列表
+              返回发布中心
             </Button>
           ) : ready ? (
             <span className="flex items-center gap-2 text-sm text-[var(--muted-foreground)]">
               <LoaderCircle className="size-4 animate-spin-slow" />
-              设置完成，正在打开测试版
+              设置完成，正在返回发布中心
             </span>
           ) : (
             <span className="text-sm text-[var(--muted-foreground)]">
-              系统会依次带你完成剩余设置，全部完成后自动进入测试版
+              {focusCurrentTask
+                ? "完成当前这一项后会自动进入下一项；关闭面板也不会丢失进度"
+                : "系统会依次带你完成剩余设置，全部完成后返回发布中心"}
             </span>
           )}
         </div>
@@ -2790,7 +3961,12 @@ function VersionScene({
   // 只有最新一次部署仍未完成时才需要用户继续处理。更早的失败已经被
   // 后续部署替代，继续把它们显示成“需要处理”会让用户误以为项目仍有
   // 十几项故障，尤其是在当前测试版已经正常运行的情况下。
-  const latestRun = runs[0];
+  const sortedDeploymentAttempts = [...deploymentAttempts].sort(
+    (left, right) =>
+      right.startedAt.localeCompare(left.startedAt) ||
+      right.updatedAt.localeCompare(left.updatedAt),
+  );
+  const latestRun = sortedDeploymentAttempts[0];
   const currentIncompleteDeployment =
     latestRun && ["failed", "needs_action"].includes(latestRun.status)
       ? latestRun
@@ -2799,7 +3975,7 @@ function VersionScene({
     latestRun && ["queued", "running"].includes(latestRun.status)
       ? latestRun
       : null;
-  const historicalIncompleteDeployments = runs.filter(
+  const historicalIncompleteDeployments = sortedDeploymentAttempts.filter(
     (run) =>
       run.status !== "success" &&
       run.id !== currentIncompleteDeployment?.id &&
@@ -2827,6 +4003,7 @@ function VersionScene({
     const incomplete = Boolean(incompleteKind);
     const historical = incompleteKind === "historical";
     const verified = verifiedRunIds.includes(run.id);
+    const rejected = rejectedVersionKeys.includes(versionKey(run));
     const currentInTest = !incomplete && testSourceKey === versionKey(run);
     const currentInProduction =
       !incomplete && productionSourceKey === versionKey(run);
@@ -2857,11 +4034,13 @@ function VersionScene({
         : "技术信息";
     const publishAction = restoring ? "用此版本恢复正式版" : "发布正式版";
     const continueProductionAction =
-      productionRun?.actionKind === "route-check"
-        ? "继续设置正式地址"
-        : productionRun?.actionKind === "route-repair"
-          ? "继续修复正式地址"
-          : "继续完成正式发布";
+      productionRun?.issueCode === "AD-NET-202"
+        ? "重新检查正式地址"
+        : productionRun?.actionKind === "route-check"
+          ? "继续设置正式地址"
+          : productionRun?.actionKind === "route-repair"
+            ? "继续修复正式地址"
+            : "继续完成正式发布";
     return (
       <div
         className="flex items-center justify-between gap-5 px-5 py-4 max-[760px]:flex-col max-[760px]:items-stretch"
@@ -2879,17 +4058,19 @@ function VersionScene({
           </span>
           <div className="mt-2 flex flex-wrap gap-1.5">
             <span
-              className={`rounded-full px-2 py-0.5 text-[10px] ${historical ? "bg-[var(--muted)] text-[var(--muted-foreground)]" : incomplete ? "bg-[var(--warning-soft)] text-[var(--warning)]" : verified ? "bg-[var(--success-soft)] text-[var(--success)]" : "bg-[var(--muted)] text-[var(--muted-foreground)]"}`}
+              className={`rounded-full px-2 py-0.5 text-[10px] ${historical ? "bg-[var(--muted)] text-[var(--muted-foreground)]" : incomplete || rejected ? "bg-[var(--warning-soft)] text-[var(--warning)]" : verified ? "bg-[var(--success-soft)] text-[var(--success)]" : "bg-[var(--muted)] text-[var(--muted-foreground)]"}`}
             >
               {historical
                 ? "已被后续部署替代"
                 : incomplete
                   ? deploymentStatus(run)
-                  : verified
-                    ? "测试通过"
-                    : currentInTest
-                      ? "等待确认测试结果"
-                      : "未完成测试 · 不可发布"}
+                  : rejected
+                    ? "测试未通过 · 等待代码更新"
+                    : verified
+                      ? "测试通过"
+                      : currentInTest
+                        ? "等待确认测试结果"
+                        : "未完成测试 · 不可发布"}
             </span>
             {currentInTest ? (
               <span className="rounded-full bg-[var(--info-soft)] px-2 py-0.5 text-[10px] text-[var(--accent)]">
@@ -2993,16 +4174,16 @@ function VersionScene({
             ) : null}
           </div>
         }
-        description="查看版本是否通过测试，以及正在测试或正式使用的版本。"
-        title="管理版本"
+        description="每个版本只生成一次；通过测试后，可以选择部署到正式环境。"
+        title="版本"
       />
       <div className="mb-5 flex items-center justify-between rounded-lg border border-[var(--accent)]/20 bg-[var(--info-soft)] px-4 py-3">
         <div>
           <strong className="text-sm">
             {syncBlocker
-              ? "上线设置需要更新"
+              ? "项目设置需要更新"
               : runs.length
-                ? "自动部署测试版已开启"
+                ? "测试环境自动更新已开启"
                 : "等待首次测试部署"}
           </strong>
           <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
@@ -3010,31 +4191,20 @@ function VersionScene({
               ? "先处理下面的问题，再继续同步版本"
               : runs.length
                 ? "代码合并后 → 生成版本 → 更新测试版"
-                : "完成首次设置后，主分支更新会自动部署测试版"}
+                : "完成项目设置后，主分支更新会自动部署到测试环境"}
           </span>
         </div>
-        <Button
-          onClick={() => {
-            setOpenStep("");
-            setShowSetup(true);
-          }}
-          size="sm"
-          variant="ghost"
-        >
-          查看设置
+        <Button onClick={onOpenSettings} size="sm" variant="ghost">
+          项目设置
         </Button>
       </div>
       {syncBlocker ? (
         <IssueBanner
           action={
-            syncBlocker.includes("AD-CNB-103") ? (
-              <Button
-                onClick={() => {
-                  setShowSetup(true);
-                  setOpenStep("repository");
-                }}
-                size="sm"
-              >
+            ["AD-CNB-101", "AD-CNB-103"].some((code) =>
+              syncBlocker.includes(code),
+            ) ? (
+              <Button onClick={onOpenSettings} size="sm">
                 <KeyRound />
                 更新 CNB 授权
               </Button>
@@ -3314,6 +4484,10 @@ function RegistryPreparation({
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [ready, setReady] = useState(readyFromParent);
+  const [editingCredentials, setEditingCredentials] = useState(false);
+  const [namespace, setNamespace] = useState(() =>
+    usableRegistryNamespace(registry.namespace) ? registry.namespace : "",
+  );
   const [working, setWorking] = useState(false);
   const [credentialIssue, setCredentialIssue] =
     useState<UserFacingIssue | null>(null);
@@ -3322,6 +4496,12 @@ function RegistryPreparation({
   useEffect(() => {
     setReady(readyFromParent);
   }, [readyFromParent]);
+
+  useEffect(() => {
+    setNamespace(
+      usableRegistryNamespace(registry.namespace) ? registry.namespace : "",
+    );
+  }, [registry.namespace]);
 
   useEffect(() => {
     if (registry.kind !== "cnb") {
@@ -3344,31 +4524,47 @@ function RegistryPreparation({
   }, [registry.kind]);
 
   async function save() {
-    if (!username.trim() || !password) return;
+    if (
+      !username.trim() ||
+      !password ||
+      (registry.kind === "tcr" && !usableRegistryNamespace(namespace))
+    )
+      return;
     setWorking(true);
     setCredentialIssue(null);
     try {
-      const check = await checkRegistryCredentials(
+      const check = await replaceRegistryCredentials(
         registry.endpoint,
+        prefix,
         username.trim(),
         password,
       );
       if (!check.ok) {
         setCredentialIssue(registryCredentialIssue(check));
-        setReady(false);
-        onReady(false);
         return;
       }
-      // macOS Keychain writes must be serialized. Parallel writes can trigger
-      // two authorization requests and leave both operations waiting forever.
-      await storeSecret(`${prefix}.username`, username.trim());
-      await storeSecret(`${prefix}.password`, password);
+      if (
+        registry.kind === "tcr" &&
+        (registry.namespace !== namespace.trim() ||
+          !usableRegistryNamespace(registry.namespace)) &&
+        !(await onSaveManifest(
+          tcrRegistryManifest(workspace.manifestYaml, namespace.trim()),
+        ))
+      ) {
+        setCredentialIssue(
+          issueFromUnknown(
+            "AD-REG-105：登录信息已经验证，但项目版本保存位置没有保存，请重新尝试",
+          ),
+        );
+        return;
+      }
       await setAppSetting(registryVerificationKey(prefix), registry.endpoint);
       if (registry.kind === "tcr") {
-        await rememberTcrPreference(registry.namespace);
+        await rememberTcrPreference(namespace.trim());
       }
       setUsername("");
       setPassword("");
+      setEditingCredentials(false);
       setReady(true);
       onReady(true);
     } catch (error) {
@@ -3381,6 +4577,7 @@ function RegistryPreparation({
   }
 
   async function authorizeSavedCredentials() {
+    if (registry.kind === "tcr" && !usableRegistryNamespace(namespace)) return;
     setWorking(true);
     setCredentialIssue(null);
     try {
@@ -3397,9 +4594,24 @@ function RegistryPreparation({
         onReady(false);
         return;
       }
+      if (
+        registry.kind === "tcr" &&
+        (registry.namespace !== namespace.trim() ||
+          !usableRegistryNamespace(registry.namespace)) &&
+        !(await onSaveManifest(
+          tcrRegistryManifest(workspace.manifestYaml, namespace.trim()),
+        ))
+      ) {
+        setCredentialIssue(
+          issueFromUnknown(
+            "AD-REG-105：已保存登录信息可以使用，但项目版本保存位置没有保存",
+          ),
+        );
+        return;
+      }
       await setAppSetting(registryVerificationKey(prefix), registry.endpoint);
       if (registry.kind === "tcr") {
-        await rememberTcrPreference(registry.namespace);
+        await rememberTcrPreference(namespace.trim());
       }
       setReady(true);
       onReady(true);
@@ -3516,10 +4728,11 @@ function RegistryPreparation({
         <strong className="block text-sm">项目版本保存位置</strong>
         <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
           {registry.kind === "tcr" ? "腾讯云 TCR · " : null}
-          {registry.endpoint}/{registry.namespace}
+          {registry.endpoint}/
+          {usableRegistryNamespace(namespace) ? namespace : "尚未选择命名空间"}
         </span>
       </div>
-      {ready ? (
+      {ready && !editingCredentials ? (
         <div className="flex items-center justify-between gap-4 rounded-md bg-[var(--success-soft)] px-3 py-2.5">
           <span className="text-sm text-[var(--success)]">
             登录信息已安全保存
@@ -3530,8 +4743,7 @@ function RegistryPreparation({
           <Button
             onClick={() => {
               setCredentialIssue(null);
-              setReady(false);
-              onReady(false);
+              setEditingCredentials(true);
             }}
             size="sm"
             variant="ghost"
@@ -3541,12 +4753,37 @@ function RegistryPreparation({
         </div>
       ) : (
         <div className="space-y-3">
+          {ready && editingCredentials ? (
+            <div className="rounded-md bg-[var(--info-soft)] px-3 py-2.5 text-xs leading-5 text-[var(--muted-foreground)]">
+              当前登录信息仍然有效；只有新信息验证并完整保存后才会替换。
+            </div>
+          ) : null}
+          {registry.kind === "tcr" ? (
+            <div className="space-y-1.5">
+              <Label htmlFor="registry-namespace">TCR 命名空间</Label>
+              <Input
+                id="registry-namespace"
+                onChange={(event) => {
+                  setNamespace(event.target.value.trim().toLowerCase());
+                  setCredentialIssue(null);
+                }}
+                placeholder="例如 finagent"
+                value={namespace}
+              />
+              <span className="block text-[11px] leading-4 text-[var(--muted-foreground)]">
+                在腾讯云容器镜像服务的“命名空间”中查看或创建；同一账号下的项目可以复用。
+              </span>
+            </div>
+          ) : null}
           <div className="flex items-center justify-between rounded-md bg-[var(--muted)]/35 px-3 py-2.5">
             <span className="text-xs text-[var(--muted-foreground)]">
               以前保存过登录信息？验证通过后可以直接复用。
             </span>
             <Button
-              disabled={working}
+              disabled={
+                working ||
+                (registry.kind === "tcr" && !usableRegistryNamespace(namespace))
+              }
               onClick={() => void authorizeSavedCredentials()}
               size="sm"
               variant="secondary"
@@ -3607,7 +4844,12 @@ function RegistryPreparation({
             </div>
             <Button
               className="w-full md:w-auto"
-              disabled={working || !username.trim() || !password}
+              disabled={
+                working ||
+                !username.trim() ||
+                !password ||
+                (registry.kind === "tcr" && !usableRegistryNamespace(namespace))
+              }
               onClick={() => void save()}
             >
               {working ? (
@@ -3618,6 +4860,24 @@ function RegistryPreparation({
               {working ? "正在验证" : "验证并安全保存"}
             </Button>
           </div>
+          {ready && editingCredentials ? (
+            <div className="flex justify-end">
+              <Button
+                disabled={working}
+                onClick={() => {
+                  setCredentialIssue(null);
+                  setEditingCredentials(false);
+                  setUsername("");
+                  setPassword("");
+                  setNamespace(registry.namespace);
+                }}
+                size="sm"
+                variant="ghost"
+              >
+                取消更换
+              </Button>
+            </div>
+          ) : null}
         </div>
       )}
     </div>
@@ -3626,36 +4886,50 @@ function RegistryPreparation({
 
 function TestScene({
   blockingProductionRun,
+  cnbAuthorizationSource,
+  initialCnbAuthorizationOpen = false,
   initialServer,
+  initialStartRequested,
   onDeploy,
+  onCnbAuthorizationOpenChange,
   onError,
   onOpenProduction,
   onOpenSetup,
   onRefresh,
+  onReject,
   onVerify,
+  onStartHandled,
   path,
   productionRun,
   productionWebSaveVersionKey,
+  rejected,
   run,
   setupComplete,
   verified,
   workspace,
 }: {
   blockingProductionRun?: DeploymentRun;
+  cnbAuthorizationSource: string;
+  initialCnbAuthorizationOpen?: boolean;
   initialServer?: ServerForm;
+  initialStartRequested: boolean;
   onDeploy: (
     server: ServerForm,
     repository: string,
     useCommittedCode?: boolean,
   ) => Promise<void>;
+  onCnbAuthorizationOpenChange: CnbAuthorizationOpenReporter;
   onError: (message: string) => void;
   onOpenProduction: () => void;
   onOpenSetup: () => void;
   onRefresh: (run: DeploymentRun) => Promise<DeploymentRun>;
+  onReject: (run: DeploymentRun) => Promise<void>;
   onVerify: (run: DeploymentRun) => Promise<void>;
+  onStartHandled: () => void;
   path: string;
   productionRun?: DeploymentRun;
   productionWebSaveVersionKey: string;
+  rejected: boolean;
   run?: DeploymentRun;
   setupComplete: boolean | null;
   verified: boolean;
@@ -3670,9 +4944,21 @@ function TestScene({
   const [previewUrl, setPreviewUrl] = useState("");
   const [deploymentBlocker, setDeploymentBlocker] = useState("");
   const [showPreparation, setShowPreparation] = useState(!run);
-  const [cnbAuthorizationDialog, setCnbAuthorizationDialog] = useState(false);
+  const [cnbAuthorizationDialog, setCnbAuthorizationDialog] = useState(
+    initialCnbAuthorizationOpen,
+  );
   const [cnbToken, setCnbToken] = useState("");
   const [authorizingCnb, setAuthorizingCnb] = useState(false);
+  const [cnbAuthorizationFeedback, setCnbAuthorizationFeedback] =
+    useState<CnbAuthorizationFeedback | null>(null);
+  useCnbAuthorizationDialogVisibility(
+    cnbAuthorizationDialog,
+    cnbAuthorizationSource,
+    onCnbAuthorizationOpenChange,
+  );
+  const [openedVersionKey, setOpenedVersionKey] = useState("");
+  const automaticStartAttempted = useRef(false);
+  const deploymentStartInFlight = useRef(false);
 
   const checkingSetup =
     setupComplete === null ||
@@ -3697,7 +4983,12 @@ function TestScene({
   );
 
   async function deploy(useCommittedCode = false) {
-    if (!ready || !initialServer) return;
+    if (!ready || !initialServer || deploymentStartInFlight.current) return;
+    deploymentStartInFlight.current = true;
+    if (initialStartRequested && !automaticStartAttempted.current) {
+      automaticStartAttempted.current = true;
+      onStartHandled();
+    }
     setDeploying(true);
     setDeploymentBlocker("");
     try {
@@ -3706,9 +4997,21 @@ function TestScene({
     } catch (error) {
       setDeploymentBlocker(toMessage(error));
     } finally {
+      deploymentStartInFlight.current = false;
       setDeploying(false);
     }
   }
+
+  useEffect(() => {
+    if (
+      !initialStartRequested ||
+      automaticStartAttempted.current ||
+      run ||
+      !ready
+    )
+      return;
+    void deploy();
+  }, [initialStartRequested, onStartHandled, ready, run]);
 
   async function openSecurePreview(currentRun: DeploymentRun) {
     setPreviewing(true);
@@ -3716,6 +5019,7 @@ function TestScene({
       const preview = await openStagingPreviewTunnel(currentRun.id);
       setPreviewUrl(preview.url);
       await openUrl(preview.url);
+      setOpenedVersionKey(versionKey(currentRun));
       await onRefresh(currentRun);
     } catch (error) {
       onError(toMessage(error));
@@ -3724,13 +5028,51 @@ function TestScene({
     }
   }
 
+  async function openTestAddress(currentRun: DeploymentRun, url: string) {
+    try {
+      await openUrl(url);
+      setOpenedVersionKey(versionKey(currentRun));
+    } catch (error) {
+      onError(toMessage(error));
+    }
+  }
+
   async function authorizeCnbAndContinue(currentRun: DeploymentRun) {
     if (!cnbToken.trim()) return;
     setAuthorizingCnb(true);
+    setCnbAuthorizationFeedback(null);
     try {
-      await connectCnb(cnbToken, true, currentRun.repository);
-      await onRefresh(currentRun);
+      try {
+        await connectCnb(cnbToken, true, currentRun.repository);
+      } catch (error) {
+        setCnbAuthorizationFeedback({
+          message: cnbAuthorizationFeedbackMessage(error),
+          title: "新令牌未保存，当前任务仍使用原授权",
+          tone: "error",
+        });
+        return;
+      }
       setCnbToken("");
+      let refreshed: DeploymentRun;
+      try {
+        refreshed = await onRefresh(currentRun);
+      } catch (error) {
+        setCnbAuthorizationFeedback({
+          message: `${cnbAuthorizationFeedbackMessage(error)}。稍后可以直接重新检查当前任务。`,
+          title: "新令牌已保存，但这次状态检查没有完成",
+          tone: "warning",
+        });
+        return;
+      }
+      if (stillNeedsCnbAuthorization(refreshed)) {
+        setCnbAuthorizationFeedback({
+          message: `请同时检查授权范围和使用范围；使用范围必须包含 ${currentRun.repository} 或全部仓库。`,
+          title: "新令牌已保存，但 CNB 仍拒绝读取当前仓库",
+          tone: "warning",
+        });
+        return;
+      }
+      setCnbAuthorizationFeedback(null);
       setCnbAuthorizationDialog(false);
     } catch (error) {
       onError(toMessage(error));
@@ -3742,6 +5084,8 @@ function TestScene({
   if (run && !showPreparation) {
     const usesSecurePreview = run.actionKind === "local-preview";
     const displayAddress = previewUrl || (usesSecurePreview ? "" : address);
+    const testOpened =
+      verified || openedVersionKey === versionKey(run) || Boolean(previewUrl);
     return (
       <div>
         <PageHeading
@@ -3776,7 +5120,8 @@ function TestScene({
         <CurrentVersionBanner label="当前测试版本" run={run} />
         <DeploymentState
           action={
-            run.status === "needs_action" && run.issueCode === "AD-CNB-103" ? (
+            run.status === "needs_action" &&
+            ["AD-CNB-101", "AD-CNB-103"].includes(run.issueCode ?? "") ? (
               <Button onClick={() => setCnbAuthorizationDialog(true)} size="sm">
                 <KeyRound />
                 更新 CNB 授权
@@ -3786,6 +5131,12 @@ function TestScene({
               <Button onClick={() => setShowPreparation(true)} size="sm">
                 <Rocket />
                 重新部署当前代码
+              </Button>
+            ) : run.status === "needs_action" &&
+              run.actionKind === "retry-staging-preparation" ? (
+              <Button onClick={() => setShowPreparation(true)} size="sm">
+                <Rocket />
+                继续当前部署
               </Button>
             ) : run.status === "needs_action" &&
               ["cloud-config", "cloud-setup"].includes(run.actionKind ?? "") ? (
@@ -3816,6 +5167,7 @@ function TestScene({
               : undefined
           }
           onError={onError}
+          pauseAutoRecheck={cnbAuthorizationDialog}
           run={run}
           onRefresh={onRefresh}
         />
@@ -3826,14 +5178,14 @@ function TestScene({
               href={displayAddress}
               onClick={(event) => {
                 event.preventDefault();
-                void openUrl(displayAddress);
+                void openTestAddress(run, displayAddress);
               }}
             >
               {displayAddress}
             </a>
             <div className="mt-4">
               <Button
-                onClick={() => void openUrl(displayAddress)}
+                onClick={() => void openTestAddress(run, displayAddress)}
                 variant="secondary"
               >
                 <ExternalLink />
@@ -3841,7 +5193,8 @@ function TestScene({
               </Button>
             </div>
             <TestVerificationPrompt
-              onModify={() => setShowPreparation(true)}
+              canVerify={testOpened}
+              onReject={() => void onReject(run)}
               onOpenProduction={onOpenProduction}
               onVerify={() => void onVerify(run)}
               blockingProductionRun={blockingProductionRun}
@@ -3850,6 +5203,7 @@ function TestScene({
                 productionWebSaveForCurrentVersion
               }
               productionWebSavePending={productionWebSavePending}
+              rejected={rejected}
               verified={verified}
             />
           </div>
@@ -3876,7 +5230,8 @@ function TestScene({
             />
             {verified ? (
               <TestVerificationPrompt
-                onModify={() => setShowPreparation(true)}
+                canVerify={testOpened}
+                onReject={() => void onReject(run)}
                 onOpenProduction={onOpenProduction}
                 onVerify={() => void onVerify(run)}
                 blockingProductionRun={blockingProductionRun}
@@ -3885,11 +5240,13 @@ function TestScene({
                   productionWebSaveForCurrentVersion
                 }
                 productionWebSavePending={productionWebSavePending}
+                rejected={rejected}
                 verified
               />
             ) : previewUrl ? (
               <TestVerificationPrompt
-                onModify={() => setShowPreparation(true)}
+                canVerify={testOpened}
+                onReject={() => void onReject(run)}
                 onOpenProduction={onOpenProduction}
                 onVerify={() => void onVerify(run)}
                 blockingProductionRun={blockingProductionRun}
@@ -3898,6 +5255,7 @@ function TestScene({
                   productionWebSaveForCurrentVersion
                 }
                 productionWebSavePending={productionWebSavePending}
+                rejected={rejected}
                 verified={false}
               />
             ) : (
@@ -3926,7 +5284,8 @@ function TestScene({
             />
             {verified ? (
               <TestVerificationPrompt
-                onModify={() => setShowPreparation(true)}
+                canVerify={testOpened}
+                onReject={() => void onReject(run)}
                 onOpenProduction={onOpenProduction}
                 onVerify={() => void onVerify(run)}
                 blockingProductionRun={blockingProductionRun}
@@ -3935,6 +5294,7 @@ function TestScene({
                   productionWebSaveForCurrentVersion
                 }
                 productionWebSavePending={productionWebSavePending}
+                rejected={rejected}
                 verified
               />
             ) : null}
@@ -3951,11 +5311,19 @@ function TestScene({
         ) : null}
         <CnbAuthorizationDialog
           description="保存新授权后会继续检查这次测试部署，已经生成并启动的版本不会重做。"
+          feedback={cnbAuthorizationFeedback}
           fieldId="test-cnb-token"
-          onOpenChange={setCnbAuthorizationDialog}
+          onOpenChange={(open) => {
+            setCnbAuthorizationDialog(open);
+            if (!open) setCnbAuthorizationFeedback(null);
+          }}
           onSubmit={() => void authorizeCnbAndContinue(run)}
-          onTokenChange={setCnbToken}
+          onTokenChange={(value) => {
+            setCnbToken(value);
+            setCnbAuthorizationFeedback(null);
+          }}
           open={cnbAuthorizationDialog}
+          repository={run.repository}
           submitLabel="保存授权并继续"
           title="更新 CNB 授权"
           token={cnbToken}
@@ -3971,7 +5339,7 @@ function TestScene({
         description={
           setupComplete
             ? "使用已经保存的上线设置，不需要重新填写服务器、配置或地址。"
-            : "一次性设置统一在“管理版本”完成，这里不重复要求填写。"
+            : "一次性设置统一在“项目设置”完成，这里不重复要求填写。"
         }
         title={run ? "手动部署测试版" : "部署测试版"}
       />
@@ -4050,21 +5418,25 @@ function TestScene({
 
 function TestVerificationPrompt({
   blockingProductionRun,
-  onModify,
+  canVerify,
   onOpenProduction,
+  onReject,
   onVerify,
   productionRun,
   productionWebSaveForCurrentVersion,
   productionWebSavePending,
+  rejected,
   verified,
 }: {
   blockingProductionRun?: DeploymentRun;
-  onModify: () => void;
+  canVerify: boolean;
   onOpenProduction: () => void;
+  onReject: () => void;
   onVerify: () => void;
   productionRun?: DeploymentRun;
   productionWebSaveForCurrentVersion: boolean;
   productionWebSavePending: boolean;
+  rejected: boolean;
   verified: boolean;
 }) {
   if (verified) {
@@ -4105,13 +5477,22 @@ function TestVerificationPrompt({
         ? "系统正在发布这个测试通过的版本；可以打开查看当前进度。"
         : "系统正在发布另一个测试通过的版本；先等待那次任务完成，再决定是否发布当前版本。";
     } else if (activeProductionRun?.actionKind === "route-check") {
-      activeProductionAction = "继续设置正式地址";
-      activeProductionTitle = activeProductionForCurrentVersion
-        ? "正式版还差设置地址"
-        : "另一个版本还差设置正式地址";
-      activeProductionMessage = activeProductionForCurrentVersion
-        ? "这个测试通过的版本已经在正式服务器运行，但正式地址还不能访问；继续完成地址设置即可。"
-        : "另一个测试通过的版本已经在正式服务器运行，但正式地址还不能访问；先完成那次地址设置，再决定是否发布当前版本。";
+      const checkInterrupted = activeProductionRun.issueCode === "AD-NET-202";
+      activeProductionAction = checkInterrupted
+        ? "重新检查正式地址"
+        : "继续设置正式地址";
+      activeProductionTitle = checkInterrupted
+        ? activeProductionForCurrentVersion
+          ? "正式地址检查暂时中断"
+          : "另一个版本的地址检查暂时中断"
+        : activeProductionForCurrentVersion
+          ? "正式版还差设置地址"
+          : "另一个版本还差设置正式地址";
+      activeProductionMessage = checkInterrupted
+        ? "版本已经在正式服务器运行；确认本机网络后重新检查即可，不会重复部署。"
+        : activeProductionForCurrentVersion
+          ? "这个测试通过的版本已经在正式服务器运行，但正式地址还不能访问；继续完成地址设置即可。"
+          : "另一个测试通过的版本已经在正式服务器运行，但正式地址还不能访问；先完成那次地址设置，再决定是否发布当前版本。";
     } else if (activeProductionRun?.actionKind === "route-repair") {
       activeProductionAction = "继续修复正式地址";
       activeProductionTitle = activeProductionForCurrentVersion
@@ -4166,19 +5547,31 @@ function TestVerificationPrompt({
       />
     );
   }
+  if (rejected) {
+    return (
+      <div className="mt-7 border-t border-[var(--border)] pt-6 text-center">
+        <h2 className="m-0 text-base font-semibold">这个版本暂不发布</h2>
+        <p className="mb-0 mt-2 text-sm text-[var(--muted-foreground)]">
+          测试结果已记录为有问题。修改代码并更新主分支后，系统会生成一个新版本；当前正式版不受影响。
+        </p>
+      </div>
+    );
+  }
   return (
     <div className="mt-7 border-t border-[var(--border)] pt-6 text-center">
       <h2 className="m-0 text-base font-semibold">测试结果符合你的预期吗？</h2>
       <p className="mb-5 mt-2 text-sm text-[var(--muted-foreground)]">
-        如果还需要修改，请回到开发工具处理后重新部署。
+        {canVerify
+          ? "只记录这次测试结论，不会自动发布正式版。"
+          : "请先打开测试版，确认主要功能后再记录结果。"}
       </p>
       <div className="flex justify-center gap-2">
-        <Button onClick={onModify} variant="secondary">
-          还需要修改
+        <Button disabled={!canVerify} onClick={onReject} variant="secondary">
+          测试有问题
         </Button>
-        <Button onClick={onVerify}>
+        <Button disabled={!canVerify} onClick={onVerify}>
           <Check />
-          测试通过
+          确认测试通过
         </Button>
       </div>
     </div>
@@ -4186,15 +5579,21 @@ function TestVerificationPrompt({
 }
 
 function ProductionScene({
+  cnbAuthorizationSource,
+  currentProductionVersion,
   currentTestVersion,
+  initialCnbAuthorizationOpen = false,
   initialWebSavePending,
-  initialServer,
+  initialServer: savedServer,
   onError,
+  onCnbAuthorizationOpenChange,
   onPromote,
   onProgressChange,
   onRefresh,
   onSaveManifest,
+  onServerChange,
   onSelectVersion,
+  onShowSettings,
   onShowVersions,
   onShowTest,
   path,
@@ -4206,15 +5605,21 @@ function ProductionScene({
   verifiedRuns,
   workspace,
 }: {
+  cnbAuthorizationSource: string;
+  currentProductionVersion?: DeploymentRun;
   currentTestVersion?: DeploymentRun;
+  initialCnbAuthorizationOpen?: boolean;
   initialWebSavePending: boolean;
   initialServer?: ServerForm;
   onError: (message: string) => void;
+  onCnbAuthorizationOpenChange: CnbAuthorizationOpenReporter;
   onPromote: (run: DeploymentRun, server: ServerForm) => Promise<void>;
   onProgressChange?: () => void;
   onRefresh: (run: DeploymentRun) => Promise<DeploymentRun>;
   onSaveManifest: (manifestYaml: string) => Promise<boolean>;
+  onServerChange: (server: ServerForm) => void;
   onSelectVersion: (runId: string) => void;
+  onShowSettings: () => void;
   onShowVersions: () => void;
   onShowTest: () => void;
   path: string;
@@ -4226,6 +5631,8 @@ function ProductionScene({
   verifiedRuns: DeploymentRun[];
   workspace: WorkspacePreview;
 }) {
+  const [initialServer, setInitialServer] = useState(savedServer);
+  useEffect(() => setInitialServer(savedServer), [savedServer]);
   const restoreWebSaveSnapshot = Boolean(
     initialServer && initialWebSavePending,
   );
@@ -4258,9 +5665,22 @@ function ProductionScene({
   const [dnsTargetCopied, setDnsTargetCopied] = useState(false);
   const [dnsProviders, setDnsProviders] = useState<DnsProviderHint[]>([]);
   const [dnsProviderChecking, setDnsProviderChecking] = useState(false);
-  const [cnbAuthorizationDialog, setCnbAuthorizationDialog] = useState(false);
+  const [publicRouteStatuses, setPublicRouteStatuses] = useState<
+    PublicRouteStatus[]
+  >(production?.routeChecks ?? []);
+  const [retryingCertificates, setRetryingCertificates] = useState(false);
+  const [cnbAuthorizationDialog, setCnbAuthorizationDialog] = useState(
+    initialCnbAuthorizationOpen,
+  );
   const [cnbToken, setCnbToken] = useState("");
   const [authorizingCnb, setAuthorizingCnb] = useState(false);
+  const [cnbAuthorizationFeedback, setCnbAuthorizationFeedback] =
+    useState<CnbAuthorizationFeedback | null>(null);
+  useCnbAuthorizationDialogVisibility(
+    cnbAuthorizationDialog,
+    cnbAuthorizationSource,
+    onCnbAuthorizationOpenChange,
+  );
   const [routeCheck, setRouteCheck] = useState<RouteConflictCheck | null>(null);
   const [checkingRoutes, setCheckingRoutes] = useState(false);
   const [takeoverDialog, setTakeoverDialog] = useState(false);
@@ -4427,7 +5847,37 @@ function ProductionScene({
     () => environmentAddresses(workspace, "production"),
     [workspace.manifestYaml],
   );
+  const showsDetailedRouteStatus =
+    production?.actionKind === "route-check" ||
+    production?.actionKind === "route-takeover" ||
+    production?.actionKind === "route-repair";
   const dnsRecordType = dnsRecordTypeForTarget(initialServer?.host);
+  useEffect(() => {
+    setPublicRouteStatuses(
+      showsDetailedRouteStatus ? (production?.routeChecks ?? []) : [],
+    );
+  }, [production?.id, production?.routeChecks, showsDetailedRouteStatus]);
+  const publicRouteStatusByHost = useMemo(
+    () =>
+      new Map(
+        publicRouteStatuses.map((check) => [
+          check.host.trim().toLowerCase(),
+          check,
+        ]),
+      ),
+    [publicRouteStatuses],
+  );
+  const readyPublicRouteCount = publicRouteStatuses.filter(
+    (check) => check.reachable || check.phase === "ready",
+  ).length;
+  const conflictingRouteCount = publicRouteStatuses.filter(
+    (check) => check.phase === "route-conflict",
+  ).length;
+  const missingRouteCount = publicRouteStatuses.filter(
+    (check) => check.phase === "route-missing",
+  ).length;
+  const hasCertificatePendingRoute =
+    certificateOnlyRouteFailure(publicRouteStatuses);
   useEffect(() => {
     const hosts = Array.from(
       new Set(productionAddresses.map((address) => address.host)),
@@ -4501,13 +5951,18 @@ function ProductionScene({
     const currentProduction = production;
     const verifiedCandidate = productionVersion;
     const addresses = productionAddresses;
-    const needsCnbAuthorization = production.issueCode === "AD-CNB-103";
+    const needsCnbAuthorization = ["AD-CNB-101", "AD-CNB-103"].includes(
+      production.issueCode ?? "",
+    );
     const needsNewTestVersion = production.issueCode === "AD-REL-204";
     const needsRouteTakeover = production.issueCode === "AD-SRV-206";
     const needsRouteRepair = production.issueCode === "AD-SRV-209";
+    const addressCheckInterrupted = production.issueCode === "AD-NET-202";
     const canRetry = Boolean(
       initialServer &&
-      (production.issueCode === "AD-CNB-202" ||
+      production.actionKind !== "route-check" &&
+      (production.actionKind === "retry-production-preparation" ||
+        production.issueCode === "AD-CNB-202" ||
         (production.status === "failed" &&
           !needsCnbAuthorization &&
           !needsNewTestVersion &&
@@ -4515,12 +5970,43 @@ function ProductionScene({
           !needsRouteRepair)),
     );
     async function authorizeAndRetry() {
-      if (!initialServer || !cnbToken.trim()) return;
+      if (!cnbToken.trim()) return;
       setAuthorizingCnb(true);
+      setCnbAuthorizationFeedback(null);
       try {
-        await connectCnb(cnbToken, true, currentProduction.repository);
-        await onPromote(verifiedCandidate, initialServer);
+        try {
+          await connectCnb(cnbToken, true, currentProduction.repository);
+        } catch (error) {
+          setCnbAuthorizationFeedback({
+            message: cnbAuthorizationFeedbackMessage(error),
+            title: "新令牌未保存，当前任务仍使用原授权",
+            tone: "error",
+          });
+          return;
+        }
         setCnbToken("");
+        // 授权属于当前生产任务的停点。保存后只恢复这一个任务，不能
+        // 新建 production run，也不能重新构建已经测试通过的镜像。
+        let refreshed: DeploymentRun;
+        try {
+          refreshed = await onRefresh(currentProduction);
+        } catch (error) {
+          setCnbAuthorizationFeedback({
+            message: `${cnbAuthorizationFeedbackMessage(error)}。稍后可以直接重新检查当前任务。`,
+            title: "新令牌已保存，但这次状态检查没有完成",
+            tone: "warning",
+          });
+          return;
+        }
+        if (stillNeedsCnbAuthorization(refreshed)) {
+          setCnbAuthorizationFeedback({
+            message: `请同时检查授权范围和使用范围；使用范围必须包含 ${currentProduction.repository} 或全部仓库。`,
+            title: "新令牌已保存，但 CNB 仍拒绝读取当前仓库",
+            tone: "warning",
+          });
+          return;
+        }
+        setCnbAuthorizationFeedback(null);
         setCnbAuthorizationDialog(false);
       } catch (error) {
         onError(toMessage(error));
@@ -4566,6 +6052,22 @@ function ProductionScene({
         onError(toMessage(error));
       } finally {
         setReapplyingRoutes(false);
+      }
+    }
+    async function retryCertificates() {
+      if (retryingCertificates) return;
+      setRetryingCertificates(true);
+      try {
+        const checks = await retryDeploymentCertificates(currentProduction.id);
+        setPublicRouteStatuses(checks);
+        const refreshed = await onRefresh(currentProduction);
+        if (refreshed.routeChecks?.length) {
+          setPublicRouteStatuses(refreshed.routeChecks);
+        }
+      } catch (error) {
+        onError(`重试 HTTPS 证书没有完成：${toMessage(error)}`);
+      } finally {
+        setRetryingCertificates(false);
       }
     }
     async function checkProduction() {
@@ -4621,14 +6123,18 @@ function ProductionScene({
             production.actionKind === "redeploy-test"
               ? "项目增加了新服务，先部署并验证一个新的测试版本。"
               : production.actionKind === "route-check"
-                ? "服务已经在服务器运行，现在只需要设置正式地址。"
-                : production.actionKind === "route-repair"
-                  ? "服务已经在服务器运行，现在只需要重新应用正式地址。"
-                  : production.status === "success"
-                    ? addresses.length
-                      ? "当前使用测试通过的同一版本，正式地址可以访问。"
-                      : "当前使用测试通过的同一版本，服务运行正常。"
-                    : "正式版使用测试通过的同一版本。"
+                ? addressCheckInterrupted
+                  ? "服务已经在服务器运行；这次地址检查没有完成，网络恢复后会自动继续。"
+                  : "服务已经在服务器运行，现在只需要设置正式地址。"
+                : production.actionKind === "route-takeover"
+                  ? "新版本已经运行；未冲突地址可以先恢复，旧地址由你确认是否切换。"
+                  : production.actionKind === "route-repair"
+                    ? "服务已经在服务器运行，现在只需要重新应用正式地址。"
+                    : production.status === "success"
+                      ? addresses.length
+                        ? "当前使用测试通过的同一版本，正式地址可以访问。"
+                        : "当前使用测试通过的同一版本，服务运行正常。"
+                      : "正式版使用测试通过的同一版本。"
           }
           title={
             production.status === "success"
@@ -4652,21 +6158,77 @@ function ProductionScene({
                   : "还没有在这台电脑检查过运行状态 · 页面显示最近一次部署结果"}
           </p>
         ) : null}
-        <CurrentVersionBanner label="当前正式版本" run={verifiedCandidate} />
+        {currentProductionVersion ? (
+          <CurrentVersionBanner
+            label="当前正式版本"
+            run={currentProductionVersion}
+          />
+        ) : null}
+        {!currentProductionVersion ||
+        versionKey(currentProductionVersion) !==
+          versionKey(verifiedCandidate) ? (
+          <CurrentVersionBanner
+            label={
+              production.status === "success" ? "当前正式版本" : "本次发布版本"
+            }
+            run={verifiedCandidate}
+          />
+        ) : null}
         {production.status !== "success" ? (
           <DeploymentState
+            compactCheckStatus={
+              addressCheckInterrupted
+                ? "本次检查中断"
+                : hasCertificatePendingRoute
+                  ? "DNS 已生效，HTTPS 证书未就绪"
+                  : undefined
+            }
             compactMessage={
               production.actionKind === "route-check"
-                ? "服务已经启动，不会重复部署。新增或确认下方解析记录后，点击“检查并完成发布”。"
-                : undefined
+                ? addressCheckInterrupted
+                  ? "服务已经启动，不会重复部署。请确认本机网络，恢复后系统会自动继续检查。"
+                  : hasCertificatePendingRoute
+                    ? "服务和 DNS 都已准备好。点击“重试证书”只会重新加载 Caddy 并检查 HTTPS，不会重复部署。"
+                    : "服务已经启动，不会重复部署。请根据下方每个地址的状态继续处理。"
+                : production.actionKind === "route-takeover"
+                  ? missingRouteCount > 0
+                    ? "新版本已经在服务器运行。你可以先恢复未冲突地址，不会切换正在使用的旧服务；旧地址稍后再确认接管。"
+                    : "新版本已经在服务器运行，未冲突的地址会继续使用；确认后只切换仍在使用旧服务的地址。"
+                  : production.actionKind === "route-repair"
+                    ? "新版本已经在服务器运行，只需恢复下方尚未启用的访问地址。"
+                    : undefined
             }
             compactTitle={
               production.actionKind === "route-check"
-                ? "还差设置正式地址"
-                : undefined
+                ? addressCheckInterrupted
+                  ? "地址检查暂时没有完成"
+                  : hasCertificatePendingRoute
+                    ? "还差 HTTPS 证书"
+                    : "还差设置正式地址"
+                : production.actionKind === "route-takeover"
+                  ? `${conflictingRouteCount || 1} 个地址仍在使用旧服务`
+                  : production.actionKind === "route-repair"
+                    ? `${missingRouteCount || 1} 个地址尚未启用`
+                    : undefined
             }
             secondaryAction={
-              production.actionKind === "route-check" && initialServer ? (
+              needsRouteTakeover && missingRouteCount > 0 ? (
+                <Button
+                  disabled={reapplyingRoutes}
+                  onClick={() => void reapplyRoutes()}
+                  size="sm"
+                  variant="secondary"
+                >
+                  {reapplyingRoutes ? (
+                    <LoaderCircle className="animate-spin-slow" />
+                  ) : (
+                    <RefreshCw />
+                  )}
+                  {reapplyingRoutes ? "正在恢复其他地址" : "先恢复其他地址"}
+                </Button>
+              ) : production.actionKind === "route-check" &&
+                initialServer &&
+                !addressCheckInterrupted ? (
                 <Button
                   onClick={() => void copyDnsTarget()}
                   size="sm"
@@ -4713,6 +6275,17 @@ function ProductionScene({
                   )}
                   重新应用地址
                 </Button>
+              ) : hasCertificatePendingRoute ? (
+                <Button
+                  disabled={retryingCertificates}
+                  onClick={() => void retryCertificates()}
+                  size="sm"
+                >
+                  <RefreshCw
+                    className={retryingCertificates ? "animate-spin-slow" : ""}
+                  />
+                  {retryingCertificates ? "正在重试证书" : "重试证书"}
+                </Button>
               ) : canRetry ? (
                 <Button
                   disabled={publishing}
@@ -4721,6 +6294,8 @@ function ProductionScene({
                     setPublishing(true);
                     try {
                       await onPromote(verifiedCandidate, initialServer);
+                    } catch {
+                      // 失败已经由 App 写回当前 durable task；继续显示该任务。
                     } finally {
                       setPublishing(false);
                     }
@@ -4737,20 +6312,25 @@ function ProductionScene({
               ) : undefined
             }
             onError={onError}
+            pauseAutoRecheck={cnbAuthorizationDialog || retryingCertificates}
             run={production}
             onRefresh={onRefresh}
           />
         ) : null}
-        {production.actionKind === "route-check" &&
-        initialServer &&
-        addresses.length ? (
+        {showsDetailedRouteStatus && initialServer && addresses.length ? (
           <Section
-            title="设置正式访问地址"
-            trailing={`${addresses.length} 个地址`}
+            title="正式访问地址状态"
+            trailing={`${readyPublicRouteCount}/${addresses.length} 可以访问`}
           >
             <div className="mb-3 flex flex-col items-start gap-3 min-[760px]:flex-row min-[760px]:items-center min-[760px]:justify-between">
               <p className="m-0 text-xs leading-5 text-[var(--muted-foreground)]">
-                在域名平台新增以下记录；若记录已存在，确认记录值一致即可。
+                {production.actionKind === "route-takeover"
+                  ? missingRouteCount > 0
+                    ? "未冲突的地址可以单独恢复；只有标记为旧服务的地址需要你确认切换。"
+                    : "未冲突的地址会继续使用；只有标记为旧服务的地址需要你确认切换。"
+                  : production.actionKind === "route-repair"
+                    ? "服务已经启动；重新应用地址只会修复 Caddy 路由，不会重新部署版本。"
+                    : "系统会分别检查 DNS 和 HTTPS；根据每个地址右侧的实际状态继续处理即可。"}
               </p>
               {dnsProviders.length ? (
                 <div className="flex flex-wrap gap-2">
@@ -4770,15 +6350,42 @@ function ProductionScene({
               ) : null}
             </div>
             <div className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
-              {addresses.map((item) => (
-                <StatusRow
-                  detail={`${dnsHostRecordLabel(item.host, dnsProviders, dnsProviderChecking)} · 类型 ${dnsRecordType} · 记录值 ${initialServer.host}`}
-                  key={item.service}
-                  label={item.host}
-                  state="warning"
-                  status="待添加或生效"
-                />
-              ))}
+              {addresses.map((item) => {
+                const check = publicRouteStatusByHost.get(
+                  item.host.trim().toLowerCase(),
+                );
+                const presentation = publicRouteStatusPresentation(
+                  check,
+                  publicRouteStatuses.length === 0,
+                );
+                const recordDetail = `${dnsHostRecordLabel(item.host, dnsProviders, dnsProviderChecking)} · 类型 ${dnsRecordType} · 记录值 ${initialServer.host}`;
+                const detail = check?.message
+                  ? check.phase === "dns"
+                    ? `${recordDetail} · ${check.message}`
+                    : check.message
+                  : recordDetail;
+                return (
+                  <StatusRow
+                    action={
+                      presentation.state === "success" ? (
+                        <Button
+                          onClick={() => void openUrl(item.url)}
+                          size="sm"
+                          variant="ghost"
+                        >
+                          <ExternalLink />
+                          打开
+                        </Button>
+                      ) : undefined
+                    }
+                    detail={detail}
+                    key={item.service}
+                    label={item.host}
+                    state={presentation.state}
+                    status={presentation.status}
+                  />
+                );
+              })}
             </div>
           </Section>
         ) : null}
@@ -4812,12 +6419,19 @@ function ProductionScene({
         ) : null}
         <CnbAuthorizationDialog
           description="保存新授权后会继续发布当前选中的测试通过版本，不会重新构建镜像。"
+          feedback={cnbAuthorizationFeedback}
           fieldId="production-cnb-token"
-          onOpenChange={setCnbAuthorizationDialog}
+          onOpenChange={(open) => {
+            setCnbAuthorizationDialog(open);
+            if (!open) setCnbAuthorizationFeedback(null);
+          }}
           onSubmit={() => void authorizeAndRetry()}
-          onTokenChange={setCnbToken}
+          onTokenChange={(value) => {
+            setCnbToken(value);
+            setCnbAuthorizationFeedback(null);
+          }}
           open={cnbAuthorizationDialog}
-          submitDisabled={!initialServer}
+          repository={currentProduction.repository}
           submitLabel="保存授权并继续发布"
           title="更新 CNB 授权"
           token={cnbToken}
@@ -4888,7 +6502,7 @@ function ProductionScene({
               ? "完成后系统会生成并部署测试版；只有你确认通过的版本才能发布给真实用户。"
               : "正式版必须使用你已经验证过的测试版本，不会重新生成另一个版本。"}
           </p>
-          <Button onClick={needsInitialSetup ? onShowVersions : onShowTest}>
+          <Button onClick={needsInitialSetup ? onShowSettings : onShowTest}>
             {needsInitialSetup ? "继续完成设置" : "前往测试版"}
           </Button>
         </div>
@@ -4896,12 +6510,10 @@ function ProductionScene({
     );
   }
   const candidate = verifiedRun;
-  const currentProductionVersion = production?.sourceRunId
-    ? verifiedRuns.find((run) => run.id === production.sourceRunId)
-    : undefined;
   const restoring = isOlderVersion(candidate, currentProductionVersion);
-  const activePreparation =
-    productionConfigChecking || !configReady || editingConfig
+  const activePreparation = !initialServer
+    ? "server"
+    : productionConfigChecking || !configReady || editingConfig
       ? "config"
       : !domainReady || editingDomains
         ? "domain"
@@ -4928,6 +6540,10 @@ function ProductionScene({
     try {
       await onPromote(candidate, initialServer);
       setPublishConfirmationOpen(false);
+    } catch {
+      // App 会把失败原因持久化到同一个正式发布任务，并负责统一提示。
+      // 这里吞掉已处理的拒绝，避免 `void publish()` 产生未处理 Promise，
+      // 同时让父层传回的 needs_action 任务接管后续“继续发布”界面。
     } finally {
       setPublishing(false);
     }
@@ -5076,7 +6692,22 @@ function ProductionScene({
           </div>
         </Section>
       ) : null}
-      {activePreparation === "config" ? (
+      {activePreparation === "server" ? (
+        <Section title="正式环境服务器" trailing="首次发布前设置">
+          <p className="mb-4 mt-0 text-xs leading-5 text-[var(--muted-foreground)]">
+            选择正式版本实际运行的服务器。它可以和测试服务器不同，保存后以后会自动复用。
+          </p>
+          <ServerPreparation
+            environment="production"
+            onError={onError}
+            onReady={(next) => {
+              setInitialServer(next);
+              onServerChange(next);
+            }}
+            path={path}
+          />
+        </Section>
+      ) : activePreparation === "config" ? (
         <Section
           title={
             productionConfigChecking
@@ -5222,12 +6853,6 @@ function ProductionScene({
           正在确认正式地址是否可以安全切换
         </div>
       ) : null}
-      {!initialServer ? (
-        <IssueBanner
-          message="测试服务器信息未恢复，请回到测试版重新确认运行服务器。"
-          title={restoring ? "还不能恢复正式版" : "还不能发布正式版"}
-        />
-      ) : null}
       {activePreparation === "publish" ? (
         <div className="mt-6 flex items-center justify-between gap-5 border-t border-[var(--border)] pt-5">
           <span className="text-xs text-[var(--muted-foreground)]">
@@ -5341,6 +6966,10 @@ export function CnbSecretSetup({
   const [generating, setGenerating] = useState(false);
   const [working, setWorking] = useState(false);
   const automaticResumeStarted = useRef(false);
+  const copiedSecretContent = useRef("");
+  const copiedSecretCleanupTimer = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   const verifiedRepository = useRef("");
   const repositoryCheckRequest = useRef<{
     promise: ReturnType<typeof checkCnbSecretRepositoryAccess>;
@@ -5355,6 +6984,40 @@ export function CnbSecretSetup({
   const resumingSave = resumeStage === "save-page-opened";
   const contentCopied = copyStatus.startsWith("配置内容已复制");
   const resumedSaveChoice = resumingSave && !redoingSave && !contentCopied;
+
+  function stopTrackingCopiedSecret() {
+    if (copiedSecretCleanupTimer.current) {
+      clearTimeout(copiedSecretCleanupTimer.current);
+      copiedSecretCleanupTimer.current = null;
+    }
+    copiedSecretContent.current = "";
+  }
+
+  async function clearCopiedSecret() {
+    const content = copiedSecretContent.current;
+    stopTrackingCopiedSecret();
+    if (content) await clearClipboardIfUnchanged(content);
+  }
+
+  function trackCopiedSecret(content: string) {
+    stopTrackingCopiedSecret();
+    copiedSecretContent.current = content;
+    copiedSecretCleanupTimer.current = setTimeout(
+      () => {
+        const current = copiedSecretContent.current;
+        stopTrackingCopiedSecret();
+        if (current) void clearClipboardIfUnchanged(current);
+      },
+      2 * 60 * 1000,
+    );
+  }
+
+  useEffect(
+    () => () => {
+      void clearCopiedSecret();
+    },
+    [],
+  );
 
   function requestRepositoryAccess(repositoryName: string) {
     const existing = repositoryCheckRequest.current;
@@ -5629,6 +7292,7 @@ export function CnbSecretSetup({
     setWorking(true);
     try {
       await copyText(name);
+      stopTrackingCopiedSecret();
       await setAppSetting(repositoryKey, repository.trim());
       setCreationHint(
         "名称已经复制。请在网页中粘贴名称，选择“密钥仓库”并创建，完成后回到这里。",
@@ -5646,6 +7310,7 @@ export function CnbSecretSetup({
     setWorking(true);
     try {
       await copyText(currentBundle.content);
+      trackCopiedSecret(currentBundle.content);
       setCopyStatus("配置内容已复制，请回到网页粘贴并保存");
     } catch (error) {
       onError(toMessage(error));
@@ -5662,6 +7327,7 @@ export function CnbSecretSetup({
       // Copy the filename before opening so the first paste has one clear
       // destination; the user can then return here to copy the secret content.
       await copyText(currentBundle.filename);
+      stopTrackingCopiedSecret();
       setCopyStatus("文件名已复制");
       await openUrl(cnbNewFileUrl(repository, currentBundle.filename));
       await saveResumeStage("save-page-opened");
@@ -5712,6 +7378,9 @@ export function CnbSecretSetup({
         );
       }
       await clearClipboardIfUnchanged(currentBundle.content);
+      stopTrackingCopiedSecret();
+      setBundle(null);
+      setCopyStatus("");
       setEditing(false);
       setReady(true);
       onReadyChange(true);
@@ -5896,6 +7565,7 @@ export function CnbSecretSetup({
                   void setAppSetting(repositoryKey, repository.trim());
               }}
               onChange={(event) => {
+                void clearCopiedSecret();
                 setRepository(event.target.value);
                 setRepositoryPreviouslyUsed(false);
                 setRepositoryAvailability("idle");
@@ -5952,7 +7622,7 @@ export function CnbSecretSetup({
               : repositoryAvailability === "error"
                 ? "网络或授权可能暂时不可用，请重新检查。"
                 : reusableRepositoryReady
-                  ? "同一 CNB 账号可以复用，不需要重新创建。"
+                  ? "当前授权的使用范围包含此位置时可以复用，不需要重新创建。"
                   : "无需填写，打开网页时会自动复制仓库名称。"}
           </span>
         </div>
@@ -6493,12 +8163,16 @@ export function runtimeVariableOptionalManifest(
 }
 
 function RepositoryPreparation({
+  cnbAuthorizationSource,
+  onCnbAuthorizationOpenChange,
   onError,
   onReady,
   onSaveManifest,
   repository,
   workspace,
 }: {
+  cnbAuthorizationSource: string;
+  onCnbAuthorizationOpenChange: CnbAuthorizationOpenReporter;
   onError: (message: string) => void;
   onReady: (repository: string) => void;
   onSaveManifest: (manifestYaml: string) => Promise<boolean>;
@@ -6516,11 +8190,16 @@ function RepositoryPreparation({
   const [editing, setEditing] = useState(false);
   const [repositoryAccessError, setRepositoryAccessError] = useState("");
   const [repositoryChecking, setRepositoryChecking] = useState(false);
+  const [authorizationFeedback, setAuthorizationFeedback] =
+    useState<CnbAuthorizationFeedback | null>(null);
+  useCnbAuthorizationDialogVisibility(
+    tokenDialog,
+    `${cnbAuthorizationSource}:repository`,
+    onCnbAuthorizationOpenChange,
+  );
   const onReadyRef = useRef(onReady);
   const accountLoadSequence = useRef(0);
   const accountSlowTimer = useRef<number | null>(null);
-  const isHistoryOnlyError = (message: string) =>
-    message.includes("repo-cnb-history:r");
   const loadAccount = useCallback(() => {
     const sequence = accountLoadSequence.current + 1;
     accountLoadSequence.current = sequence;
@@ -6579,15 +8258,27 @@ function RepositoryPreparation({
     let cancelled = false;
     setRepositoryAccessError("");
     setRepositoryChecking(true);
-    // 仓库地址已经由用户确认并保存在项目清单中，先恢复准备状态，再在
-    // 后台校验当前授权。真正同步代码时仍会执行完整鉴权并给出可操作错误。
-    onReadyRef.current(repository);
+    // 已保存的仓库在背景重新核权时先保留当前显示状态。如果这里
+    // 立即回传未完成，父层会收起并重新挂载此步骤，导致重复请求。
+    // 只在服务端真正拒绝访问后才回退为未完成；首次保存仓库
+    // 仍由 saveRepository 保证必须先通过核权。
     checkCnbRepositoryAccess(repository)
-      .then(() => undefined)
+      .then((check) => {
+        if (cancelled) return;
+        const failure = cnbRepositoryAccessFailure(check);
+        if (failure) {
+          setRepositoryAccessError(failure);
+          onReadyRef.current("");
+          return;
+        }
+        setRepositoryAccessError("");
+        onReadyRef.current(repository);
+      })
       .catch((error) => {
         if (cancelled) return;
         const message = toMessage(error);
         setRepositoryAccessError(message);
+        onReadyRef.current("");
       })
       .finally(() => {
         if (!cancelled) setRepositoryChecking(false);
@@ -6599,33 +8290,65 @@ function RepositoryPreparation({
   async function connect() {
     if (!token.trim()) return;
     setWorking(true);
+    setAuthorizationFeedback(null);
     try {
-      const connected = await connectCnb(
-        token,
-        true,
-        usableRepository(repository) ? repository : undefined,
-      );
+      let connected: CnbAccount;
+      try {
+        connected = await connectCnb(
+          token,
+          true,
+          usableRepository(repository) ? repository : undefined,
+        );
+      } catch (error) {
+        setAuthorizationFeedback({
+          message: cnbAuthorizationFeedbackMessage(error),
+          title: "新令牌未保存，仍保留原来的 CNB 连接",
+          tone: "error",
+        });
+        return;
+      }
       setAccount(connected);
       setAccountError("");
       setToken("");
-      setTokenDialog(false);
-    } catch (error) {
-      onError(toMessage(error));
+      setAuthorizationFeedback(null);
+      if (usableRepository(repository)) {
+        setRepositoryChecking(true);
+        try {
+          const check = await checkCnbRepositoryAccess(repository);
+          const failure = cnbRepositoryAccessFailure(check);
+          if (failure) throw new Error(failure);
+          setRepositoryAccessError("");
+          onReadyRef.current(repository);
+          setTokenDialog(false);
+        } catch (error) {
+          const message = toMessage(error);
+          setRepositoryAccessError(message);
+          onReadyRef.current("");
+          setAuthorizationFeedback({
+            message: cnbAuthorizationFeedbackMessage(error),
+            title: "新令牌已保存，但 CNB 仍拒绝读取当前仓库",
+            tone: "error",
+          });
+        } finally {
+          setRepositoryChecking(false);
+        }
+      } else {
+        setRepositoryAccessError("");
+        setTokenDialog(false);
+      }
     } finally {
       setWorking(false);
     }
   }
   async function saveRepository(next: string) {
     try {
-      await checkCnbRepositoryAccess(next);
+      const check = await checkCnbRepositoryAccess(next);
+      const failure = cnbRepositoryAccessFailure(check);
+      if (failure) throw new Error(failure);
       setRepositoryAccessError("");
     } catch (error) {
-      const message = toMessage(error);
-      setRepositoryAccessError(message);
-      if (!isHistoryOnlyError(message)) {
-        onError(message);
-        return;
-      }
+      setRepositoryAccessError(toMessage(error));
+      return;
     }
     const document = parseDocument(workspace.manifestYaml);
     document.setIn(["providers", "build", "repository"], next);
@@ -6678,23 +8401,31 @@ function RepositoryPreparation({
   }
   const authorizationDialog = (
     <CnbAuthorizationDialog
-      description="连接后，同一 CNB 账号可以用于所有项目。请在创建令牌时勾选下面 5 项。"
+      description="连接后，授权会统一保存在本机。创建令牌时需要同时设置授权范围和使用范围。"
+      feedback={authorizationFeedback}
       fieldId="cnb-token"
       fieldLabel="访问令牌"
-      onOpenChange={setTokenDialog}
+      onOpenChange={(open) => {
+        setTokenDialog(open);
+        if (!open) setAuthorizationFeedback(null);
+      }}
       onSubmit={() => void connect()}
-      onTokenChange={setToken}
+      onTokenChange={(value) => {
+        setToken(value);
+        setAuthorizationFeedback(null);
+      }}
       open={tokenDialog}
+      repository={usableRepository(repository) ? repository : undefined}
       submitLabel="验证账号并连接"
       title="连接 CNB"
       token={token}
       working={working}
     />
   );
+  const repositoryIssue = repositoryAccessError
+    ? issueFromUnknown(repositoryAccessError)
+    : null;
   if (!editing && usableRepository(repository)) {
-    const repositoryIssue = repositoryAccessError
-      ? issueFromUnknown(repositoryAccessError)
-      : null;
     return (
       <>
         <div className="flex items-center justify-between gap-4">
@@ -6709,15 +8440,13 @@ function RepositoryPreparation({
               className={`mt-1 block text-xs ${repositoryIssue ? "text-[var(--warning)]" : repositoryChecking ? "text-[var(--muted-foreground)]" : "text-[var(--success)]"}`}
             >
               {repositoryIssue
-                ? isHistoryOnlyError(repositoryAccessError)
-                  ? "代码仓库可用；版本列表暂不可同步"
-                  : repositoryIssue.message
+                ? repositoryIssue.title
                 : repositoryChecking
                   ? "正在检查代码仓库"
                   : "代码仓库可用"}
             </span>
             <span className="mt-1 block text-[11px] leading-4 text-[var(--muted-foreground)]">
-              当前 CNB 授权供所有项目复用；真正同步或构建前会再次核对权限。
+              授权统一保存在本机；只有使用范围包含此仓库时才能复用。
             </span>
           </div>
           <div className="flex gap-1">
@@ -6777,7 +8506,7 @@ function RepositoryPreparation({
             <span>
               <span className="block">CNB 账号：{account.displayName}</span>
               <span className="mt-1 block text-[11px] text-[var(--muted-foreground)]">
-                已安全保存，其他项目也可以直接使用
+                已安全保存在本机；使用范围包含项目仓库时可以复用
               </span>
             </span>
           </span>
@@ -6797,6 +8526,23 @@ function RepositoryPreparation({
           </Button>
         </div>
       )}
+      {repositoryIssue ? (
+        <div className="mt-4">
+          <IssueBanner
+            action={
+              <Button onClick={() => setTokenDialog(true)} size="sm">
+                <KeyRound />
+                更新授权
+              </Button>
+            }
+            message={repositoryIssue.message}
+            nextStep={repositoryIssue.nextSteps[0]}
+            technicalCode={repositoryIssue.code}
+            technicalDetails={repositoryIssue.technicalDetails}
+            title={repositoryIssue.title}
+          />
+        </div>
+      ) : null}
       {account?.connected ? (
         <div className="mt-4 rounded-md border border-[var(--border)] bg-[var(--muted)]/35 p-4">
           {existingRepository ? (
@@ -6845,7 +8591,10 @@ function RepositoryPreparation({
             <div className="flex min-w-[320px] flex-1 gap-2 max-[760px]:min-w-0 max-[760px]:basis-full max-[760px]:flex-col">
               <Input
                 aria-label="已有代码仓库"
-                onChange={(event) => setCustomRepository(event.target.value)}
+                onChange={(event) => {
+                  setCustomRepository(event.target.value);
+                  setRepositoryAccessError("");
+                }}
                 placeholder="或填写已有仓库，例如 team/project"
                 value={customRepository}
               />
@@ -6868,11 +8617,13 @@ function RepositoryPreparation({
 }
 
 export function ServerPreparation({
+  environment = "staging",
   initialServer,
   onError,
   onReady,
   path,
 }: {
+  environment?: "staging" | "production";
   initialServer?: ServerForm;
   onError: (message: string) => void;
   onReady: (server: ServerForm) => void;
@@ -6880,7 +8631,7 @@ export function ServerPreparation({
 }) {
   const [form, setForm] = useState<ServerForm>(
     initialServer ?? {
-      name: "测试服务器",
+      name: environment === "production" ? "正式服务器" : "测试服务器",
       host: "",
       user: "ubuntu",
       port: 22,
@@ -6899,10 +8650,6 @@ export function ServerPreparation({
     if (initialServer) setForm(initialServer);
   }, [initialServer]);
   useEffect(() => {
-    if (initialServer) {
-      setSavedServers([]);
-      return;
-    }
     let active = true;
     listServers()
       .then((servers) => {
@@ -6911,7 +8658,11 @@ export function ServerPreparation({
           (server) => server.keyPathExists && Boolean(server.hostFingerprint),
         );
         setSavedServers(reusable);
-        if (reusable.length === 1 && !automaticReuseStarted.current) {
+        if (
+          !initialServer &&
+          reusable.length === 1 &&
+          !automaticReuseStarted.current
+        ) {
           automaticReuseStarted.current = true;
           const selected = serverFormFromResource(reusable[0]);
           setForm(selected);
@@ -6925,13 +8676,12 @@ export function ServerPreparation({
   }, [initialServer, path]);
 
   async function finishConnection(next: ServerForm) {
-    const bound = await bindProjectServer(path, "staging", next);
+    const bound = await bindProjectServer(path, environment, next);
     const ready = {
       ...next,
       hostFingerprint: bound.hostFingerprint ?? next.hostFingerprint,
     };
     setForm(ready);
-    setSavedServers([]);
     setEditing(false);
     setFingerprint("");
     setPasswordRequired(false);
@@ -7056,7 +8806,7 @@ export function ServerPreparation({
           size="sm"
           variant="ghost"
         >
-          重新连接
+          更换或修复连接
         </Button>
       </div>
     );
@@ -7614,20 +9364,24 @@ function PreparationStep({
 
 function DeploymentState({
   action,
+  compactCheckStatus,
   compactMessage,
   compactTitle,
   messageOverride,
   onError,
   onRefresh,
+  pauseAutoRecheck = false,
   run,
   secondaryAction,
 }: {
   action?: React.ReactNode;
+  compactCheckStatus?: string;
   compactMessage?: string;
   compactTitle?: string;
   messageOverride?: string;
   onError: (message: string) => void;
   onRefresh: (run: DeploymentRun) => Promise<DeploymentRun>;
+  pauseAutoRecheck?: boolean;
   run: DeploymentRun;
   secondaryAction?: React.ReactNode;
 }) {
@@ -7691,7 +9445,7 @@ function DeploymentState({
     }
   }, []);
   useEffect(() => {
-    if (!recheckOnReturn) return;
+    if (!recheckOnReturn || pauseAutoRecheck) return;
     let timer = 0;
     let interval = 0;
     const scheduleRecheck = (identity = "") => {
@@ -7720,7 +9474,14 @@ function DeploymentState({
       window.removeEventListener("focus", recheckOnFocus);
       document.removeEventListener("visibilitychange", recheckOnFocus);
     };
-  }, [recheckOnReturn, refresh, run.actionKind, run.id, run.issueCode]);
+  }, [
+    pauseAutoRecheck,
+    recheckOnReturn,
+    refresh,
+    run.actionKind,
+    run.id,
+    run.issueCode,
+  ]);
   return (
     <div
       className={`rounded-lg border p-5 ${issue ? "border-[var(--warning)]/35 bg-[var(--warning-soft)]" : run.status === "success" ? "border-[var(--success)]/25 bg-[var(--success-soft)]" : "border-[var(--border)] bg-[var(--surface)]"}`}
@@ -7776,7 +9537,9 @@ function DeploymentState({
                 {compactTitle ? (
                   <>
                     最近检查：{lastCheckedAt}
-                    {run.actionKind === "route-check" ? " · 地址还未生效" : ""}
+                    {run.actionKind === "route-check"
+                      ? ` · ${compactCheckStatus ?? "地址还未生效"}`
+                      : ""}
                   </>
                 ) : run.status === "success" ? (
                   <>
@@ -8246,6 +10009,43 @@ function usableRepository(repository: string) {
   );
 }
 
+function usableRegistryNamespace(namespace: string) {
+  const value = namespace.trim();
+  return Boolean(value && !value.includes("replace-me"));
+}
+
+export function inferredReleaseSetupBlocker(
+  manifestYaml: string,
+  stagingServer: ServerForm | undefined,
+  storedStep: string | null | undefined,
+): ReleaseSetupBlocker {
+  const repository = readRepository(manifestYaml);
+  if (!usableRepository(repository)) return "source-connection";
+
+  const storedBlocker = legacySetupStepBlocker(storedStep);
+  const registry = readRegistry(manifestYaml);
+  if (
+    registry.kind !== "cnb" &&
+    (!usableRegistryNamespace(registry.namespace) ||
+      !storedBlocker ||
+      storedBlocker === "registry-connection")
+  ) {
+    return "registry-connection";
+  }
+  if (!stagingServer) return "test-server";
+  if (
+    storedBlocker === "test-config" ||
+    storedBlocker === "test-address" ||
+    storedBlocker === "automation"
+  ) {
+    return storedBlocker;
+  }
+  // The manifest and server do not prove that required runtime values are
+  // present. The focused task panel verifies the saved bindings and advances
+  // to address/automation without asking the user to navigate elsewhere.
+  return "test-config";
+}
+
 function readRegistry(manifestYaml: string): {
   endpoint: string;
   kind: "cnb" | "tcr" | "oci";
@@ -8365,6 +10165,61 @@ function versionKeyForSource(
   if (!sourceRunId) return "";
   const source = runs.find((run) => run.id === sourceRunId);
   return source ? versionKey(source) : sourceRunId;
+}
+
+/**
+ * Transitional adapter while deployment commands still accept the successful
+ * staging run that produced a Version. Display facts come from ProjectVersion;
+ * the real run id is retained only as the command hand-off identifier.
+ */
+export function deploymentRunForProjectVersion(
+  version: ProjectVersion,
+  stagingAttempts: DeploymentRun[],
+  projectPath: string,
+  projectName: string,
+): DeploymentRun {
+  const successfulAttempts = stagingAttempts.filter(
+    (run) =>
+      run.environment === "staging" &&
+      run.status === "success" &&
+      run.actionKind !== "production-approval",
+  );
+  const matchingRun =
+    successfulAttempts.find((run) => run.id === version.stagingRunId) ??
+    successfulAttempts.find(
+      (run) => deploymentVersionKey(run) === version.versionKey,
+    );
+  if (matchingRun) return matchingRun;
+
+  return {
+    id:
+      version.stagingRunId ??
+      version.validation?.runId ??
+      `version:${version.id}`,
+    projectPath,
+    projectName: projectName || "project",
+    environment: "staging",
+    status: "success",
+    currentStage: "complete",
+    buildSerial: version.sourceBuildId,
+    commitSha: version.commitSha,
+    sourceTitle: version.sourceTitle,
+    sourceRunId: null,
+    candidateTag: version.candidateTag,
+    artifacts: version.artifacts,
+    // A successful run can still carry the access hand-off used to inspect
+    // that version (for example a local secure preview tunnel). Preserve the
+    // hand-off without inheriting any failure state from deployment history.
+    actionKind: null,
+    actionUrl: null,
+    issueCode: null,
+    repository: version.repository ?? "",
+    branch: version.branch ?? "main",
+    message: "不可变版本已生成",
+    completedSteps: ["complete"],
+    startedAt: version.createdAt || version.updatedAt,
+    updatedAt: version.updatedAt || version.createdAt,
+  };
 }
 
 function collapseVersionRuns(runs: DeploymentRun[]) {
@@ -8590,6 +10445,7 @@ export function dnsRecordTypeForTarget(target?: string): "A" | "AAAA" {
 }
 
 function deploymentStatus(run: DeploymentRun) {
+  if (run.issueCode === "AD-NET-202") return "地址检查中断";
   if (run.actionKind === "route-check") return "还差设置地址";
   if (run.actionKind === "route-repair") return "地址未生效";
   if (run.status === "queued") return "等待系统开始";
@@ -8648,9 +10504,13 @@ export function deploymentUpdatedAtLabel(
 export function autoRechecksDeployment(run: DeploymentRun) {
   return (
     run.status === "needs_action" &&
-    ["route-check", "route-repair", "verify-release", "cnb-builds"].includes(
-      run.actionKind ?? "",
-    )
+    [
+      "route-check",
+      "route-repair",
+      "route-takeover",
+      "verify-release",
+      "cnb-builds",
+    ].includes(run.actionKind ?? "")
   );
 }
 
@@ -8675,16 +10535,22 @@ export function deploymentRefreshLabel(run: DeploymentRun) {
 }
 
 export function deploymentNextStep(run: DeploymentRun, fallback = "") {
-  if (run.issueCode === "AD-CNB-103")
+  if (["AD-CNB-101", "AD-CNB-103"].includes(run.issueCode ?? ""))
     return "点击“更新 CNB 授权”，保存新令牌后继续当前任务";
   if (run.issueCode === "AD-CNB-202")
     return run.environment === "production"
       ? "点击“重新发布同一版本”，继续使用已经测试通过的版本"
       : "点击“重新部署当前代码”，重新创建远程测试任务";
+  if (run.actionKind === "retry-staging-preparation")
+    return "点击“继续当前部署”，系统会从刚才中断的位置重新检查并继续同一个任务";
+  if (run.actionKind === "retry-production-preparation")
+    return "点击“重新发布同一版本”，系统会继续同一个正式发布任务";
   if (run.issueCode === "AD-CTR-201")
     return run.status === "needs_action"
       ? "点击“检查服务原因”，系统会读取启动日志并给出具体处理建议"
       : "点击下方“检查后重新部署”，系统会重新核对服务状态";
+  if (run.issueCode === "AD-NET-202")
+    return "确认本机网络可用后点击“检查并完成发布”；系统只检查地址，不会重新部署";
   if (run.actionKind === "route-check") {
     return run.environment === "production"
       ? "设置好域名后点击“检查并完成发布”，不会重新部署服务"
@@ -8712,6 +10578,10 @@ export function deploymentNextStep(run: DeploymentRun, fallback = "") {
 }
 
 function deploymentTitle(run: DeploymentRun) {
+  if (run.issueCode === "AD-NET-202")
+    return run.environment === "production"
+      ? "正式版已经部署，地址检查暂时中断"
+      : "测试版已经部署，地址检查暂时中断";
   if (run.actionKind === "route-check")
     return run.environment === "production"
       ? "正式版已经部署"
@@ -8758,6 +10628,11 @@ export function deploymentMilestones(run: DeploymentRun) {
   const completed = new Set(run.completedSteps);
   const currentStage = run.currentStage;
   const successful = run.status === "success";
+  const awaitingAddressConfirmation =
+    ["failed", "needs_action"].includes(run.status) &&
+    ["route-check", "route-repair", "route-takeover"].includes(
+      run.actionKind ?? "",
+    );
   const milestones = [
     {
       label: "准备项目",
@@ -8775,19 +10650,26 @@ export function deploymentMilestones(run: DeploymentRun) {
       stages: ["prepare-server", "deploy"],
     },
     {
-      label: "确认可用",
+      label: awaitingAddressConfirmation
+        ? run.environment === "production"
+          ? "确认正式地址"
+          : "确认测试地址"
+        : "确认可用",
       done: completed.has("healthcheck"),
+      addressConfirmation: true,
       stages: ["verify-release", "healthcheck", "complete"],
     },
   ];
   return milestones.map((milestone) => ({
     label: milestone.label,
     state:
-      successful || milestone.done
-        ? ("done" as const)
-        : milestone.stages.includes(currentStage)
-          ? ("active" as const)
-          : ("pending" as const),
+      awaitingAddressConfirmation && milestone.addressConfirmation
+        ? ("active" as const)
+        : successful || milestone.done
+          ? ("done" as const)
+          : milestone.stages.includes(currentStage)
+            ? ("active" as const)
+            : ("pending" as const),
   }));
 }
 

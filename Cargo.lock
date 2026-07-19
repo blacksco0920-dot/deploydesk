@@ -1231,6 +1231,7 @@ dependencies = [
 name = "deploy-core"
 version = "0.2.0-preview.4"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "dirs",
  "percent-encoding",

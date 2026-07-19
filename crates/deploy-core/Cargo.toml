@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64.workspace = true
 chrono.workspace = true
 dirs.workspace = true
 percent-encoding.workspace = true

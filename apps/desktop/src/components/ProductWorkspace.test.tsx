@@ -4,6 +4,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useState } from "react";
@@ -12,7 +13,12 @@ import { parseDocument } from "yaml";
 import * as api from "../api";
 import { openProject } from "../api";
 import { deploymentVersionKey } from "../lib/projects";
-import type { CnbSecretBundle, DeploymentRun, ServerResource } from "../types";
+import type {
+  CnbSecretBundle,
+  DeploymentRun,
+  ProviderCheck,
+  ServerResource,
+} from "../types";
 import {
   autoRechecksDeployment,
   availableVersionRuns,
@@ -20,6 +26,7 @@ import {
   cnbNewFileUrl,
   cnbRepositoryUrl,
   CnbSecretSetup,
+  certificateOnlyRouteFailure,
   clearClipboardIfUnchanged,
   DeploymentBlockerBanner,
   deploymentNextStep,
@@ -33,9 +40,11 @@ import {
   productionConfirmationMessage,
   productionConfigDetail,
   productionConfigStatus,
+  publicRouteStatusPresentation,
   recordedSecretRepository,
   isOlderVersion,
   ProductWorkspace,
+  type ProjectScene,
   ServerPreparation,
   deploymentMilestones,
   reusableServer,
@@ -46,6 +55,7 @@ import {
   stagingAddressConfigured,
   testAddress,
   testEnvironmentDisplayReady,
+  updateCnbAuthorizationOpenSources,
   versionComparisonTitle,
   versionMeta,
   versionSetupStep,
@@ -56,12 +66,78 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: vi.fn().mockResolvedValue(undefined),
 }));
 
-async function beginFirstVersionSetup() {
+function projectNavigation() {
+  return screen.getByRole("navigation", { name: "项目导航" });
+}
+
+async function openOverview() {
+  const navigation = await screen.findByRole("navigation", {
+    name: "项目导航",
+  });
+  const button = within(navigation).getByRole("button", { name: "发布中心" });
+  fireEvent.click(button);
+  await screen.findByRole("heading", { name: "发布中心" });
+  return button;
+}
+
+async function openLocal() {
+  const navigation = await screen.findByRole("navigation", {
+    name: "项目导航",
+  });
+  const button = within(navigation).getByRole("button", { name: "在本机运行" });
+  fireEvent.click(button);
+  await screen.findByRole("heading", { name: "在本机运行" });
+  return button;
+}
+
+async function openVersions() {
+  const navigation = await screen.findByRole("navigation", {
+    name: "项目导航",
+  });
+  const button = within(navigation).getByRole("button", { name: "版本" });
+  fireEvent.click(button);
+  await screen.findByRole("heading", { name: "版本" });
+  return button;
+}
+
+async function openProjectSettings() {
+  const navigation = await screen.findByRole("navigation", {
+    name: "项目导航",
+  });
+  const button = within(navigation).getByRole("button", { name: "项目设置" });
+  fireEvent.click(button);
+  await screen.findByRole("heading", { name: "项目设置" });
+  return button;
+}
+
+async function openTestEnvironmentDetails() {
+  await openOverview();
+  fireEvent.click(await screen.findByRole("button", { name: /^测试环境：/ }));
+  await screen.findByRole("dialog", { name: "测试环境任务" });
+}
+
+async function openProductionEnvironmentDetails() {
+  await openOverview();
+  fireEvent.click(await screen.findByRole("button", { name: /^正式环境：/ }));
+  await screen.findByRole("dialog", { name: "正式环境任务" });
+}
+
+function closeReleaseTaskPanel() {
   fireEvent.click(
-    await screen.findByRole("button", { name: "准备自动生成版本" }),
+    within(screen.getByRole("dialog")).getByRole("button", { name: "关闭" }),
   );
+}
+
+function expectOverviewTopLevelActive() {
   expect(
-    await screen.findByRole("heading", { name: "完成一次上线设置" }),
+    within(projectNavigation()).getByRole("button", { name: "发布中心" }),
+  ).toHaveAttribute("aria-current", "page");
+}
+
+async function beginFirstVersionSetup() {
+  await openProjectSettings();
+  expect(
+    await screen.findByRole("heading", { name: "项目设置" }),
   ).toBeInTheDocument();
 }
 
@@ -77,7 +153,51 @@ function configureCnbRepository(
   workspace.manifestYaml = document.toString({ lineWidth: 0 });
 }
 
+function successfulStagingRun(
+  path: string,
+  overrides: Partial<DeploymentRun> = {},
+): DeploymentRun {
+  return {
+    id: "staging-success",
+    projectPath: path,
+    projectName: "demo",
+    environment: "staging",
+    status: "success",
+    currentStage: "complete",
+    buildSerial: "101",
+    commitSha: "0123456789abcdef0123456789abcdef01234567",
+    sourceRunId: null,
+    sourceTitle: "修复登录问题",
+    candidateTag: "candidate-101",
+    artifacts: [],
+    actionKind: null,
+    actionUrl: null,
+    issueCode: null,
+    repository: "demo/project",
+    branch: "main",
+    message: "测试环境运行正常",
+    completedSteps: ["healthcheck"],
+    startedAt: "2026-07-16T00:00:00.000Z",
+    updatedAt: "2026-07-16T00:05:00.000Z",
+    ...overrides,
+  };
+}
+
 describe("ProductWorkspace blocking states", () => {
+  it("keeps global CNB refresh paused until every authorization dialog closes", () => {
+    const sources = new Set<string>();
+
+    expect(updateCnbAuthorizationOpenSources(sources, "test", true)).toBe(true);
+    expect(updateCnbAuthorizationOpenSources(sources, "settings", true)).toBe(
+      true,
+    );
+    expect(updateCnbAuthorizationOpenSources(sources, "test", false)).toBe(
+      true,
+    );
+    expect(updateCnbAuthorizationOpenSources(sources, "settings", false)).toBe(
+      false,
+    );
+  });
   beforeEach(() => {
     localStorage.clear();
     Object.defineProperty(navigator, "clipboard", {
@@ -146,7 +266,349 @@ describe("ProductWorkspace blocking states", () => {
     ).toBeInTheDocument();
   });
 
-  it("keeps an unfinished production web save visible in the scenario tabs", async () => {
+  it("keeps exactly four stable project entries", async () => {
+    const path = "/demo/stable-project-navigation";
+    const workspace = await openProject(path);
+
+    render(
+      <ProductWorkspace
+        initialScene="overview"
+        onDeployTest={vi.fn()}
+        onError={vi.fn()}
+        onPromote={vi.fn()}
+        onRefresh={vi.fn()}
+        onSaveManifest={vi.fn().mockResolvedValue(true)}
+        onServerChange={vi.fn()}
+        path={path}
+        runs={[]}
+        saving={false}
+        workspace={workspace}
+      />,
+    );
+
+    await screen.findByRole("heading", { name: "发布中心" });
+    expect(
+      within(projectNavigation())
+        .getAllByRole("button")
+        .map((button) => button.textContent),
+    ).toEqual(["发布中心", "在本机运行", "版本", "项目设置"]);
+    expect(await openLocal()).toHaveAttribute("aria-current", "page");
+    expect(await openVersions()).toHaveAttribute("aria-current", "page");
+    expect(await openProjectSettings()).toHaveAttribute("aria-current", "page");
+    expect(await openOverview()).toHaveAttribute("aria-current", "page");
+  });
+
+  it("opens only the exact current setup task from the release center", async () => {
+    const path = "/demo/focused-release-setup";
+    const workspace = await openProject(path);
+
+    render(
+      <ProductWorkspace
+        initialScene="overview"
+        onDeployTest={vi.fn()}
+        onError={vi.fn()}
+        onPromote={vi.fn()}
+        onRefresh={vi.fn()}
+        onSaveManifest={vi.fn().mockResolvedValue(true)}
+        onServerChange={vi.fn()}
+        path={path}
+        runs={[]}
+        saving={false}
+        workspace={workspace}
+      />,
+    );
+
+    expect(await screen.findByText("先连接代码平台")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "连接代码平台" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "先连接代码平台" }),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByRole("button", {
+        name: /连接代码平台.*现在完成/,
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /连接镜像仓库/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /准备测试环境/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /开启自动部署/ }),
+    ).not.toBeInTheDocument();
+
+    closeReleaseTaskPanel();
+    await openProjectSettings();
+    expect(
+      screen.getByRole("button", { name: /连接镜像仓库.*随后处理/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /准备测试环境.*随后处理/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not mistake an interrupted first deployment for completed setup", async () => {
+    const path = "/demo/interrupted-first-setup";
+    const workspace = await openProject(path);
+    const interrupted: DeploymentRun = {
+      ...successfulStagingRun(path),
+      id: "interrupted-first-setup",
+      status: "needs_action",
+      currentStage: "cloud-setup",
+      actionKind: "cloud-setup",
+      issueCode: "AD-CNB-201",
+      message: "测试配置还需要准备",
+    };
+
+    render(
+      <ProductWorkspace
+        initialScene="overview"
+        onDeployTest={vi.fn()}
+        onError={vi.fn()}
+        onPromote={vi.fn()}
+        onRefresh={vi.fn()}
+        onSaveManifest={vi.fn().mockResolvedValue(true)}
+        onServerChange={vi.fn()}
+        path={path}
+        runs={[interrupted]}
+        saving={false}
+        workspace={workspace}
+      />,
+    );
+
+    expect(
+      await screen.findByText("测试部署暂停在代码平台"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "更新代码平台授权" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("等待设置")).toBeInTheDocument();
+  });
+
+  it("shows test and production as independent environment states", async () => {
+    const path = "/demo/independent-environment-status";
+    const workspace = await openProject(path);
+    const staging = successfulStagingRun(path);
+    const production: DeploymentRun = {
+      ...staging,
+      id: "production-success",
+      environment: "production",
+      sourceRunId: staging.id,
+      message: "正式环境运行正常",
+      startedAt: "2026-07-16T00:10:00.000Z",
+      updatedAt: "2026-07-16T00:15:00.000Z",
+    };
+
+    render(
+      <ProductWorkspace
+        initialScene="overview"
+        onDeployTest={vi.fn()}
+        onError={vi.fn()}
+        onPromote={vi.fn()}
+        onRefresh={vi.fn()}
+        onSaveManifest={vi.fn().mockResolvedValue(true)}
+        onServerChange={vi.fn()}
+        path={path}
+        runs={[production, staging]}
+        saving={false}
+        workspace={workspace}
+      />,
+    );
+
+    expect(
+      await screen.findByRole("button", {
+        name: "测试环境：等待你确认，查看详情",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "正式环境：运行正常，查看详情",
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("uses the durable environment pointer instead of guessing the online version from history", async () => {
+    const path = "/demo/authoritative-environment-pointer";
+    const workspace = await openProject(path);
+    const online = successfulStagingRun(path, {
+      id: "staging-online",
+      commitSha: "a".repeat(40),
+      sourceTitle: "当前在线版本",
+      startedAt: "2026-07-15T00:00:00.000Z",
+      updatedAt: "2026-07-15T00:05:00.000Z",
+    });
+    const newerHistory = successfulStagingRun(path, {
+      id: "staging-newer-history",
+      commitSha: "b".repeat(40),
+      sourceTitle: "较新的历史记录",
+      startedAt: "2026-07-16T00:00:00.000Z",
+      updatedAt: "2026-07-16T00:05:00.000Z",
+    });
+    const listEnvironments = vi
+      .spyOn(api, "listProjectEnvironments")
+      .mockResolvedValue([
+        {
+          environment: "development",
+          displayName: "本机环境",
+          status: "unknown",
+          currentVersionKey: null,
+          currentRunId: null,
+        },
+        {
+          environment: "staging",
+          displayName: "测试环境",
+          status: "healthy",
+          currentVersionKey: deploymentVersionKey(online),
+          currentRunId: online.id,
+        },
+        {
+          environment: "production",
+          displayName: "生产环境",
+          status: "unknown",
+          currentVersionKey: null,
+          currentRunId: null,
+        },
+      ]);
+
+    const view = render(
+      <ProductWorkspace
+        initialScene="overview"
+        onDeployTest={vi.fn()}
+        onError={vi.fn()}
+        onPromote={vi.fn()}
+        onRefresh={vi.fn()}
+        onSaveManifest={vi.fn().mockResolvedValue(true)}
+        onServerChange={vi.fn()}
+        path={path}
+        runs={[newerHistory, online]}
+        saving={false}
+        workspace={workspace}
+      />,
+    );
+
+    const testEnvironmentButton = await screen.findByRole("button", {
+      name: /^测试环境：/,
+    });
+    const card = testEnvironmentButton.closest("section");
+    expect(card).not.toBeNull();
+    expect(within(card!).getByText("当前在线版本")).toBeInTheDocument();
+    expect(within(card!).queryByText("较新的历史记录")).not.toBeInTheDocument();
+
+    view.unmount();
+    listEnvironments.mockRestore();
+  });
+
+  it("uses the immutable Version collection instead of treating every successful run as a version", async () => {
+    const path = "/demo/authoritative-version-catalog";
+    const workspace = await openProject(path);
+    const realVersion = successfulStagingRun(path, {
+      id: "real-version-run",
+      commitSha: "c".repeat(40),
+      sourceTitle: "权威稳定版本",
+      startedAt: "2026-07-15T00:00:00.000Z",
+      updatedAt: "2026-07-15T00:05:00.000Z",
+    });
+    const straySuccessfulRun = successfulStagingRun(path, {
+      id: "stray-success-run",
+      commitSha: "d".repeat(40),
+      sourceTitle: "不应冒充版本的记录",
+      startedAt: "2026-07-16T00:00:00.000Z",
+      updatedAt: "2026-07-16T00:05:00.000Z",
+    });
+    const listVersions = vi
+      .spyOn(api, "listProjectVersions")
+      .mockResolvedValue([
+        {
+          id: "version-1",
+          versionKey: deploymentVersionKey(realVersion),
+          status: "available",
+          commitSha: realVersion.commitSha,
+          sourceTitle: realVersion.sourceTitle ?? null,
+          sourceConnectionId: null,
+          sourceBuildId: realVersion.buildSerial,
+          repository: realVersion.repository,
+          branch: realVersion.branch,
+          candidateTag: realVersion.candidateTag,
+          stagingRunId: realVersion.id,
+          artifacts: realVersion.artifacts,
+          validation: null,
+          currentEnvironments: ["staging"],
+          createdAt: realVersion.startedAt,
+          updatedAt: realVersion.updatedAt,
+        },
+      ]);
+
+    const view = render(
+      <ProductWorkspace
+        initialScene="versions"
+        onDeployTest={vi.fn()}
+        onError={vi.fn()}
+        onPromote={vi.fn()}
+        onRefresh={vi.fn()}
+        onSaveManifest={vi.fn().mockResolvedValue(true)}
+        onServerChange={vi.fn()}
+        path={path}
+        runs={[straySuccessfulRun, realVersion]}
+        saving={false}
+        workspace={workspace}
+      />,
+    );
+
+    expect(await screen.findByText("权威稳定版本")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByText("不应冒充版本的记录")).not.toBeInTheDocument(),
+    );
+
+    view.unmount();
+    listVersions.mockRestore();
+  });
+
+  it("returns from environment details to overview while keeping overview selected", async () => {
+    const path = "/demo/contextual-environment-details";
+    const workspace = await openProject(path);
+    const staging = successfulStagingRun(path);
+    const production: DeploymentRun = {
+      ...staging,
+      id: "production-success",
+      environment: "production",
+      sourceRunId: staging.id,
+      message: "正式环境运行正常",
+    };
+
+    render(
+      <ProductWorkspace
+        initialScene="overview"
+        onDeployTest={vi.fn()}
+        onError={vi.fn()}
+        onPromote={vi.fn()}
+        onRefresh={vi.fn()}
+        onSaveManifest={vi.fn().mockResolvedValue(true)}
+        onServerChange={vi.fn()}
+        path={path}
+        runs={[production, staging]}
+        saving={false}
+        workspace={workspace}
+      />,
+    );
+
+    await openTestEnvironmentDetails();
+    closeReleaseTaskPanel();
+    expect(
+      await screen.findByRole("heading", { name: "发布中心" }),
+    ).toBeInTheDocument();
+    expectOverviewTopLevelActive();
+
+    await openProductionEnvironmentDetails();
+    closeReleaseTaskPanel();
+    expect(
+      await screen.findByRole("heading", { name: "发布中心" }),
+    ).toBeInTheDocument();
+    expectOverviewTopLevelActive();
+  });
+
+  it("keeps an unfinished production web save visible on the release overview", async () => {
     const path = "/demo/production-web-save-tab";
     const workspace = await openProject(path);
     const settingKey = `project.${encodeURIComponent(path)}`;
@@ -157,6 +619,7 @@ describe("ProductWorkspace blocking states", () => {
 
     render(
       <ProductWorkspace
+        initialScene="overview"
         onDeployTest={vi.fn()}
         onError={vi.fn()}
         onPromote={vi.fn()}
@@ -171,9 +634,10 @@ describe("ProductWorkspace blocking states", () => {
     );
 
     expect(
-      await screen.findByRole("button", {
-        name: /发布正式版 还差网页保存/,
-      }),
+      await screen.findByRole("heading", { name: "正式版还差网页保存" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "继续网页保存" }),
     ).toBeInTheDocument();
   });
 
@@ -274,9 +738,8 @@ describe("ProductWorkspace blocking states", () => {
     ).not.toBeInTheDocument();
     expect(screen.getByText(/已选择的历史稳定版本/)).toBeInTheDocument();
     expect(loadConfig).not.toHaveBeenCalled();
-    fireEvent.click(
-      screen.getByRole("button", { name: /部署测试版 测试已通过/ }),
-    );
+    expectOverviewTopLevelActive();
+    await openTestEnvironmentDetails();
     expect(
       await screen.findByRole("heading", { name: "测试版已通过验证" }),
     ).toBeInTheDocument();
@@ -299,10 +762,8 @@ describe("ProductWorkspace blocking states", () => {
       }),
     ).toBeInTheDocument();
     expect(screen.getByText(/已选择的历史稳定版本/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /管理版本 2 个版本/ }));
-    expect(
-      await screen.findByRole("heading", { name: "管理版本" }),
-    ).toBeInTheDocument();
+    closeReleaseTaskPanel();
+    await openVersions();
     expect(screen.getByText("正式版还差网页保存")).toHaveClass(
       "text-[var(--warning)]",
     );
@@ -326,7 +787,7 @@ describe("ProductWorkspace blocking states", () => {
       "registry:\n    kind: tcr\n    registry: ccr.ccs.tencentyun.com\n    namespace: restore-test",
     );
     const settingKey = `project.${encodeURIComponent(path)}`;
-    localStorage.setItem(`abcdeploy.setting.${settingKey}.scene`, "versions");
+    localStorage.setItem(`abcdeploy.setting.${settingKey}.scene`, "settings");
     localStorage.setItem(
       `abcdeploy.setting.${settingKey}.version-setup-active`,
       "true",
@@ -341,7 +802,7 @@ describe("ProductWorkspace blocking states", () => {
     expect(versionSetupStep("save-page-opened")).toBeNull();
     render(
       <ProductWorkspace
-        initialScene="versions"
+        initialScene="settings"
         onDeployTest={vi.fn()}
         onError={vi.fn()}
         onPromote={vi.fn()}
@@ -362,18 +823,16 @@ describe("ProductWorkspace blocking states", () => {
       }),
     ).toBeInTheDocument();
     expect(
-      await screen.findByText(
-        "用于保存项目代码，并在代码更新后自动生成测试版本。",
-      ),
+      await screen.findByText("保存项目代码，并自动发现准备上线的更新"),
     ).toBeInTheDocument();
     expect(
       screen.queryByText("填写镜像仓库地址和登录信息。"),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /保存项目版本.*随后处理/ }),
+      screen.getByRole("button", { name: /连接镜像仓库.*随后处理/ }),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("系统会依次带你完成剩余设置，全部完成后自动进入测试版"),
+      screen.getByText("系统会依次带你完成剩余设置，全部完成后返回发布中心"),
     ).toBeInTheDocument();
     await waitFor(() =>
       expect(
@@ -423,10 +882,11 @@ describe("ProductWorkspace blocking states", () => {
       />,
     );
 
+    expect(await screen.findByText("正在等待第一个版本")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "版本" })).toBeInTheDocument();
     expect(
-      await screen.findByRole("heading", { name: "还没有可部署的版本" }),
+      screen.getByText(/新版本会自动出现在这里并更新测试版/),
     ).toBeInTheDocument();
-    expect(screen.getByText(/不会直接发布正式版/)).toBeInTheDocument();
     expect(
       localStorage.getItem(
         `abcdeploy.setting.${settingKey}.version-setup-active`,
@@ -471,9 +931,9 @@ describe("ProductWorkspace blocking states", () => {
       await screen.findByText("已准备 0 项 · 还差 4 项"),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /保存项目版本.*随后处理/ }),
+      screen.getByRole("button", { name: /连接镜像仓库.*随后处理/ }),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /保存项目版本/ }));
+    fireEvent.click(screen.getByRole("button", { name: /连接镜像仓库/ }));
     expect(await screen.findByText("跟随代码仓库保存")).toBeInTheDocument();
     expect(
       screen.getByText(
@@ -543,12 +1003,10 @@ describe("ProductWorkspace blocking states", () => {
       />,
     );
 
+    expect(screen.getByRole("heading", { name: "版本" })).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "管理版本" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: /管理版本 正在恢复/ }),
-    ).toBeInTheDocument();
+      within(projectNavigation()).getByRole("button", { name: "版本" }),
+    ).toHaveAttribute("aria-current", "page");
     expect(screen.getByText("正在恢复项目状态")).toBeInTheDocument();
     expect(screen.queryByText(/0 个测试通过/)).not.toBeInTheDocument();
 
@@ -559,9 +1017,7 @@ describe("ProductWorkspace blocking states", () => {
       }),
     );
     expect(
-      await screen.findByRole("button", {
-        name: /管理版本 1 个版本 · 1 个测试通过/,
-      }),
+      await screen.findByText("1 个版本 · 1 个测试通过"),
     ).toBeInTheDocument();
     expect(setting).toHaveBeenCalledTimes(1);
     expect(setting.mock.calls[0][0]).toEqual(
@@ -573,6 +1029,97 @@ describe("ProductWorkspace blocking states", () => {
       ]),
     );
     setting.mockRestore();
+  });
+
+  it("starts the first test deployment from the release center without a second deploy click", async () => {
+    const path = "/demo/direct-first-test-deployment";
+    const workspace = await openProject(path);
+    const document = parseDocument(workspace.manifestYaml);
+    document.setIn(["source", "repository"], "demo/direct-first-test");
+    document.setIn(
+      ["providers", "build", "repository"],
+      "demo/direct-first-test",
+    );
+    document.setIn(
+      ["environments", "staging", "secrets_ref"],
+      "https://cnb.cool/demo/deploy-secrets/-/blob/main/direct-first-test.staging.yml",
+    );
+    document.setIn(
+      ["environments", "staging", "domains"],
+      [{ service: "api", host: "direct-first-test.example.com", path: "/" }],
+    );
+    workspace.manifestExists = true;
+    workspace.manifestYaml = document.toString({ lineWidth: 0 });
+    const settingKey = `project.${encodeURIComponent(path)}`;
+    const settings = vi.spyOn(api, "getAppSettings").mockResolvedValue({
+      [`${settingKey}.version-setup-complete`]: "true",
+    });
+    const config = vi.spyOn(api, "loadRuntimeConfig").mockResolvedValue({
+      environment: "staging",
+      filename: ".env.staging",
+      sourceFiles: [".env.example"],
+      content: "APP_SECRET=saved",
+      templateContent: "APP_SECRET=",
+      requiredVariables: ["APP_SECRET"],
+      stored: true,
+      authorizationRequired: false,
+    });
+    const sync = vi
+      .spyOn(api, "getRuntimeConfigSyncStatus")
+      .mockResolvedValue({ stored: true, synchronized: true });
+    const server = {
+      name: "测试服务器",
+      host: "203.0.113.10",
+      user: "ubuntu",
+      port: 22,
+      keyPath: "/tmp/id_ed25519",
+      hostFingerprint: "SHA256:direct-first-test",
+    };
+    let finishDeployment: (() => void) | undefined;
+    const deploy = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishDeployment = resolve;
+        }),
+    );
+
+    render(
+      <ProductWorkspace
+        initialServer={server}
+        onDeployTest={deploy}
+        onError={vi.fn()}
+        onPromote={vi.fn()}
+        onRefresh={vi.fn()}
+        onSaveManifest={vi.fn().mockResolvedValue(true)}
+        onServerChange={vi.fn()}
+        path={path}
+        runs={[]}
+        saving={false}
+        workspace={workspace}
+      />,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "生成第一个测试版" }),
+    );
+    await waitFor(() =>
+      expect(deploy).toHaveBeenCalledWith(
+        server,
+        "demo/direct-first-test",
+        false,
+      ),
+    );
+    const startingButton = await screen.findByRole("button", {
+      name: "正在开始部署",
+    });
+    expect(startingButton).toBeDisabled();
+    fireEvent.click(startingButton);
+    expect(deploy).toHaveBeenCalledTimes(1);
+    finishDeployment?.();
+
+    settings.mockRestore();
+    config.mockRestore();
+    sync.mockRestore();
   });
 
   it("does not report local services as stopped before their real state is read", async () => {
@@ -1023,7 +1570,7 @@ describe("ProductWorkspace blocking states", () => {
     });
   });
 
-  it("guides a first-time server through one-time password authorization", async () => {
+  it("binds a first-time production server only to production after one-time authorization", async () => {
     const onReady = vi.fn();
     const onError = vi.fn();
     vi.spyOn(api, "listServers").mockResolvedValue([]);
@@ -1064,7 +1611,7 @@ describe("ProductWorkspace blocking states", () => {
         summary: "服务器已建立安全连接",
         details: ["服务器密码未保存"],
       });
-    vi.spyOn(api, "bindProjectServer").mockResolvedValue({
+    const bind = vi.spyOn(api, "bindProjectServer").mockResolvedValue({
       id: "server",
       name: "测试服务器",
       host: "203.0.113.10",
@@ -1078,6 +1625,7 @@ describe("ProductWorkspace blocking states", () => {
 
     render(
       <ServerPreparation
+        environment="production"
         onError={onError}
         onReady={onReady}
         path="/demo/new-server"
@@ -1114,6 +1662,19 @@ describe("ProductWorkspace blocking states", () => {
       "one-time-password",
     );
     expect(check).toHaveBeenCalledTimes(2);
+    expect(bind).toHaveBeenCalledWith(
+      "/demo/new-server",
+      "production",
+      expect.objectContaining({
+        host: "203.0.113.10",
+        hostFingerprint: "SHA256:server",
+      }),
+    );
+    expect(bind).not.toHaveBeenCalledWith(
+      "/demo/new-server",
+      "staging",
+      expect.anything(),
+    );
     expect(onError).not.toHaveBeenCalled();
     expect(screen.queryByLabelText("服务器登录密码")).not.toBeInTheDocument();
   });
@@ -1370,7 +1931,9 @@ describe("ProductWorkspace blocking states", () => {
 
     expect(await screen.findByText("已找到以前使用的位置")).toBeInTheDocument();
     expect(
-      screen.getByText("同一 CNB 账号可以复用，不需要重新创建。"),
+      screen.getByText(
+        "当前授权的使用范围包含此位置时可以复用，不需要重新创建。",
+      ),
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "打开 CNB 创建保存位置" }),
@@ -1728,6 +2291,7 @@ describe("ProductWorkspace blocking states", () => {
 
     render(
       <ProductWorkspace
+        initialScene="production"
         onDeployTest={vi.fn()}
         onError={vi.fn()}
         onPromote={vi.fn()}
@@ -1741,7 +2305,7 @@ describe("ProductWorkspace blocking states", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /部署测试版/ }));
+    await openTestEnvironmentDetails();
     expect(
       await screen.findByRole("heading", { name: "测试配置还需要准备" }),
     ).toBeInTheDocument();
@@ -1753,13 +2317,13 @@ describe("ProductWorkspace blocking states", () => {
       screen.queryByRole("button", { name: "检查并继续" }),
     ).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /发布正式版/ }));
-    expect(await screen.findByText("还没有测试通过的版本")).toBeInTheDocument();
+    closeReleaseTaskPanel();
     expect(
-      screen.getByRole("button", { name: "前往测试版" }),
+      await screen.findByRole("heading", { name: "发布中心" }),
     ).toBeInTheDocument();
+    expect(screen.getByText("尚未发布")).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "管理版本" }),
+      screen.queryByRole("button", { name: /^正式环境：/ }),
     ).not.toBeInTheDocument();
   });
 
@@ -1800,9 +2364,9 @@ describe("ProductWorkspace blocking states", () => {
     fireEvent.click(screen.getByRole("button", { name: "继续完成设置" }));
 
     expect(
-      await screen.findByRole("heading", { name: "完成一次上线设置" }),
+      await screen.findByRole("heading", { name: "项目设置" }),
     ).toBeInTheDocument();
-    expect(onSceneChange).toHaveBeenLastCalledWith("versions");
+    expect(onSceneChange).toHaveBeenLastCalledWith("settings");
   });
 
   it("repairs staging CNB authorization from the exact stalled task", async () => {
@@ -1847,7 +2411,7 @@ describe("ProductWorkspace blocking states", () => {
       defaultNamespace: "demo",
       namespaces: [],
     });
-    const onRefresh = vi.fn().mockResolvedValue(undefined);
+    const onRefresh = vi.fn().mockResolvedValue(run);
     const view = render(
       <ProductWorkspace
         onDeployTest={vi.fn()}
@@ -1863,33 +2427,38 @@ describe("ProductWorkspace blocking states", () => {
       />,
     );
 
-    expect(await screen.findByText("CNB 权限还差一步")).toBeInTheDocument();
-    expect(
-      screen.getByText("代码平台授权还不完整，已经完成的部署步骤仍然保留。"),
-    ).toBeInTheDocument();
-    const deploymentTechnicalDetails = screen
-      .getByText("查看技术详情")
-      .closest("details");
-    expect(deploymentTechnicalDetails).not.toHaveAttribute("open");
-    expect(screen.getByText(/Missing required scopes/)).not.toBeVisible();
+    await openOverview();
     fireEvent.click(
-      await screen.findByRole("button", { name: "更新 CNB 授权" }),
+      await screen.findByRole("button", { name: "更新代码平台授权" }),
     );
-    expect(screen.getByText("在创建令牌页面勾选这 5 项")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "更新 CNB 授权" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("授权范围：在创建令牌页面勾选这 6 项"),
+    ).toBeInTheDocument();
     expect(screen.getByText("读写项目代码")).toBeInTheDocument();
     expect(screen.getByText("读取构建记录")).toBeInTheDocument();
+    expect(screen.getByText("读取构建详情")).toBeInTheDocument();
     expect(screen.getByText("管理仓库设置")).toBeInTheDocument();
     expect(screen.getByText("触发自动构建")).toBeInTheDocument();
     expect(screen.getByText("创建代码仓库")).toBeInTheDocument();
     expect(
-      screen.getByText(/令牌只保存在系统密钥库，并供所有项目复用/),
+      screen.getByText(
+        /令牌统一保存在本机系统密钥库，符合使用范围的项目可以复用/,
+      ),
     ).toBeInTheDocument();
+    expect(
+      screen.getByText(/CNB 令牌需要同时设置“授权范围”和“使用范围”/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("demo/project")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "复制权限代码" }));
     await waitFor(() =>
       expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
         [
           "repo-code:rw",
           "repo-cnb-history:r",
+          "repo-cnb-detail:r",
           "repo-manage:rw",
           "repo-cnb-trigger:rw",
           "group-resource:rw",
@@ -1911,6 +2480,31 @@ describe("ProductWorkspace blocking states", () => {
       ),
     );
     await waitFor(() => expect(onRefresh).toHaveBeenCalledWith(run));
+    expect(
+      await screen.findByText("新令牌已保存，但 CNB 仍拒绝读取当前仓库"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "请同时检查授权范围和使用范围；使用范围必须包含 demo/project 或全部仓库。",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "更新 CNB 授权" })).toBeVisible();
+    expect(screen.getByLabelText("新的访问令牌")).toHaveValue("");
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect(
+      screen.queryByRole("dialog", { name: "更新 CNB 授权" }),
+    ).not.toBeInTheDocument();
+    expect(
+      await screen.findByText("当前 CNB 授权无法完成这项操作"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("代码平台授权还不完整，已经完成的部署步骤仍然保留。"),
+    ).toBeInTheDocument();
+    const deploymentTechnicalDetails = screen
+      .getByText("查看技术详情")
+      .closest("details");
+    expect(deploymentTechnicalDetails).not.toHaveAttribute("open");
+    expect(screen.getByText(/Missing required scopes/)).not.toBeVisible();
 
     view.rerender(
       <ProductWorkspace
@@ -1936,6 +2530,99 @@ describe("ProductWorkspace blocking states", () => {
     expect(
       await screen.findByRole("button", { name: "重新部署当前代码" }),
     ).toBeInTheDocument();
+    connect.mockRestore();
+  });
+
+  it("keeps a rejected replacement CNB token in the dialog without refreshing the task", async () => {
+    const path = "/demo/staging-cnb-token-rejected";
+    const workspace = await openProject(path);
+    const run: DeploymentRun = {
+      id: "staging-cnb-token-rejected",
+      projectPath: path,
+      projectName: "demo",
+      environment: "staging",
+      status: "needs_action",
+      currentStage: "build",
+      buildSerial: null,
+      commitSha: "0123456789abcdef0123456789abcdef01234567",
+      sourceRunId: null,
+      candidateTag: null,
+      artifacts: [],
+      actionKind: "cnb-builds",
+      actionUrl: null,
+      issueCode: "AD-CNB-103",
+      repository: "demo/rejected-token",
+      branch: "main",
+      message: "当前授权无法读取构建结果",
+      completedSteps: ["write-config"],
+      startedAt: "2026-07-12T00:00:00.000Z",
+      updatedAt: "2026-07-12T00:00:00.000Z",
+    };
+    localStorage.setItem(
+      `abcdeploy.setting.project.${encodeURIComponent(path)}.scene`,
+      "test",
+    );
+    let rejectConnect: ((reason: Error) => void) | undefined;
+    const connect = vi.spyOn(api, "connectCnb").mockImplementation(
+      async () =>
+        new Promise((_, reject) => {
+          rejectConnect = reject;
+        }),
+    );
+    const onRefresh = vi.fn();
+    const onError = vi.fn();
+    const onCnbAuthorizationOpenChange = vi.fn();
+
+    const view = render(
+      <ProductWorkspace
+        onDeployTest={vi.fn()}
+        onCnbAuthorizationOpenChange={onCnbAuthorizationOpenChange}
+        onError={onError}
+        onPromote={vi.fn()}
+        onRefresh={onRefresh}
+        onSaveManifest={vi.fn().mockResolvedValue(true)}
+        onServerChange={vi.fn()}
+        path={path}
+        runs={[run]}
+        saving={false}
+        workspace={workspace}
+      />,
+    );
+
+    await openOverview();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "更新代码平台授权" }),
+    );
+    fireEvent.change(screen.getByLabelText("新的访问令牌"), {
+      target: { value: "replacement-token-that-must-stay" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存授权并继续" }));
+
+    await waitFor(() => expect(connect).toHaveBeenCalledTimes(1));
+    expect(onCnbAuthorizationOpenChange).toHaveBeenLastCalledWith(true);
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    expect(
+      screen.getByRole("dialog", { name: "更新 CNB 授权" }),
+    ).toBeInTheDocument();
+    await act(async () => {
+      rejectConnect?.(
+        new Error(
+          'AD-CNB-103：CNB API 请求失败 (403)。原始信息：{"errmsg":"denied"}',
+        ),
+      );
+    });
+
+    expect(
+      await screen.findByText("新令牌未保存，当前任务仍使用原授权"),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("新的访问令牌")).toHaveValue(
+      "replacement-token-that-must-stay",
+    );
+    expect(onRefresh).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+    expect(screen.queryByText(/errmsg|denied/)).not.toBeInTheDocument();
+    view.unmount();
+    expect(onCnbAuthorizationOpenChange).toHaveBeenLastCalledWith(false);
     connect.mockRestore();
   });
 
@@ -2005,6 +2692,7 @@ describe("ProductWorkspace blocking states", () => {
       />,
     );
 
+    await openProductionEnvironmentDetails();
     expect(
       await screen.findByRole("heading", { name: "先完成正式配置" }),
     ).toBeInTheDocument();
@@ -2076,11 +2764,38 @@ describe("ProductWorkspace blocking states", () => {
       ...verified,
       id: "failed-production-route",
       environment: "production",
-      status: "failed",
+      status: "needs_action",
       currentStage: "prepare-server",
       sourceRunId: verified.id,
+      actionKind: "route-takeover",
       issueCode: "AD-SRV-206",
-      message: "新路由与现有配置冲突，已恢复原路由",
+      message: "example.com 仍在使用旧服务，另外两个地址已经可以访问",
+      routeChecks: [
+        {
+          host: "example.com",
+          url: "https://example.com/",
+          phase: "route-conflict",
+          reachable: false,
+          httpStatus: null,
+          message: "example.com 仍由旧服务提供",
+        },
+        {
+          host: "admin.example.com",
+          url: "https://admin.example.com/",
+          phase: "route-missing",
+          reachable: false,
+          httpStatus: null,
+          message: "admin.example.com 已解析，但服务器尚未启用",
+        },
+        {
+          host: "app.other.net",
+          url: "https://app.other.net/",
+          phase: "ready",
+          reachable: true,
+          httpStatus: 200,
+          message: "app.other.net 可以访问",
+        },
+      ],
     };
     localStorage.setItem(
       `abcdeploy.setting.project.${encodeURIComponent(path)}.scene`,
@@ -2136,15 +2851,33 @@ describe("ProductWorkspace blocking states", () => {
       />,
     );
 
+    await openProductionEnvironmentDetails();
     const takeover = await screen.findByRole("button", {
       name: "接管现有地址",
     });
+    expect(
+      screen.getByRole("heading", { name: "正式访问地址状态" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("正在使用旧服务")).toBeInTheDocument();
+    expect(screen.getByText("服务器尚未启用")).toBeInTheDocument();
+    expect(screen.getAllByText("可以访问")).toHaveLength(1);
+    expect(
+      screen.getByRole("button", { name: "先恢复其他地址" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "未冲突的地址可以单独恢复；只有标记为旧服务的地址需要你确认切换。",
+      ),
+    ).toBeInTheDocument();
     await waitFor(() => expect(takeover).toBeEnabled());
     fireEvent.click(takeover);
     expect(
       screen.getByRole("heading", { name: "把现有地址切换到新版本？" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("example.com")).toBeInTheDocument();
+    const takeoverDialog = screen.getByRole("dialog", {
+      name: "把现有地址切换到新版本？",
+    });
+    expect(within(takeoverDialog).getByText("example.com")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "接管并完成发布" }),
     ).toBeInTheDocument();
@@ -2165,7 +2898,34 @@ describe("ProductWorkspace blocking states", () => {
       actionKind: "route-check",
       issueCode: "AD-NET-201",
       message: "应用已经部署成功，访问地址暂未就绪：example.com 尚未解析",
+      routeChecks: [
+        {
+          host: "example.com",
+          url: "https://example.com/",
+          phase: "dns",
+          reachable: false,
+          httpStatus: null,
+          message: "example.com 尚未解析",
+        },
+        {
+          host: "admin.example.com",
+          url: "https://admin.example.com/",
+          phase: "dns",
+          reachable: false,
+          httpStatus: null,
+          message: "admin.example.com 尚未解析",
+        },
+        {
+          host: "app.other.net",
+          url: "https://app.other.net/",
+          phase: "ready",
+          reachable: true,
+          httpStatus: 200,
+          message: "app.other.net 的 DNS、HTTPS 和 Caddy 路由均可访问",
+        },
+      ],
     };
+    const routeStatusCheck = vi.spyOn(api, "checkDeploymentRoutes");
     const refreshRoute = vi.fn().mockResolvedValue(routePending);
     const pendingRouteError = vi.fn();
     const pendingRouteView = () => (
@@ -2215,7 +2975,7 @@ describe("ProductWorkspace blocking states", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "服务已经启动，不会重复部署。新增或确认下方解析记录后，点击“检查并完成发布”。",
+        "服务已经启动，不会重复部署。请根据下方每个地址的状态继续处理。",
       ),
     ).toBeInTheDocument();
     const periodicCheck = intervalSpy.mock.calls.find(
@@ -2226,18 +2986,21 @@ describe("ProductWorkspace blocking states", () => {
       intervalSpy.mock.calls.filter(([, delay]) => delay === 30_000),
     ).toHaveLength(1);
     expect(
-      screen.getByRole("heading", { name: "设置正式访问地址" }),
+      screen.getByRole("heading", { name: "正式访问地址状态" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("主机记录 @ · 类型 A · 记录值 203.0.113.10"),
+      screen.getByText(/主机记录 @ · 类型 A · 记录值 203\.0\.113\.10/),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("主机记录 admin · 类型 A · 记录值 203.0.113.10"),
+      screen.getByText(/主机记录 admin · 类型 A · 记录值 203\.0\.113\.10/),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("主机记录 app · 类型 A · 记录值 203.0.113.10"),
+      screen.getByText("app.other.net 的 DNS、HTTPS 和 Caddy 路由均可访问"),
     ).toBeInTheDocument();
-    expect(screen.getAllByText("待添加或生效").length).toBeGreaterThan(0);
+    expect(await screen.findAllByText("DNS 未解析")).toHaveLength(2);
+    expect(screen.getByText("可以访问")).toBeInTheDocument();
+    expect(screen.queryByText("待添加或生效")).not.toBeInTheDocument();
+    expect(routeStatusCheck).not.toHaveBeenCalled();
     expect(
       await screen.findByRole("button", {
         name: "打开腾讯云 DNSPod · example.com",
@@ -2252,9 +3015,23 @@ describe("ProductWorkspace blocking states", () => {
     expect(screen.queryByLabelText("本次部署进度")).not.toBeInTheDocument();
     expect(screen.getByText(/任务记录：|最近检查：/)).toBeInTheDocument();
     expect(autoRechecksDeployment(routePending)).toBe(true);
+    expect(
+      autoRechecksDeployment({
+        ...routePending,
+        actionKind: "route-takeover",
+      }),
+    ).toBe(true);
     expect(deploymentRefreshLabel(routePending)).toBe("检查并完成发布");
     expect(deploymentNextStep(routePending)).toBe(
       "设置好域名后点击“检查并完成发布”，不会重新部署服务",
+    );
+    const interruptedRouteCheck: DeploymentRun = {
+      ...routePending,
+      issueCode: "AD-NET-202",
+      message: "本机网络中断，地址状态没有完成复核",
+    };
+    expect(deploymentNextStep(interruptedRouteCheck)).toBe(
+      "确认本机网络可用后点击“检查并完成发布”；系统只检查地址，不会重新部署",
     );
     const unhealthyService: DeploymentRun = {
       ...routePending,
@@ -2313,7 +3090,8 @@ describe("ProductWorkspace blocking states", () => {
     );
     expect(screen.getByText(/最近检查：/)).toHaveTextContent("地址还未生效");
 
-    fireEvent.click(screen.getByRole("button", { name: /管理版本/ }));
+    closeReleaseTaskPanel();
+    await openVersions();
     const pendingProductionBadge =
       await screen.findByText("正式版已部署，还差地址");
     expect(pendingProductionBadge).toHaveClass("text-[var(--warning)]");
@@ -2330,9 +3108,12 @@ describe("ProductWorkspace blocking states", () => {
     const genericFailure: DeploymentRun = {
       ...failed,
       id: "failed-production-generic",
+      status: "failed",
       currentStage: "deploy",
+      actionKind: null,
       issueCode: "AD-DEP-201",
       message: "服务器没有完成部署",
+      routeChecks: [],
     };
     const retryProduction = vi.fn().mockResolvedValue(undefined);
     view.rerender(
@@ -2356,11 +3137,7 @@ describe("ProductWorkspace blocking states", () => {
         workspace={workspace}
       />,
     );
-    expect(
-      screen.getByRole("button", {
-        name: /发布正式版 正式发布没有完成/,
-      }),
-    ).toBeInTheDocument();
+    expectOverviewTopLevelActive();
     expect(screen.queryByText("部署失败")).not.toBeInTheDocument();
     fireEvent.click(
       await screen.findByRole("button", { name: "重新发布同一版本" }),
@@ -2373,6 +3150,148 @@ describe("ProductWorkspace blocking states", () => {
     );
     inspection.mockRestore();
     dnsProvider.mockRestore();
+    routeStatusCheck.mockRestore();
+  });
+
+  it("offers a certificate-only retry when DNS already points to the server", async () => {
+    const path = "/demo/certificate-retry";
+    const workspace = await openProject(path);
+    const service = workspace.inspection.services.find(
+      (item) => item.kind !== "worker",
+    );
+    expect(service).toBeDefined();
+    const document = parseDocument(workspace.manifestYaml);
+    document.setIn(
+      ["environments", "production", "domains"],
+      [
+        {
+          service: service!.id,
+          host: "cert.example.com",
+          path: "/",
+        },
+      ],
+    );
+    workspace.manifestYaml = document.toString({ lineWidth: 0 });
+    const verified = successfulStagingRun(path, {
+      id: "certificate-retry-staging",
+    });
+    const pending: DeploymentRun = {
+      ...verified,
+      id: "certificate-retry-production",
+      environment: "production",
+      status: "needs_action",
+      currentStage: "healthcheck",
+      sourceRunId: verified.id,
+      artifacts: [
+        {
+          service: service!.id,
+          image: `registry.example.com/demo/${service!.id}`,
+          digest: `sha256:${"a".repeat(64)}`,
+        },
+      ],
+      actionKind: "route-check",
+      issueCode: "AD-NET-201",
+      message:
+        "cert.example.com 已解析，但 HTTPS 尚未就绪；请稍候让 Caddy 申请证书",
+      routeChecks: [
+        {
+          host: "cert.example.com",
+          url: "https://cert.example.com/",
+          phase: "https",
+          reachable: false,
+          httpStatus: null,
+          message:
+            "cert.example.com 已解析，但 HTTPS 尚未就绪；请稍候让 Caddy 申请证书",
+        },
+      ],
+    };
+    localStorage.setItem(
+      `abcdeploy.setting.project.${encodeURIComponent(path)}.scene`,
+      "production",
+    );
+    localStorage.setItem(
+      `abcdeploy.setting.project.${encodeURIComponent(path)}.verified-run`,
+      verified.id,
+    );
+    const readyChecks = [
+      {
+        host: "cert.example.com",
+        url: "https://cert.example.com/",
+        phase: "ready" as const,
+        reachable: true,
+        httpStatus: 200,
+        message: "cert.example.com 的 DNS、HTTPS 和 Caddy 路由均可访问",
+      },
+    ];
+    const initialPending: DeploymentRun = { ...pending, routeChecks: [] };
+    const supplementalCheck = vi.spyOn(api, "checkDeploymentRoutes");
+    let finishRetry: ((checks: typeof readyChecks) => void) | undefined;
+    const retry = vi
+      .spyOn(api, "retryDeploymentCertificates")
+      .mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            finishRetry = resolve;
+          }),
+      );
+    const onRefresh = vi.fn().mockResolvedValue({
+      ...pending,
+      routeChecks: readyChecks,
+    });
+    const intervalSpy = vi.spyOn(window, "setInterval");
+    const clearIntervalSpy = vi.spyOn(window, "clearInterval");
+    const workspaceView = (run: DeploymentRun) => (
+      <ProductWorkspace
+        initialServer={{
+          host: "203.0.113.10",
+          keyPath: "/tmp/id_ed25519",
+          name: "测试服务器",
+          port: 22,
+          user: "ubuntu",
+        }}
+        onDeployTest={vi.fn()}
+        onError={vi.fn()}
+        onPromote={vi.fn()}
+        onRefresh={onRefresh}
+        onSaveManifest={vi.fn().mockResolvedValue(true)}
+        onServerChange={vi.fn()}
+        path={path}
+        runs={[run, verified]}
+        saving={false}
+        workspace={workspace}
+      />
+    );
+    const view = render(workspaceView(initialPending));
+
+    await openProductionEnvironmentDetails();
+    expect(await screen.findByText("正在检查")).toBeInTheDocument();
+    await waitFor(() => expect(onRefresh).toHaveBeenCalled());
+    expect(supplementalCheck).not.toHaveBeenCalled();
+    onRefresh.mockClear();
+    view.rerender(workspaceView(pending));
+    expect(await screen.findByText("还差 HTTPS 证书")).toBeInTheDocument();
+    expect(screen.getByText("DNS 已生效，等待 HTTPS")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试证书" }));
+    await waitFor(() => expect(retry).toHaveBeenCalledWith(pending.id));
+    expect(
+      await screen.findByRole("button", { name: "正在重试证书" }),
+    ).toBeDisabled();
+    const routeIntervalIndex = intervalSpy.mock.calls.findIndex(
+      ([, delay]) => delay === 30_000,
+    );
+    expect(routeIntervalIndex).toBeGreaterThanOrEqual(0);
+    const routeInterval = intervalSpy.mock.results[routeIntervalIndex]?.value;
+    await waitFor(() =>
+      expect(clearIntervalSpy).toHaveBeenCalledWith(routeInterval),
+    );
+    await act(async () => finishRetry?.(readyChecks));
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledWith(pending));
+    expect(await screen.findByText("可以访问")).toBeInTheDocument();
+
+    supplementalCheck.mockRestore();
+    retry.mockRestore();
+    intervalSpy.mockRestore();
+    clearIntervalSpy.mockRestore();
   });
 
   it("把已保存的任务更新时间显示成用户能判断的新鲜度", () => {
@@ -2474,6 +3393,7 @@ describe("ProductWorkspace blocking states", () => {
       />,
     );
 
+    await openProductionEnvironmentDetails();
     expect(
       await screen.findByRole("heading", { name: "正式版地址没有生效" }),
     ).toBeInTheDocument();
@@ -2497,6 +3417,7 @@ describe("ProductWorkspace blocking states", () => {
 
     render(
       <ProductWorkspace
+        initialScene="local"
         onDeployTest={vi.fn()}
         onError={onError}
         onPromote={vi.fn()}
@@ -2888,6 +3809,7 @@ describe("ProductWorkspace blocking states", () => {
     const workspace = await openProject(path);
     render(
       <ProductWorkspace
+        initialScene="local"
         onDeployTest={vi.fn()}
         onError={vi.fn()}
         onPromote={vi.fn()}
@@ -2935,10 +3857,8 @@ describe("ProductWorkspace blocking states", () => {
       />,
     );
 
-    const localScene = await screen.findByRole("button", {
-      name: /在本机运行 上次运行成功/,
-    });
-    expect(localScene.querySelector('[data-status="success"]')).not.toBeNull();
+    const localScene = await openLocal();
+    expect(localScene).toHaveAttribute("aria-current", "page");
     await waitFor(() =>
       expect(
         localStorage.getItem(
@@ -2954,7 +3874,9 @@ describe("ProductWorkspace blocking states", () => {
     fireEvent.click(screen.getByRole("button", { name: "全部停止" }));
     await waitFor(() =>
       expect(
-        screen.getByRole("button", { name: /在本机运行 上次运行成功/ }),
+        within(projectNavigation()).getByRole("button", {
+          name: "在本机运行",
+        }),
       ).toBeInTheDocument(),
     );
     expect(screen.getAllByText("上次随全部服务启动成功")).not.toHaveLength(0);
@@ -2995,14 +3917,7 @@ describe("ProductWorkspace blocking states", () => {
       />,
     );
 
-    expect(
-      await screen.findByRole("button", {
-        name: /在本机运行 上次启动未完成/,
-      }),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: /在本机运行 启动未完成/ }),
-    ).not.toBeInTheDocument();
+    expect(await openLocal()).toHaveAttribute("aria-current", "page");
     expect(await screen.findByText("上次启动没有完成")).toBeInTheDocument();
     expect(
       screen.getByText(/上次原因：后端服务（api）没有构建成功/),
@@ -3088,11 +4003,7 @@ describe("ProductWorkspace blocking states", () => {
       />,
     );
 
-    expect(
-      await screen.findByRole("button", {
-        name: /在本机运行 上次运行成功/,
-      }),
-    ).toBeInTheDocument();
+    expect(await openLocal()).toHaveAttribute("aria-current", "page");
     await waitFor(() =>
       expect(
         localStorage.getItem(
@@ -3168,10 +4079,10 @@ describe("ProductWorkspace blocking states", () => {
     );
     await waitFor(() => expect(localStorage.getItem(issueKey)).toBe(""));
     expect(
-      screen.getByRole("button", {
-        name: /在本机运行 快捷启停与配置检核/,
+      within(projectNavigation()).getByRole("button", {
+        name: "在本机运行",
       }),
-    ).toBeInTheDocument();
+    ).toHaveAttribute("aria-current", "page");
     start.mockRestore();
   });
 
@@ -3218,6 +4129,14 @@ describe("ProductWorkspace blocking states", () => {
       staging.id,
     );
     const onPromote = vi.fn().mockResolvedValue(undefined);
+    const onRefresh = vi.fn().mockResolvedValue(undefined);
+    const connect = vi.spyOn(api, "connectCnb").mockResolvedValue({
+      connected: true,
+      displayName: "示例用户",
+      username: "demo",
+      defaultNamespace: "demo",
+      namespaces: [],
+    });
 
     const view = render(
       <ProductWorkspace
@@ -3231,7 +4150,7 @@ describe("ProductWorkspace blocking states", () => {
         onDeployTest={vi.fn()}
         onError={vi.fn()}
         onPromote={onPromote}
-        onRefresh={vi.fn()}
+        onRefresh={onRefresh}
         onSaveManifest={vi.fn().mockResolvedValue(true)}
         onServerChange={vi.fn()}
         path={path}
@@ -3241,6 +4160,7 @@ describe("ProductWorkspace blocking states", () => {
       />,
     );
 
+    await openProductionEnvironmentDetails();
     fireEvent.click(
       await screen.findByRole("button", { name: "重新发布同一版本" }),
     );
@@ -3248,6 +4168,11 @@ describe("ProductWorkspace blocking states", () => {
       expect(onPromote).toHaveBeenCalledWith(staging, expect.any(Object)),
     );
 
+    const authorizationProduction = {
+      ...production,
+      issueCode: "AD-CNB-101",
+      message: "CNB 登录已失效，请重新连接后继续",
+    };
     view.rerender(
       <ProductWorkspace
         initialServer={{
@@ -3260,18 +4185,11 @@ describe("ProductWorkspace blocking states", () => {
         onDeployTest={vi.fn()}
         onError={vi.fn()}
         onPromote={onPromote}
-        onRefresh={vi.fn()}
+        onRefresh={onRefresh}
         onSaveManifest={vi.fn().mockResolvedValue(true)}
         onServerChange={vi.fn()}
         path={path}
-        runs={[
-          {
-            ...production,
-            issueCode: "AD-CNB-103",
-            message: "CNB API 请求失败 (403): Missing required scopes",
-          },
-          staging,
-        ]}
+        runs={[authorizationProduction, staging]}
         saving={false}
         workspace={workspace}
       />,
@@ -3287,9 +4205,26 @@ describe("ProductWorkspace blocking states", () => {
       screen.getByRole("button", { name: "复制权限代码" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/令牌只保存在系统密钥库，并供所有项目复用/),
+      screen.getByText(
+        /令牌统一保存在本机系统密钥库，符合使用范围的项目可以复用/,
+      ),
     ).toBeInTheDocument();
-    expect(screen.getByText(/Missing required scopes/)).not.toBeVisible();
+    fireEvent.change(screen.getByLabelText("新的访问令牌"), {
+      target: { value: "replacement-production-token" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存授权并继续发布" }));
+    await waitFor(() =>
+      expect(connect).toHaveBeenCalledWith(
+        "replacement-production-token",
+        true,
+        "demo/project",
+      ),
+    );
+    await waitFor(() =>
+      expect(onRefresh).toHaveBeenCalledWith(authorizationProduction),
+    );
+    expect(onPromote).toHaveBeenCalledTimes(1);
+    connect.mockRestore();
   });
 
   it("separates usable versions from failed deployments and lets production choose independently", async () => {
@@ -3413,9 +4348,8 @@ describe("ProductWorkspace blocking states", () => {
     expect(isOlderVersion(first, first)).toBe(false);
 
     function ParentMirroringScene() {
-      const [initialScene, setInitialScene] = useState<
-        "local" | "versions" | "test" | "production"
-      >("versions");
+      const [initialScene, setInitialScene] =
+        useState<ProjectScene>("versions");
       return (
         <ProductWorkspace
           initialScene={initialScene}
@@ -3451,17 +4385,13 @@ describe("ProductWorkspace blocking states", () => {
 
     render(<ParentMirroringScene />);
 
-    await waitFor(() =>
-      expect(
-        screen.getByRole("heading", { name: "管理版本" }),
-      ).toBeInTheDocument(),
-    );
+    await screen.findByRole("heading", { name: "版本" });
     await waitFor(() =>
       expect(
         screen.getByRole("heading", { name: "版本记录" }),
       ).toBeInTheDocument(),
     );
-    expect(screen.getAllByText("3 个版本 · 2 个测试通过")).toHaveLength(2);
+    expect(screen.getByText("3 个版本 · 2 个测试通过")).toBeInTheDocument();
     expect(screen.getByText("最新一次部署没有完成")).toBeInTheDocument();
     const historySummary = document.querySelector("summary")!;
     expect(historySummary).toHaveTextContent("1 条历史部署记录");
@@ -3469,7 +4399,7 @@ describe("ProductWorkspace blocking states", () => {
     expect(historySummary.closest("details")).not.toHaveAttribute("open");
     expect(screen.getByText("修复登录并优化首页速度")).toBeInTheDocument();
     expect(screen.getByText(/7.*12.*代码 10234567/)).toBeInTheDocument();
-    expect(screen.getByText("增加导出功能")).toBeInTheDocument();
+    expect(screen.getByText(/增加导出功能/)).toBeInTheDocument();
     expect(screen.getByText(/7.*11.*代码 10134567/)).toBeInTheDocument();
     expect(screen.getByText("旧版未确认")).toBeInTheDocument();
     expect(
@@ -3517,10 +4447,7 @@ describe("ProductWorkspace blocking states", () => {
     await waitFor(() => expect(onSyncVersions).toHaveBeenCalledTimes(2));
     expect(await screen.findByText(/版本记录已于 .* 更新/)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "查看设置" }));
-    expect(
-      await screen.findByRole("heading", { name: "上线设置" }),
-    ).toBeInTheDocument();
+    await openProjectSettings();
     expect(
       screen.getByRole("button", {
         name: /连接代码平台.*已准备/,
@@ -3531,14 +4458,7 @@ describe("ProductWorkspace blocking states", () => {
         name: /准备测试环境.*已准备/,
       }),
     ).toBeInTheDocument();
-    const backToVersions = screen.getByRole("button", {
-      name: "返回版本列表",
-    });
-    expect(backToVersions).toBeEnabled();
-    fireEvent.click(backToVersions);
-    expect(
-      await screen.findByRole("heading", { name: "管理版本" }),
-    ).toBeInTheDocument();
+    await openVersions();
 
     const restoreButtons = screen.getAllByRole("button", {
       name: /^用此版本恢复正式版：/,
@@ -3559,15 +4479,15 @@ describe("ProductWorkspace blocking states", () => {
     ).toHaveAttribute("aria-pressed", "false");
     expect(screen.getByText("2 个可发布")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /管理版本/ }));
-    fireEvent.click(screen.getByRole("button", { name: /发布正式版/ }));
+    await openVersions();
     expect(
-      await screen.findByRole("heading", { name: "正式版已上线" }),
+      await screen.findByRole("button", {
+        name: /用此版本恢复正式版：增加导出功能/,
+      }),
     ).toBeInTheDocument();
-    expect(screen.getByLabelText("当前正式版本")).toHaveTextContent(
-      "修复登录并优化首页速度",
-    );
-    expect(screen.queryByText("准备恢复的版本")).not.toBeInTheDocument();
+    await openProductionEnvironmentDetails();
+    const restoringVersion = await screen.findByText("准备恢复的版本");
+    expect(restoringVersion.parentElement).toHaveTextContent("增加导出功能");
   });
 
   it("does not treat the production approval branch as a newer test deployment", async () => {
@@ -3626,9 +4546,10 @@ describe("ProductWorkspace blocking states", () => {
       />,
     );
 
+    await openOverview();
     expect(
-      await screen.findByRole("button", {
-        name: /部署测试版 测试已通过/,
+      screen.getByRole("button", {
+        name: "测试环境：测试已通过，查看详情",
       }),
     ).toBeInTheDocument();
   });
@@ -3675,12 +4596,15 @@ describe("ProductWorkspace blocking states", () => {
       />,
     );
 
-    const testScene = await screen.findByRole("button", {
-      name: /部署测试版 等待确认测试结果/,
+    await openOverview();
+    const testScene = screen.getByRole("button", {
+      name: "测试环境：等待你确认，查看详情",
     });
-    expect(testScene.querySelector('[data-status="active"]')).not.toBeNull();
+    expect(testScene).toBeEnabled();
     expect(
-      screen.queryByRole("button", { name: /部署测试版 测试已通过/ }),
+      screen.queryByRole("button", {
+        name: "测试环境：测试已通过，查看详情",
+      }),
     ).not.toBeInTheDocument();
   });
 
@@ -3728,6 +4652,10 @@ describe("ProductWorkspace blocking states", () => {
       `abcdeploy.setting.${settingKey}.verified-run`,
       JSON.stringify([older.id]),
     );
+    localStorage.setItem(
+      "abcdeploy.demo.runs",
+      JSON.stringify([current, older]),
+    );
 
     const firstView = render(
       <ProductWorkspace
@@ -3746,9 +4674,9 @@ describe("ProductWorkspace blocking states", () => {
     );
 
     expect(
-      await screen.findByRole("button", { name: /部署测试版 测试已通过/ }),
+      await screen.findByRole("heading", { name: "测试版已通过验证" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("测试版已通过验证")).toBeInTheDocument();
+    expectOverviewTopLevelActive();
     expect(screen.getByText("测试版正在服务器运行")).toBeInTheDocument();
     expect(screen.getByText("下一步：准备正式版")).toBeInTheDocument();
     expect(
@@ -3765,20 +4693,18 @@ describe("ProductWorkspace blocking states", () => {
     });
     expect(releaseButton).toBeInTheDocument();
     fireEvent.click(releaseButton);
-    await waitFor(() =>
-      expect(
-        screen.getByRole("button", {
-          name: /发布正式版 1 个测试通过版本/,
-        }),
-      ).toHaveAttribute("aria-current", "page"),
-    );
+    expect(
+      await screen.findByRole("button", { name: "← 返回发布中心" }),
+    ).toBeInTheDocument();
+    expectOverviewTopLevelActive();
 
-    await waitFor(() =>
-      expect(
-        localStorage.getItem(
-          `abcdeploy.setting.${settingKey}.verified-version`,
-        ),
-      ).toBe(JSON.stringify([deploymentVersionKey(older)])),
+    await waitFor(async () =>
+      expect(await api.listVersionValidations(path)).toEqual([
+        expect.objectContaining({
+          state: "passed",
+          versionKey: deploymentVersionKey(older),
+        }),
+      ]),
     );
     firstView.unmount();
     localStorage.removeItem(`abcdeploy.setting.${settingKey}.verified-run`);
@@ -3799,7 +4725,54 @@ describe("ProductWorkspace blocking states", () => {
       />,
     );
     expect(
-      await screen.findByRole("button", { name: /部署测试版 测试已通过/ }),
+      await screen.findByRole("heading", { name: "测试版已通过验证" }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps a failed repeat attempt visible without duplicating its immutable version", async () => {
+    const path = "/demo/failed-repeat-attempt";
+    const workspace = await openProject(path);
+    const successful = successfulStagingRun(path, {
+      id: "successful-attempt",
+      commitSha: "c123456789abcdefc123456789abcdefc1234567",
+      sourceTitle: "同一个不可变版本",
+      startedAt: "2026-07-14T10:00:00.000Z",
+      updatedAt: "2026-07-14T10:05:00.000Z",
+    });
+    const failed: DeploymentRun = {
+      ...successful,
+      id: "failed-repeat-attempt",
+      status: "failed",
+      currentStage: "deploy",
+      issueCode: "AD-CTR-201",
+      message: "重新部署时服务没有启动",
+      completedSteps: ["build"],
+      startedAt: "2026-07-15T10:00:00.000Z",
+      updatedAt: "2026-07-15T10:05:00.000Z",
+    };
+
+    render(
+      <ProductWorkspace
+        initialScene="versions"
+        onDeployTest={vi.fn()}
+        onError={vi.fn()}
+        onPromote={vi.fn()}
+        onRefresh={vi.fn()}
+        onSaveManifest={vi.fn().mockResolvedValue(true)}
+        onServerChange={vi.fn()}
+        path={path}
+        runs={[failed, successful]}
+        saving={false}
+        workspace={workspace}
+      />,
+    );
+
+    expect(
+      await screen.findByText("1 个版本 · 0 个测试通过"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("最新一次部署没有完成")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "查看处理方法" }),
     ).toBeInTheDocument();
   });
 
@@ -3872,24 +4845,25 @@ describe("ProductWorkspace blocking states", () => {
     );
 
     expect(
-      await screen.findByRole("button", {
-        name: /管理版本 2 个版本 · 1 个测试通过/,
-      }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", {
-        name: /部署测试版 等待确认测试结果/,
-      }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", {
-        name: /发布正式版 1 个测试通过版本/,
-      }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText("测试版正在正常运行，可以打开并确认功能"),
+      await screen.findByText("测试版正在正常运行，可以打开并确认功能"),
     ).toBeInTheDocument();
     expect(screen.queryByText("测试版已通过验证")).not.toBeInTheDocument();
+    await openVersions();
+    expect(screen.getByText("2 个版本 · 1 个测试通过")).toBeInTheDocument();
+    await openOverview();
+    expect(
+      screen.getByRole("button", {
+        name: "测试环境：等待你确认，查看详情",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "正式环境：有版本可以发布，查看详情",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "查看全部版本" }),
+    ).toBeInTheDocument();
   });
 
   it("requires reopening a secure preview before business confirmation", async () => {
@@ -3918,6 +4892,7 @@ describe("ProductWorkspace blocking states", () => {
       updatedAt: "2026-07-15T00:10:00.000Z",
     };
     const onRefresh = vi.fn().mockResolvedValue(staging);
+    localStorage.setItem("abcdeploy.demo.runs", JSON.stringify([staging]));
 
     const view = render(
       <ProductWorkspace
@@ -3945,7 +4920,7 @@ describe("ProductWorkspace blocking states", () => {
     expect(screen.queryByText(/安全通道|开放端口/)).not.toBeInTheDocument();
     expect(screen.getByText("还差一次业务确认")).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "测试通过" }),
+      screen.queryByRole("button", { name: "确认测试通过" }),
     ).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "检查运行状态" }));
@@ -3973,15 +4948,16 @@ describe("ProductWorkspace blocking states", () => {
       }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "测试通过" }),
+      screen.getByRole("button", { name: "确认测试通过" }),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "测试通过" }));
-    await waitFor(() =>
-      expect(
-        localStorage.getItem(
-          `abcdeploy.setting.project.${encodeURIComponent(path)}.verified-version`,
-        ),
-      ).toBe(JSON.stringify([deploymentVersionKey(staging)])),
+    fireEvent.click(screen.getByRole("button", { name: "确认测试通过" }));
+    await waitFor(async () =>
+      expect(await api.listVersionValidations(path)).toEqual([
+        expect.objectContaining({
+          state: "passed",
+          versionKey: deploymentVersionKey(staging),
+        }),
+      ]),
     );
     expect(
       screen.getByText("测试结果已保存，不会因为关闭应用而丢失。"),
@@ -4033,6 +5009,100 @@ describe("ProductWorkspace blocking states", () => {
       screen.getByText(/secure-preview-staging-api-1/),
     ).toBeInTheDocument();
     expect(screen.queryByText("测试版正在服务器运行")).not.toBeInTheDocument();
+  });
+
+  it("requires opening the test version and keeps a rejected result after reopening", async () => {
+    const path = "/demo/rejected-test-version";
+    const workspace = await openProject(path);
+    const staging = successfulStagingRun(path, {
+      id: "rejected-test-version",
+      artifacts: [
+        {
+          service: "api",
+          image: "registry/demo/api",
+          digest: `sha256:${"9".repeat(64)}`,
+        },
+      ],
+    });
+    const settingKey = `project.${encodeURIComponent(path)}`;
+    localStorage.setItem(
+      `abcdeploy.setting.${settingKey}.version-setup-complete`,
+      "true",
+    );
+    localStorage.setItem("abcdeploy.demo.runs", JSON.stringify([staging]));
+    vi.mocked(openUrl).mockClear();
+    const props = {
+      initialServer: {
+        host: "203.0.113.10",
+        keyPath: "/tmp/id_ed25519",
+        name: "测试服务器",
+        port: 22,
+        user: "ubuntu",
+      },
+      onDeployTest: vi.fn(),
+      onError: vi.fn(),
+      onPromote: vi.fn(),
+      onRefresh: vi.fn(),
+      onSaveManifest: vi.fn().mockResolvedValue(true),
+      onServerChange: vi.fn(),
+      path,
+      runs: [staging],
+      saving: false,
+      workspace,
+    };
+
+    const view = render(<ProductWorkspace {...props} initialScene="test" />);
+
+    const confirm = await screen.findByRole("button", {
+      name: "确认测试通过",
+    });
+    expect(confirm).toBeDisabled();
+    expect(screen.getByRole("button", { name: "测试有问题" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "打开测试版" }));
+    await waitFor(() => expect(openUrl).toHaveBeenCalled());
+    expect(confirm).toBeEnabled();
+    expect(screen.getByRole("button", { name: "测试有问题" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "测试有问题" }));
+    expect(
+      await screen.findByRole("heading", { name: "这个版本暂不发布" }),
+    ).toBeInTheDocument();
+    await waitFor(async () =>
+      expect(await api.listVersionValidations(path)).toEqual([
+        expect.objectContaining({
+          state: "rejected",
+          versionKey: deploymentVersionKey(staging),
+        }),
+      ]),
+    );
+    // A stale setting from an older build must not override the durable
+    // rejection that was just saved.
+    localStorage.setItem(
+      `abcdeploy.setting.${settingKey}.verified-run`,
+      JSON.stringify([staging.id]),
+    );
+    localStorage.setItem(
+      `abcdeploy.setting.${settingKey}.verified-version`,
+      JSON.stringify([deploymentVersionKey(staging)]),
+    );
+
+    view.unmount();
+    render(<ProductWorkspace {...props} initialScene="overview" />);
+
+    const currentTask = await screen.findByRole("region", {
+      name: "当前发布任务",
+    });
+    expect(
+      await within(currentTask).findByText(/暂不发布/),
+    ).toBeInTheDocument();
+    expect(within(currentTask).getByText("等待代码更新")).toBeInTheDocument();
+
+    await openVersions();
+    expect(screen.getByText("测试未通过 · 等待代码更新")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^发布正式版：/ }),
+    ).not.toBeInTheDocument();
   });
 
   it("restores a real production state without relying on this device's test marker", async () => {
@@ -4111,6 +5181,7 @@ describe("ProductWorkspace blocking states", () => {
       .mockResolvedValue(production);
     const currentView = render(
       <ProductWorkspace
+        initialScene="production"
         onDeployTest={vi.fn()}
         onError={onError}
         onPromote={vi.fn()}
@@ -4159,9 +5230,7 @@ describe("ProductWorkspace blocking states", () => {
     expect(await screen.findByText(/最近检查：/)).toHaveTextContent(
       "正式版仍可访问",
     );
-    expect(
-      screen.getByRole("button", { name: /发布正式版 正式版可以访问/ }),
-    ).toBeInTheDocument();
+    expectOverviewTopLevelActive();
     expect(screen.queryByText("还没有测试通过的版本")).not.toBeInTheDocument();
     await waitFor(() =>
       expect(localStorage.getItem(healthCheckKey)).toMatch(
@@ -4181,9 +5250,7 @@ describe("ProductWorkspace blocking states", () => {
     );
     expect(screen.queryByText(/最近检查：/)).not.toBeInTheDocument();
 
-    fireEvent.click(
-      screen.getByRole("button", { name: /部署测试版 测试已通过/ }),
-    );
+    await openTestEnvironmentDetails();
     expect(
       await screen.findByText("当前版本已完成正式发布"),
     ).toBeInTheDocument();
@@ -4267,6 +5334,7 @@ describe("ProductWorkspace blocking states", () => {
     localStorage.setItem(`abcdeploy.setting.${settingKey}.scene`, "production");
     const restoredCurrentView = render(
       <ProductWorkspace
+        initialScene="production"
         onDeployTest={vi.fn()}
         onError={vi.fn()}
         onPromote={vi.fn()}
@@ -4306,6 +5374,100 @@ describe("ProductWorkspace blocking states", () => {
     expect(
       screen.getByText("较早的测试版本", { exact: false }),
     ).toBeInTheDocument();
+  });
+
+  it("keeps the online production version separate from a newer failed release", async () => {
+    const path = "/demo/production-failure-keeps-online-version";
+    const workspace = await openProject(path);
+    const onlineVersion: DeploymentRun = {
+      id: "staging-online-version",
+      projectPath: path,
+      projectName: "production-failure-keeps-online-version",
+      environment: "staging",
+      status: "success",
+      currentStage: "complete",
+      buildSerial: "401",
+      commitSha: "a123456789abcdefa123456789abcdefa1234567",
+      sourceTitle: "当前稳定版本",
+      sourceRunId: null,
+      candidateTag: "deploydesk-online",
+      artifacts: [],
+      actionKind: null,
+      actionUrl: null,
+      issueCode: null,
+      repository: "demo/production-failure-keeps-online-version",
+      branch: "main",
+      message: "测试通过",
+      completedSteps: ["healthcheck"],
+      startedAt: "2026-07-14T10:00:00.000Z",
+      updatedAt: "2026-07-14T10:00:00.000Z",
+    };
+    const failedCandidate: DeploymentRun = {
+      ...onlineVersion,
+      id: "staging-failed-candidate",
+      buildSerial: "402",
+      commitSha: "b123456789abcdefb123456789abcdefb1234567",
+      sourceTitle: "待发布的新版本",
+      candidateTag: "deploydesk-candidate",
+      startedAt: "2026-07-15T10:00:00.000Z",
+      updatedAt: "2026-07-15T10:00:00.000Z",
+    };
+    const onlineProduction: DeploymentRun = {
+      ...onlineVersion,
+      id: "production-online-version",
+      environment: "production",
+      sourceRunId: onlineVersion.id,
+      message: "正式环境运行正常",
+      startedAt: "2026-07-14T11:00:00.000Z",
+      updatedAt: "2026-07-14T11:00:00.000Z",
+    };
+    const failedProduction: DeploymentRun = {
+      ...failedCandidate,
+      id: "production-failed-candidate",
+      environment: "production",
+      status: "failed",
+      currentStage: "deploy",
+      sourceRunId: failedCandidate.id,
+      issueCode: "AD-CNB-202",
+      message: "新版本发布失败",
+      completedSteps: ["prepare"],
+      startedAt: "2026-07-15T11:00:00.000Z",
+      updatedAt: "2026-07-15T11:00:00.000Z",
+    };
+    const settingKey = `project.${encodeURIComponent(path)}`;
+    localStorage.setItem(
+      `abcdeploy.setting.${settingKey}.verified-run`,
+      JSON.stringify([onlineVersion.id, failedCandidate.id]),
+    );
+
+    render(
+      <ProductWorkspace
+        initialProductionVersionId={failedCandidate.id}
+        initialScene="production"
+        onDeployTest={vi.fn()}
+        onError={vi.fn()}
+        onPromote={vi.fn()}
+        onRefresh={vi.fn()}
+        onSaveManifest={vi.fn().mockResolvedValue(true)}
+        onServerChange={vi.fn()}
+        path={path}
+        runs={[
+          failedProduction,
+          failedCandidate,
+          onlineProduction,
+          onlineVersion,
+        ]}
+        saving={false}
+        workspace={workspace}
+      />,
+    );
+
+    expect(await screen.findByLabelText("当前正式版本")).toHaveTextContent(
+      "当前稳定版本",
+    );
+    expect(screen.getByLabelText("本次发布版本")).toHaveTextContent(
+      "待发布的新版本",
+    );
   });
 
   it("makes the final production confirmation explicit and reversible", () => {
@@ -4437,23 +5599,14 @@ describe("ProductWorkspace blocking states", () => {
     const status = vi
       .spyOn(api, "getSecretStatus")
       .mockImplementation(async (key) => ({ key, stored: false }));
-    let finishUsernameWrite: (() => void) | undefined;
-    const store = vi
-      .spyOn(api, "storeSecret")
-      .mockImplementation(async (key) => {
-        if (key.endsWith(".username")) {
-          await new Promise<void>((resolve) => {
-            finishUsernameWrite = resolve;
-          });
-        }
-        return { key, stored: true };
+    const replace = vi
+      .spyOn(api, "replaceRegistryCredentials")
+      .mockResolvedValue({
+        provider: "registry",
+        ok: true,
+        summary: "镜像仓库登录信息可用",
+        details: [],
       });
-    const check = vi.spyOn(api, "checkRegistryCredentials").mockResolvedValue({
-      provider: "registry",
-      ok: true,
-      summary: "镜像仓库登录信息可用",
-      details: [],
-    });
 
     render(
       <ProductWorkspace
@@ -4473,7 +5626,7 @@ describe("ProductWorkspace blocking states", () => {
     await beginFirstVersionSetup();
     expect(
       await screen.findByRole("button", {
-        name: /保存项目版本.*现在完成/,
+        name: /连接镜像仓库.*现在完成/,
       }),
     ).toBeInTheDocument();
     expect(await screen.findByText("项目版本保存位置")).toBeInTheDocument();
@@ -4498,24 +5651,12 @@ describe("ProductWorkspace blocking states", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "验证并安全保存" }));
     await waitFor(() =>
-      expect(check).toHaveBeenCalledWith(
+      expect(replace).toHaveBeenCalledWith(
         "ccr.ccs.tencentyun.com",
+        "registry.tcr.v2",
         "tcr-user",
         "tcr-password",
       ),
-    );
-    await waitFor(() => expect(store).toHaveBeenCalledTimes(1));
-    expect(store).toHaveBeenNthCalledWith(
-      1,
-      "registry.tcr.v2.username",
-      "tcr-user",
-    );
-    act(() => finishUsernameWrite?.());
-    await waitFor(() => expect(store).toHaveBeenCalledTimes(2));
-    expect(store).toHaveBeenNthCalledWith(
-      2,
-      "registry.tcr.v2.password",
-      "tcr-password",
     );
     await waitFor(() =>
       expect(localStorage.getItem("abcdeploy.setting.registry.mode")).toBe(
@@ -4531,12 +5672,11 @@ describe("ProductWorkspace blocking states", () => {
       ),
     ).toBe("ccr.ccs.tencentyun.com");
     expect(
-      screen.getByRole("button", { name: /保存项目版本.*已准备/ }),
+      screen.getByRole("button", { name: /连接镜像仓库.*已准备/ }),
     ).toBeInTheDocument();
     expect(screen.queryByDisplayValue("tcr-password")).not.toBeInTheDocument();
     status.mockRestore();
-    store.mockRestore();
-    check.mockRestore();
+    replace.mockRestore();
   });
 
   it("does not save or advance when the registry rejects the credentials", async () => {
@@ -4563,16 +5703,17 @@ describe("ProductWorkspace blocking states", () => {
     const status = vi
       .spyOn(api, "getSecretStatus")
       .mockImplementation(async (key) => ({ key, stored: false }));
-    const check = vi.spyOn(api, "checkRegistryCredentials").mockResolvedValue({
-      provider: "registry",
-      ok: false,
-      summary: "镜像仓库没有接受这组登录信息",
-      details: [],
-      code: "AD-REG-102",
-      nextSteps: ["重新获取登录用户名和访问密码后再试"],
-      retryable: false,
-    });
-    const store = vi.spyOn(api, "storeSecret");
+    const replace = vi
+      .spyOn(api, "replaceRegistryCredentials")
+      .mockResolvedValue({
+        provider: "registry",
+        ok: false,
+        summary: "镜像仓库没有接受这组登录信息",
+        details: [],
+        code: "AD-REG-102",
+        nextSteps: ["重新获取登录用户名和访问密码后再试"],
+        retryable: false,
+      });
 
     render(
       <ProductWorkspace
@@ -4590,7 +5731,7 @@ describe("ProductWorkspace blocking states", () => {
     );
 
     await beginFirstVersionSetup();
-    fireEvent.click(screen.getByRole("button", { name: /保存项目版本/ }));
+    fireEvent.click(screen.getByRole("button", { name: /连接镜像仓库/ }));
     fireEvent.change(await screen.findByLabelText("登录用户名"), {
       target: { value: "wrong-user" },
     });
@@ -4608,9 +5749,9 @@ describe("ProductWorkspace blocking states", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("镜像仓库没有接受这组登录信息")).not.toBeVisible();
     expect(screen.getByText(/未通过验证的信息不会保存/)).toBeInTheDocument();
-    expect(store).not.toHaveBeenCalled();
+    expect(replace).toHaveBeenCalledTimes(1);
     expect(
-      screen.getByRole("button", { name: /保存项目版本.*现在完成/ }),
+      screen.getByRole("button", { name: /连接镜像仓库.*现在完成/ }),
     ).toBeInTheDocument();
     expect(
       localStorage.getItem(
@@ -4619,8 +5760,7 @@ describe("ProductWorkspace blocking states", () => {
     ).toBeNull();
 
     status.mockRestore();
-    check.mockRestore();
-    store.mockRestore();
+    replace.mockRestore();
   });
 
   it("does not expose automatic-deployment actions before the test environment", async () => {
@@ -4659,9 +5799,20 @@ describe("ProductWorkspace blocking states", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("shows one CNB action at a time and opens the test scene automatically", async () => {
+  it("shows one CNB action at a time and returns to the release overview", async () => {
     const path = "/demo/guided-cloud-authorization";
     const workspace = await openProject(path);
+    let currentClipboard = "";
+    const clipboardWrite = vi.fn(async (value: string) => {
+      currentClipboard = value;
+    });
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        readText: vi.fn(async () => currentClipboard),
+        writeText: clipboardWrite,
+      },
+    });
     const document = parseDocument(workspace.manifestYaml);
     document.setIn(["source", "repository"], "demo/guided-cloud-authorization");
     document.setIn(
@@ -4827,6 +5978,8 @@ describe("ProductWorkspace blocking states", () => {
     ).toBeInTheDocument();
 
     view.unmount();
+    await waitFor(() => expect(clipboardWrite).toHaveBeenLastCalledWith(""));
+    expect(currentClipboard).toBe("");
     render(
       <ProductWorkspace
         initialServer={server}
@@ -4883,12 +6036,11 @@ describe("ProductWorkspace blocking states", () => {
       expect(secretRepositoryAccess).toHaveBeenCalledTimes(2),
     );
     expect(
-      await screen.findByRole("heading", { name: "部署测试版" }),
+      await screen.findByRole("heading", { name: "发布中心" }),
     ).toBeInTheDocument();
+    expectOverviewTopLevelActive();
     expect(
-      screen.queryByText(
-        "系统会依次带你完成剩余设置，全部完成后自动进入测试版",
-      ),
+      screen.queryByText("系统会依次带你完成剩余设置，全部完成后返回发布中心"),
     ).not.toBeInTheDocument();
 
     repositoryAccess.mockRestore();
@@ -4937,7 +6089,7 @@ describe("ProductWorkspace blocking states", () => {
     );
 
     await beginFirstVersionSetup();
-    fireEvent.click(screen.getByRole("button", { name: /保存项目版本/ }));
+    fireEvent.click(screen.getByRole("button", { name: /连接镜像仓库/ }));
     fireEvent.click(
       await screen.findByRole("button", { name: "验证已保存登录信息" }),
     );
@@ -4962,7 +6114,7 @@ describe("ProductWorkspace blocking states", () => {
       ),
     ).toBe("ccr.ccs.tencentyun.com");
     expect(
-      screen.getByRole("button", { name: /保存项目版本.*已准备/ }),
+      screen.getByRole("button", { name: /连接镜像仓库.*已准备/ }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: /连接代码平台.*现在完成/ }),
@@ -5353,6 +6505,7 @@ describe("ProductWorkspace blocking states", () => {
       />,
     );
 
+    await openProductionEnvironmentDetails();
     expect(
       await screen.findByRole("heading", {
         name: "正在确认正式发布条件",
@@ -5429,22 +6582,31 @@ describe("ProductWorkspace blocking states", () => {
       />,
     );
 
+    await openProductionEnvironmentDetails();
     expect(
       await screen.findByRole("heading", {
         name: "正在确认正式发布条件",
       }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "正在确认正式配置" }),
+      screen.getByRole("heading", { name: "正式环境服务器" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("正在核对已经保存的正式配置")).toBeInTheDocument();
+    expect(
+      screen.getByText(/选择正式版本实际运行的服务器/),
+    ).toBeInTheDocument();
     expect(screen.queryByText("先保存上面的配置")).not.toBeInTheDocument();
     expect(screen.queryByText("等待保存")).not.toBeInTheDocument();
   });
 
-  it("reuses the saved TCR setup for a project that still defaults to CNB images", async () => {
+  it("reuses the saved TCR setup after an existing deployment is reset", async () => {
     const path = "/demo/reuse-tcr-setup";
     const workspace = await openProject(path);
+    workspace.manifestExists = true;
+    workspace.adoption = {
+      ...workspace.adoption,
+      mode: "fresh",
+      freshDraft: true,
+    };
     const settingKey = `project.${encodeURIComponent(path)}`;
     localStorage.setItem(`abcdeploy.setting.${settingKey}.scene`, "versions");
     localStorage.setItem("abcdeploy.setting.registry.mode", "tcr");
@@ -5542,7 +6704,7 @@ describe("ProductWorkspace blocking states", () => {
     );
 
     await beginFirstVersionSetup();
-    fireEvent.click(screen.getByRole("button", { name: /保存项目版本/ }));
+    fireEvent.click(screen.getByRole("button", { name: /连接镜像仓库/ }));
     fireEvent.click(await screen.findByRole("button", { name: "检查并使用" }));
 
     await waitFor(() =>
@@ -5600,7 +6762,7 @@ describe("ProductWorkspace blocking states", () => {
     );
 
     await beginFirstVersionSetup();
-    fireEvent.click(screen.getByRole("button", { name: /保存项目版本/ }));
+    fireEvent.click(screen.getByRole("button", { name: /连接镜像仓库/ }));
     fireEvent.click(await screen.findByRole("button", { name: "检查并使用" }));
 
     const warning = await screen.findByText("登录信息没有通过验证");
@@ -5670,9 +6832,8 @@ describe("ProductWorkspace blocking states", () => {
       "staging",
       serverFormFromResource(server),
     );
-    expect(await screen.findByText("服务器信息已保存")).toBeInTheDocument();
     expect(
-      screen.getByText("部署时如果连接失效，系统会在当前步骤提示处理"),
+      await screen.findByText("已准备 2 项 · 还差 2 项"),
     ).toBeInTheDocument();
     list.mockRestore();
     check.mockRestore();
@@ -5770,6 +6931,26 @@ describe("ProductWorkspace blocking states", () => {
     expect(
       deploymentMilestones({ ...run, environment: "production" })[1],
     ).toEqual({ label: "确认版本", state: "done" });
+    expect(
+      deploymentMilestones({
+        ...run,
+        actionKind: "route-takeover",
+        environment: "production",
+        status: "needs_action",
+        completedSteps: [
+          "write-config",
+          "verify-build",
+          "publish-images",
+          "prepare-server",
+          "deploy",
+        ],
+      }),
+    ).toEqual([
+      { label: "准备项目", state: "done" },
+      { label: "确认版本", state: "done" },
+      { label: "启动服务", state: "done" },
+      { label: "确认正式地址", state: "active" },
+    ]);
   });
 
   it("does not silently reuse a same-name CNB repository", async () => {
@@ -5826,7 +7007,7 @@ describe("ProductWorkspace blocking states", () => {
     ensureRepository.mockRestore();
   });
 
-  it("keeps a CNB repository ready when only build history access is missing", async () => {
+  it("keeps a CNB repository incomplete when build history access is missing", async () => {
     const path = "/demo/repository-permission";
     const workspace = await openProject(path);
     workspace.manifestYaml = workspace.manifestYaml
@@ -5868,14 +7049,117 @@ describe("ProductWorkspace blocking states", () => {
     );
 
     await beginFirstVersionSetup();
-    expect(
-      await screen.findByText("已准备 2 项 · 还差 2 项"),
-    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /连接代码平台/ }));
     expect(
-      await screen.findByText("代码仓库可用；版本列表暂不可同步"),
+      await screen.findByText("当前令牌不能读取这个仓库的构建记录"),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByRole("button", {
+        name: /连接代码平台.*现在完成/,
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "更新授权" }),
     ).toBeInTheDocument();
     expect(checkAccess).toHaveBeenCalledWith("demo/repository-permission");
+    checkAccess.mockRestore();
+  });
+
+  it("keeps the newly connected CNB account when the repository capability check fails", async () => {
+    const path = "/demo/repository-new-token-capability";
+    const workspace = await openProject(path);
+    workspace.manifestYaml = workspace.manifestYaml
+      .split("repository: owner/ecat-energy")
+      .join("repository: demo/repository-new-token-capability");
+    const settingKey = `project.${encodeURIComponent(path)}`;
+    localStorage.setItem(`abcdeploy.setting.${settingKey}.scene`, "versions");
+    let finishInitialRepositoryCheck:
+      ((value: ProviderCheck) => void) | undefined;
+    const checkAccess = vi
+      .spyOn(api, "checkCnbRepositoryAccess")
+      .mockImplementationOnce(
+        async () =>
+          new Promise((resolve) => {
+            finishInitialRepositoryCheck = resolve;
+          }),
+      );
+    const connect = vi.spyOn(api, "connectCnb").mockResolvedValue({
+      connected: true,
+      displayName: "刚刚连接的账号",
+      username: "new-user",
+      defaultNamespace: "demo",
+      namespaces: [],
+    });
+    const onError = vi.fn();
+
+    render(
+      <ProductWorkspace
+        onDeployTest={vi.fn()}
+        onError={onError}
+        onPromote={vi.fn()}
+        onRefresh={vi.fn()}
+        onSaveManifest={vi.fn().mockResolvedValue(true)}
+        onServerChange={vi.fn()}
+        path={path}
+        runs={[]}
+        saving={false}
+        workspace={workspace}
+      />,
+    );
+
+    await beginFirstVersionSetup();
+    fireEvent.click(screen.getByRole("button", { name: /连接代码平台/ }));
+    expect(await screen.findByText("正在检查代码仓库")).toBeInTheDocument();
+    await act(async () => {
+      finishInitialRepositoryCheck?.({
+        provider: "cnb-repository",
+        ok: true,
+        summary: "CNB 仓库可用",
+        details: [],
+      });
+    });
+    const readyRepositoryStep = await screen.findByRole("button", {
+      name: /连接代码平台.*已准备/,
+    });
+    fireEvent.click(readyRepositoryStep);
+    checkAccess.mockRejectedValueOnce(
+      new Error(
+        "AD-CNB-103：CNB 授权缺少“构建记录读取”权限（repo-cnb-history:r）",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "更新授权" }));
+    fireEvent.change(screen.getByLabelText("访问令牌"), {
+      target: { value: "new-account-token" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "验证账号并连接" }));
+
+    await waitFor(() =>
+      expect(connect).toHaveBeenCalledWith(
+        "new-account-token",
+        true,
+        "demo/repository-new-token-capability",
+      ),
+    );
+    expect(
+      await screen.findByText("CNB 账号：刚刚连接的账号"),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByText("新令牌已保存，但 CNB 仍拒绝读取当前仓库"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("dialog", { name: "连接 CNB" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect(
+      await screen.findByRole("button", {
+        name: /连接代码平台.*现在完成/,
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("dialog", { name: "连接 CNB" }),
+    ).not.toBeInTheDocument();
+    expect(onError).not.toHaveBeenCalled();
+    connect.mockRestore();
     checkAccess.mockRestore();
   });
 
@@ -5919,7 +7203,7 @@ describe("ProductWorkspace blocking states", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "当前 CNB 授权供所有项目复用；真正同步或构建前会再次核对权限。",
+        "授权统一保存在本机；只有使用范围包含此仓库时才能复用。",
       ),
     ).toBeInTheDocument();
     expect(screen.queryByText("还没有连接 CNB 账号")).not.toBeInTheDocument();
@@ -5945,15 +7229,27 @@ describe("ProductWorkspace blocking states", () => {
     expect(openUrl).toHaveBeenCalledWith(
       "https://cnb.cool/profile/token/create",
     );
-    expect(screen.getByText("在创建令牌页面勾选这 5 项")).toBeInTheDocument();
+    expect(
+      screen.getByText("授权范围：在创建令牌页面勾选这 6 项"),
+    ).toBeInTheDocument();
     expect(screen.getByText("读写项目代码")).toBeInTheDocument();
+    expect(screen.getByText("读取构建详情")).toBeInTheDocument();
     expect(screen.getByText("触发自动构建")).toBeInTheDocument();
+    expect(
+      screen.getByText(/CNB 令牌需要同时设置“授权范围”和“使用范围”/),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("dialog", { name: "连接 CNB" })).getByText(
+        "demo/repository-account-recovery",
+      ),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "复制权限代码" }));
     await waitFor(() =>
       expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
         [
           "repo-code:rw",
           "repo-cnb-history:r",
+          "repo-cnb-detail:r",
           "repo-manage:rw",
           "repo-cnb-trigger:rw",
           "group-resource:rw",
@@ -6117,7 +7413,7 @@ describe("ProductWorkspace blocking states", () => {
     );
 
     expect(await screen.findByText("暂时无法刷新版本记录")).toBeInTheDocument();
-    expect(screen.getByText("上线设置需要更新")).toBeInTheDocument();
+    expect(screen.getByText("项目设置需要更新")).toBeInTheDocument();
     expect(
       screen.queryByText("main 自动部署测试已启用"),
     ).not.toBeInTheDocument();
@@ -6140,6 +7436,137 @@ describe("ProductWorkspace blocking states", () => {
 });
 
 describe("DNS guidance", () => {
+  it("offers certificate retry only when every failed route is waiting for HTTPS", () => {
+    const httpsPending = {
+      host: "cert.example.com",
+      url: "https://cert.example.com/",
+      phase: "https" as const,
+      reachable: false,
+      httpStatus: null,
+      message: "HTTPS 尚未就绪",
+    };
+    const dnsPending = {
+      ...httpsPending,
+      host: "dns.example.com",
+      url: "https://dns.example.com/",
+      phase: "dns" as const,
+      message: "尚未解析",
+    };
+    const ready = {
+      ...httpsPending,
+      host: "ready.example.com",
+      url: "https://ready.example.com/",
+      phase: "ready" as const,
+      reachable: true,
+      httpStatus: 200,
+      message: "可以访问",
+    };
+
+    expect(certificateOnlyRouteFailure([httpsPending, ready])).toBe(true);
+    expect(certificateOnlyRouteFailure([httpsPending, dnsPending])).toBe(false);
+    expect(
+      certificateOnlyRouteFailure([
+        httpsPending,
+        { ...dnsPending, phase: "tcp" },
+      ]),
+    ).toBe(false);
+    expect(certificateOnlyRouteFailure([ready])).toBe(false);
+  });
+
+  it("distinguishes DNS, HTTPS certificate, and ready route states", () => {
+    expect(
+      publicRouteStatusPresentation(
+        {
+          host: "missing.example.com",
+          url: "https://missing.example.com/",
+          phase: "dns",
+          reachable: false,
+          httpStatus: null,
+          message: "尚未解析",
+        },
+        false,
+      ),
+    ).toEqual({ state: "warning", status: "DNS 未解析" });
+    expect(
+      publicRouteStatusPresentation(
+        {
+          host: "cert.example.com",
+          url: "https://cert.example.com/",
+          phase: "https",
+          reachable: false,
+          httpStatus: null,
+          message: "HTTPS 尚未就绪",
+        },
+        false,
+      ),
+    ).toEqual({ state: "warning", status: "DNS 已生效，等待 HTTPS" });
+    expect(
+      publicRouteStatusPresentation(
+        {
+          host: "ready.example.com",
+          url: "https://ready.example.com/",
+          phase: "ready",
+          reachable: true,
+          httpStatus: 200,
+          message: "可以访问",
+        },
+        false,
+      ),
+    ).toEqual({ state: "success", status: "可以访问" });
+    expect(
+      publicRouteStatusPresentation(
+        {
+          host: "closed.example.com",
+          url: "https://closed.example.com/",
+          phase: "tcp",
+          reachable: false,
+          httpStatus: null,
+          message: "443 端口连接失败",
+        },
+        false,
+      ),
+    ).toEqual({ state: "warning", status: "TCP/443 不可达" });
+    expect(
+      publicRouteStatusPresentation(
+        {
+          host: "unknown.example.com",
+          url: "https://unknown.example.com/",
+          phase: "check",
+          reachable: false,
+          httpStatus: null,
+          message: "检查没有完成",
+        },
+        false,
+      ),
+    ).toEqual({ state: "warning", status: "检查中断" });
+    expect(
+      publicRouteStatusPresentation(
+        {
+          host: "legacy.example.com",
+          url: "https://legacy.example.com/",
+          phase: "route-conflict",
+          reachable: false,
+          httpStatus: null,
+          message: "仍由旧服务提供",
+        },
+        false,
+      ),
+    ).toEqual({ state: "warning", status: "正在使用旧服务" });
+    expect(
+      publicRouteStatusPresentation(
+        {
+          host: "inactive.example.com",
+          url: "https://inactive.example.com/",
+          phase: "route-missing",
+          reachable: false,
+          httpStatus: null,
+          message: "服务器尚未启用",
+        },
+        false,
+      ),
+    ).toEqual({ state: "warning", status: "服务器尚未启用" });
+  });
+
   it("uses the matching record type for IPv4 and IPv6 servers", () => {
     expect(dnsRecordTypeForTarget("203.0.113.10")).toBe("A");
     expect(dnsRecordTypeForTarget("2001:db8::10")).toBe("AAAA");

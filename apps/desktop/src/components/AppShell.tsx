@@ -306,11 +306,11 @@ export function AppShell({
               badge={
                 setupAttentionItems.length +
                   verificationAttentionItems.length +
-                  attentionItems.length || undefined
+                  manualAttentionItems.length || undefined
               }
               badgeTone={hasBlockingAttention ? "warning" : "accent"}
               icon={Activity}
-              label="部署任务"
+              label="待处理"
               onClick={() => setActivityOpen(true)}
             />
           </nav>
@@ -406,9 +406,9 @@ export function AppShell({
       <Dialog onOpenChange={setActivityOpen} open={activityOpen}>
         <DialogContent className="max-h-[78vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>部署任务</DialogTitle>
+            <DialogTitle>待处理与最近活动</DialogTitle>
             <DialogDescription>
-              不需要停留在部署页面；系统会继续处理，需要你时会保留明确的下一步。
+              这里只汇总需要你处理的事项和最近结果；部署操作从对应项目的发布中心发起。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-5">

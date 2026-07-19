@@ -633,7 +633,15 @@ fn host_key_gate(profile: &SshProfile, observed: &str) -> Option<ProviderCheck> 
 
 fn client_config() -> client::Config {
     client::Config {
-        inactivity_timeout: Some(Duration::from_secs(15)),
+        // A valid remote command can be deliberately quiet for minutes while
+        // Docker pulls or pushes a large image.  Treating that silence as an
+        // inactive SSH session aborted healthy deployments after 15 seconds.
+        // Every caller already owns a bounded command timeout, so keep the
+        // transport alive and let that operation-specific timeout decide when
+        // work is genuinely stuck.
+        inactivity_timeout: None,
+        keepalive_interval: Some(Duration::from_secs(10)),
+        keepalive_max: 6,
         ..Default::default()
     }
 }
@@ -717,7 +725,7 @@ fn ssh_error(action: &str, error: &russh::Error) -> DeployError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTHORIZED_KEYS_INSTALL_COMMAND, SshProfile, discover_identities_in,
+        AUTHORIZED_KEYS_INSTALL_COMMAND, SshProfile, client_config, discover_identities_in,
         generate_managed_identity_in, host_key_gate, identity_public_key,
     };
     use std::path::PathBuf;
@@ -742,6 +750,17 @@ mod tests {
         let public_key = identity_public_key(&generated.identity.path).expect("public key");
         assert!(public_key.starts_with("ssh-ed25519 "));
         assert!(!AUTHORIZED_KEYS_INSTALL_COMMAND.contains(&public_key));
+    }
+
+    #[test]
+    fn keeps_long_silent_remote_commands_alive() {
+        let config = client_config();
+        assert_eq!(config.inactivity_timeout, None);
+        assert_eq!(
+            config.keepalive_interval,
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(config.keepalive_max, 6);
     }
 
     #[test]

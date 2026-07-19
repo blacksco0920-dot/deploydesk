@@ -4,13 +4,12 @@ services:
   site:
     image: ${DEPLOYDESK_SITE_IMAGE:?请填写不可变镜像地址}
     restart: unless-stopped
-    env_file:
-    - .runtime.env
     environment:
       DEPLOYDESK_ENV: staging
     networks:
       apps:
         aliases:
+        - abcdeploy-site
         - abcdeploy-staging-site
     labels:
       deploydesk.environment: staging
@@ -19,7 +18,7 @@ services:
     healthcheck:
       test:
       - CMD-SHELL
-      - wget -q --spider http://127.0.0.1:80/
+      - wget -Y off -q --spider http://127.0.0.1:80/
       interval: 10s
       timeout: 5s
       retries: 12

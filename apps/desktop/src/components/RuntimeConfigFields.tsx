@@ -4,16 +4,20 @@ import {
   EyeOff,
   KeyRound,
   LoaderCircle,
+  RefreshCw,
   Save,
   Sparkles,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   getRuntimeConfigSyncStatus,
+  listConfigProfileBindings,
   listConfigProfiles,
   loadExistingProjectConfig,
   loadRuntimeConfig,
   recommendRuntimeConfig,
+  saveConfigProfile,
+  setEnvironmentConfigBindings,
   storeRuntimeConfig,
   syncRuntimeConfigToServer,
   writeLocalEnv,
@@ -44,6 +48,7 @@ import {
 } from "./ui/select";
 
 interface RuntimeConfigFieldsProps {
+  displayName?: string;
   environment: RuntimeEnvironment;
   onError: (message: string) => void;
   onMarkOptional?: (key: string) => Promise<boolean>;
@@ -62,13 +67,22 @@ interface EnvField {
   value: string;
 }
 
-const environmentLabels: Record<RuntimeEnvironment, string> = {
-  development: "本机",
-  staging: "测试",
-  production: "正式",
-};
+interface CommonConfigDraft {
+  description: string;
+  field: EnvField;
+  profileId?: string;
+  value: string;
+}
+
+function environmentLabel(environment: RuntimeEnvironment) {
+  if (environment === "development") return "本机";
+  if (environment === "staging") return "测试";
+  if (environment === "production") return "正式";
+  return "运行";
+}
 
 export function RuntimeConfigFields({
+  displayName,
   environment,
   onError,
   onMarkOptional,
@@ -81,7 +95,12 @@ export function RuntimeConfigFields({
   const [document, setDocument] = useState<RuntimeConfigFile | null>(null);
   const [content, setContent] = useState("");
   const [profiles, setProfiles] = useState<ConfigProfile[]>([]);
+  const [boundProfileIds, setBoundProfileIds] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadFailure, setLoadFailure] = useState("");
+  const [bindingFailure, setBindingFailure] = useState("");
+  const [bindingRefreshPending, setBindingRefreshPending] = useState(false);
+  const [applyingProfile, setApplyingProfile] = useState(false);
   const [saving, setSaving] = useState(false);
   const [remoteSynchronized, setRemoteSynchronized] = useState(false);
   const [remoteCheckComplete, setRemoteCheckComplete] = useState(false);
@@ -89,10 +108,16 @@ export function RuntimeConfigFields({
   const [showSecrets, setShowSecrets] = useState<Record<string, boolean>>({});
   const [confirmOverwrite, setConfirmOverwrite] = useState(false);
   const [pendingOptional, setPendingOptional] = useState<EnvField | null>(null);
+  const [commonConfigDraft, setCommonConfigDraft] =
+    useState<CommonConfigDraft | null>(null);
+  const [commonConfigFailure, setCommonConfigFailure] = useState("");
+  const [savingCommonConfig, setSavingCommonConfig] = useState(false);
   const onErrorRef = useRef(onError);
   const automaticSaveAttempted = useRef("");
   const skipNextRemoteCheck = useRef(false);
-  const label = environmentLabels[environment];
+  const refreshRequest = useRef(0);
+  const profileMutationInFlight = useRef(false);
+  const label = displayName ?? environmentLabel(environment);
   const heading = environment === "development" ? "必要配置" : `${label}配置`;
 
   useEffect(() => {
@@ -101,19 +126,106 @@ export function RuntimeConfigFields({
 
   const refresh = useCallback(
     async (authorize = false) => {
+      const request = refreshRequest.current + 1;
+      refreshRequest.current = request;
       setLoading(true);
+      setLoadFailure("");
+      setBindingFailure("");
+      setBindingRefreshPending(false);
+      let runtimeLoaded = false;
       try {
-        const [loaded, availableProfiles] = await Promise.all([
-          loadRuntimeConfig(path, environment, authorize),
-          listConfigProfiles(),
-        ]);
+        const loaded = await loadRuntimeConfig(path, environment, authorize);
+        if (request !== refreshRequest.current) return;
+        runtimeLoaded = true;
+        let nextContent = fillDeploymentRuntimeDefaults(
+          loaded.content,
+          environment,
+        );
         setDocument(loaded);
-        setContent(fillDeploymentRuntimeDefaults(loaded.content, environment));
-        setProfiles(availableProfiles.filter(isReusableVariable));
+        setContent(nextContent);
+        setProfiles([]);
+        setBoundProfileIds([]);
+
+        const [availableProfiles, bindings] = await Promise.all([
+          listConfigProfiles(),
+          listConfigProfileBindings(path, environment),
+        ]);
+        if (request !== refreshRequest.current) return;
+        const reusableProfiles = availableProfiles.filter(isReusableVariable);
+        const profilesById = new Map(
+          availableProfiles.map((profile) => [profile.id, profile]),
+        );
+        const documentVariables = new Set(
+          parseEnvFields(nextContent, loaded.requiredVariables).map(
+            (field) => field.key,
+          ),
+        );
+        const validBindingIds = bindings
+          .map((binding) => binding.profileId)
+          .filter((profileId) => {
+            const profile = profilesById.get(profileId);
+            if (!profile) return false;
+            return (
+              !isReusableVariable(profile) ||
+              documentVariables.has(profile.values.env_name)
+            );
+          });
+        if (validBindingIds.length !== bindings.length) {
+          await setEnvironmentConfigBindings(
+            path,
+            environment,
+            validBindingIds,
+          );
+          if (request !== refreshRequest.current) return;
+        }
+        const reusableProfileIds = new Set(
+          reusableProfiles.map((profile) => profile.id),
+        );
+        const activeProfileIds = validBindingIds.filter((profileId) =>
+          reusableProfileIds.has(profileId),
+        );
+        setProfiles(reusableProfiles);
+        setBoundProfileIds(activeProfileIds);
+        if (activeProfileIds.length && !loaded.authorizationRequired) {
+          const protectedReference = reusableProfiles.some(
+            (profile) =>
+              activeProfileIds.includes(profile.id) &&
+              profileHasProtectedValue(profile),
+          );
+          if (protectedReference) {
+            setBindingRefreshPending(true);
+          } else {
+            nextContent = clearProfileBoundValues(
+              nextContent,
+              reusableProfiles,
+              activeProfileIds,
+            );
+            const recommendation = await recommendRuntimeConfig(
+              path,
+              environment,
+              activeProfileIds,
+              nextContent,
+            );
+            if (request !== refreshRequest.current) return;
+            nextContent = recommendation.content;
+            setContent(nextContent);
+          }
+        }
       } catch (error) {
-        onErrorRef.current(toMessage(error));
+        if (request !== refreshRequest.current) return;
+        const message = toMessage(error);
+        if (runtimeLoaded) {
+          setBindingFailure(message);
+        } else {
+          setDocument(null);
+          setContent("");
+          setProfiles([]);
+          setBoundProfileIds([]);
+          setLoadFailure(message);
+          onErrorRef.current(message);
+        }
       } finally {
-        setLoading(false);
+        if (request === refreshRequest.current) setLoading(false);
       }
     },
     [environment, path],
@@ -121,6 +233,9 @@ export function RuntimeConfigFields({
 
   useEffect(() => {
     void refresh(false);
+    return () => {
+      refreshRequest.current += 1;
+    };
   }, [refresh]);
 
   const fields = useMemo(
@@ -169,12 +284,14 @@ export function RuntimeConfigFields({
       (!checksRemoteServer || remoteSynchronized)),
   );
   const automaticEmptySaveKey =
-    environment === "staging" && server && document
+    ((environment === "staging" && server) ||
+      environment.startsWith("path-")) &&
+    document
       ? [
           path,
-          server.host,
-          server.port,
-          server.user,
+          server?.host ?? environment,
+          server?.port ?? "",
+          server?.user ?? "",
           document.stored ? "stored" : "new",
           content,
         ].join("\u0000")
@@ -183,7 +300,11 @@ export function RuntimeConfigFields({
     automaticEmptySaveKey &&
     !loading &&
     !document?.authorizationRequired &&
-    fields.length === 0 &&
+    fields.every(
+      (field) =>
+        Boolean(field.value.trim()) ||
+        managedRemoteDependency(environment, field.key),
+    ) &&
     !ready &&
     !(document?.stored && !remoteCheckComplete) &&
     automaticSaveAttempted.current !== automaticEmptySaveKey,
@@ -280,22 +401,168 @@ export function RuntimeConfigFields({
     setContent((current) => replaceEnvLine(current, field.lineIndex, value));
   }
 
-  async function useProfile(field: EnvField, profileId: string) {
-    if (!profileId) return;
+  async function refreshBoundProfileValues() {
+    if (
+      profileMutationInFlight.current ||
+      !boundProfileIds.length ||
+      document?.authorizationRequired
+    )
+      return;
+    profileMutationInFlight.current = true;
+    setApplyingProfile(true);
+    setBindingFailure("");
     try {
+      const source = clearProfileBoundValues(
+        content,
+        profiles,
+        boundProfileIds,
+      );
       const result = await recommendRuntimeConfig(
         path,
         environment,
-        [profileId],
-        content,
+        boundProfileIds,
+        source,
+      );
+      setContent(result.content);
+      setBindingRefreshPending(false);
+    } catch (error) {
+      const message = toMessage(error);
+      setBindingFailure(message);
+      onError(message);
+    } finally {
+      profileMutationInFlight.current = false;
+      setApplyingProfile(false);
+    }
+  }
+
+  async function useProfile(field: EnvField, profileId: string) {
+    if (!profileId || profileMutationInFlight.current) return;
+    profileMutationInFlight.current = true;
+    setApplyingProfile(true);
+    setBindingFailure("");
+    try {
+      const idsForOtherFields = boundProfileIds.filter((boundId) => {
+        const profile = profiles.find((candidate) => candidate.id === boundId);
+        return profile?.values.env_name !== field.key;
+      });
+      if (profileId === "__manual__") {
+        await setEnvironmentConfigBindings(
+          path,
+          environment,
+          idsForOtherFields,
+        );
+        setBoundProfileIds(idsForOtherFields);
+        setBindingRefreshPending(
+          profiles.some(
+            (profile) =>
+              idsForOtherFields.includes(profile.id) &&
+              profileHasProtectedValue(profile),
+          ),
+        );
+        return;
+      }
+      const nextProfileIds = Array.from(
+        new Set([...idsForOtherFields, profileId]),
+      );
+      const clearedContent = replaceEnvLine(content, field.lineIndex, "");
+      const result = await recommendRuntimeConfig(
+        path,
+        environment,
+        nextProfileIds,
+        clearedContent,
       );
       if (!result.filledVariables.includes(field.key)) {
         onError(`所选配置没有为 ${field.key} 提供可用值`);
         return;
       }
+      await setEnvironmentConfigBindings(path, environment, nextProfileIds);
+      setBoundProfileIds(nextProfileIds);
+      setBindingRefreshPending(false);
       setContent(result.content);
     } catch (error) {
-      onError(toMessage(error));
+      const message = toMessage(error);
+      setBindingFailure(message);
+      onError(message);
+    } finally {
+      profileMutationInFlight.current = false;
+      setApplyingProfile(false);
+    }
+  }
+
+  function openCommonConfig(field: EnvField) {
+    setCommonConfigFailure("");
+    setCommonConfigDraft({
+      description: field.comment || field.key,
+      field,
+      value: field.value,
+    });
+  }
+
+  async function saveCommonConfig() {
+    if (!commonConfigDraft || profileMutationInFlight.current) return;
+    const description = commonConfigDraft.description.trim();
+    const value = commonConfigDraft.value;
+    if (!description) {
+      setCommonConfigFailure("请填写一个以后容易识别的说明");
+      return;
+    }
+    if (!value.trim()) {
+      setCommonConfigFailure("请填写配置值");
+      return;
+    }
+
+    profileMutationInFlight.current = true;
+    setSavingCommonConfig(true);
+    setCommonConfigFailure("");
+    const { field } = commonConfigDraft;
+    const secret = isSecretVariable(field.key, secretVariables);
+    try {
+      const saved = await saveConfigProfile({
+        id: commonConfigDraft.profileId,
+        kind: "custom",
+        provider: "environment",
+        name: description,
+        scope: "any",
+        values: secret
+          ? { env_name: field.key }
+          : { env_name: field.key, env_value: value },
+        secretFields: secret ? [field.key] : [],
+        secrets: secret ? { [field.key]: value } : {},
+        isDefault: profiles.length === 0,
+      });
+      const idsForOtherFields = boundProfileIds.filter((boundId) => {
+        const profile = profiles.find((candidate) => candidate.id === boundId);
+        return profile?.values.env_name !== field.key;
+      });
+      const nextProfileIds = Array.from(
+        new Set([...idsForOtherFields, saved.id]),
+      );
+      try {
+        await setEnvironmentConfigBindings(path, environment, nextProfileIds);
+      } catch (error) {
+        // The profile may already be safely stored. Keep its id so retrying the
+        // dialog updates that same entry instead of creating duplicates.
+        setCommonConfigDraft((current) =>
+          current ? { ...current, profileId: saved.id } : current,
+        );
+        throw error;
+      }
+
+      setProfiles((current) => [
+        ...current.filter((profile) => profile.id !== saved.id),
+        saved,
+      ]);
+      setBoundProfileIds(nextProfileIds);
+      setBindingRefreshPending(false);
+      setContent((current) => replaceEnvLine(current, field.lineIndex, value));
+      setCommonConfigDraft(null);
+    } catch (error) {
+      const message = toMessage(error);
+      setCommonConfigFailure(message);
+      onError(message);
+    } finally {
+      profileMutationInFlight.current = false;
+      setSavingCommonConfig(false);
     }
   }
 
@@ -438,6 +705,33 @@ export function RuntimeConfigFields({
     );
   }
 
+  if (loadFailure || !document) {
+    return (
+      <div
+        className="rounded-lg border border-[var(--warning)]/35 bg-[var(--warning-soft)] px-4 py-4"
+        role="alert"
+      >
+        <strong className="block text-sm">暂时无法读取{label}配置</strong>
+        <p className="mb-3 mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
+          为避免覆盖原有配置，本页已停止保存。重新读取成功后才能继续修改。
+        </p>
+        {loadFailure ? (
+          <code className="mb-3 block break-all text-[11px] text-[var(--muted-foreground)]">
+            {loadFailure}
+          </code>
+        ) : null}
+        <Button
+          onClick={() => void refresh(false)}
+          size="sm"
+          variant="secondary"
+        >
+          <RefreshCw />
+          重新读取
+        </Button>
+      </div>
+    );
+  }
+
   return (
     <>
       <div className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
@@ -476,12 +770,19 @@ export function RuntimeConfigFields({
                               : "配置项已经齐全，等待保存"}
             </p>
           </div>
-          {ready ? (
-            <span className="flex items-center gap-1.5 text-xs text-[var(--success)]">
-              <CheckCircle2 className="size-4" />
-              {checksRemoteServer ? "已准备" : "已保存"}
-            </span>
-          ) : null}
+          <div className="flex shrink-0 items-center gap-3">
+            {boundProfileIds.length ? (
+              <span className="text-xs text-[var(--muted-foreground)]">
+                引用配置中心 {boundProfileIds.length} 项
+              </span>
+            ) : null}
+            {ready ? (
+              <span className="flex items-center gap-1.5 text-xs text-[var(--success)]">
+                <CheckCircle2 className="size-4" />
+                {checksRemoteServer ? "已准备" : "已保存"}
+              </span>
+            ) : null}
+          </div>
         </div>
 
         {usesVerifiedRemoteConfig ? (
@@ -520,11 +821,64 @@ export function RuntimeConfigFields({
           </div>
         ) : null}
 
+        {bindingRefreshPending && !document.authorizationRequired ? (
+          <div className="flex items-center justify-between gap-4 border-b border-[var(--accent)]/20 bg-[var(--info-soft)] px-4 py-3">
+            <div>
+              <strong className="text-sm font-medium">
+                配置中心有已引用的敏感值
+              </strong>
+              <p className="mb-0 mt-1 text-xs text-[var(--muted-foreground)]">
+                应用启动时不会自动读取系统密钥库；需要刷新引用时再确认即可。
+              </p>
+            </div>
+            <Button
+              disabled={applyingProfile}
+              onClick={() => void refreshBoundProfileValues()}
+              size="sm"
+              variant="secondary"
+            >
+              {applyingProfile ? (
+                <LoaderCircle className="animate-spin-slow" />
+              ) : (
+                <KeyRound />
+              )}
+              {applyingProfile ? "正在读取" : "读取引用配置"}
+            </Button>
+          </div>
+        ) : null}
+
+        {bindingFailure ? (
+          <div
+            className="flex items-center justify-between gap-4 border-b border-[var(--warning)]/25 bg-[var(--warning-soft)] px-4 py-3"
+            role="alert"
+          >
+            <div>
+              <strong className="text-sm font-medium">
+                配置中心引用暂时没有恢复
+              </strong>
+              <p className="mb-0 mt-1 text-xs text-[var(--muted-foreground)]">
+                当前运行配置没有被覆盖。可以重试，或取消引用后手动填写。
+              </p>
+            </div>
+            <Button
+              disabled={applyingProfile}
+              onClick={() => void refresh(false)}
+              size="sm"
+              variant="secondary"
+            >
+              重新检查
+            </Button>
+          </div>
+        ) : null}
+
         {visibleFields.length ? (
           visibleFields.map((field) => {
             const secret = isSecretVariable(field.key, secretVariables);
             const candidates = profiles.filter(
               (profile) => profile.values.env_name === field.key,
+            );
+            const selectedProfile = candidates.find((profile) =>
+              boundProfileIds.includes(profile.id),
             );
             const inputId = `${environment}-${field.key}`;
             return (
@@ -571,6 +925,7 @@ export function RuntimeConfigFields({
                         field.key,
                         environment,
                       )}
+                      readOnly={Boolean(selectedProfile)}
                       type={
                         secret && !showSecrets[field.key] ? "password" : "text"
                       }
@@ -596,7 +951,9 @@ export function RuntimeConfigFields({
                   </div>
                   {candidates.length ? (
                     <Select
+                      disabled={applyingProfile}
                       onValueChange={(value) => void useProfile(field, value)}
+                      value={selectedProfile?.id ?? "__manual__"}
                     >
                       <SelectTrigger
                         aria-label={`${field.key} 使用配置中心已有值`}
@@ -604,6 +961,7 @@ export function RuntimeConfigFields({
                         <SelectValue placeholder="使用配置中心已有值" />
                       </SelectTrigger>
                       <SelectContent>
+                        <SelectItem value="__manual__">手动填写</SelectItem>
                         {candidates.map((profile) => (
                           <SelectItem key={profile.id} value={profile.id}>
                             {profile.name}
@@ -611,6 +969,21 @@ export function RuntimeConfigFields({
                         ))}
                       </SelectContent>
                     </Select>
+                  ) : null}
+                  {!selectedProfile ? (
+                    <Button
+                      disabled={applyingProfile || savingCommonConfig}
+                      onClick={() => openCommonConfig(field)}
+                      size="sm"
+                      type="button"
+                      variant="secondary"
+                    >
+                      {field.value.trim()
+                        ? "保存为常用配置"
+                        : candidates.length
+                          ? "新增常用配置"
+                          : "添加常用配置"}
+                    </Button>
                   ) : null}
                 </div>
                 {!field.value.trim() ? (
@@ -685,6 +1058,7 @@ export function RuntimeConfigFields({
               <Button
                 disabled={
                   saving ||
+                  applyingProfile ||
                   checkingRemoteSync ||
                   Boolean(missingRequired.length) ||
                   Boolean(document?.authorizationRequired)
@@ -766,6 +1140,105 @@ export function RuntimeConfigFields({
             <Button disabled={saving} onClick={() => void markOptional()}>
               {saving ? <LoaderCircle className="animate-spin-slow" /> : null}
               确认不需要
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        onOpenChange={(open) => {
+          if (!open && !savingCommonConfig) {
+            setCommonConfigDraft(null);
+            setCommonConfigFailure("");
+          }
+        }}
+        open={Boolean(commonConfigDraft)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {commonConfigDraft?.field.value.trim()
+                ? "保存为常用配置"
+                : "添加常用配置"}
+            </DialogTitle>
+            <DialogDescription>
+              保存后，当前{label}
+              环境会立即使用这项配置。以后其他项目遇到相同配置名称时，也可以直接选择。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-1">
+            <div className="space-y-2">
+              <Label htmlFor="common-config-key">配置名称</Label>
+              <Input
+                id="common-config-key"
+                readOnly
+                value={commonConfigDraft?.field.key ?? ""}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="common-config-description">说明</Label>
+              <Input
+                id="common-config-description"
+                onChange={(event) =>
+                  setCommonConfigDraft((current) =>
+                    current
+                      ? { ...current, description: event.target.value }
+                      : current,
+                  )
+                }
+                placeholder="例如：公司统一短信服务令牌"
+                value={commonConfigDraft?.description ?? ""}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="common-config-value">值</Label>
+              <Input
+                id="common-config-value"
+                onChange={(event) =>
+                  setCommonConfigDraft((current) =>
+                    current
+                      ? { ...current, value: event.target.value }
+                      : current,
+                  )
+                }
+                type={
+                  commonConfigDraft &&
+                  isSecretVariable(commonConfigDraft.field.key, secretVariables)
+                    ? "password"
+                    : "text"
+                }
+                value={commonConfigDraft?.value ?? ""}
+              />
+            </div>
+            {commonConfigFailure ? (
+              <p
+                className="mb-0 rounded-md bg-[var(--warning-soft)] px-3 py-2 text-xs text-[var(--warning-foreground)]"
+                role="alert"
+              >
+                {commonConfigFailure}。当前内容和原有引用均未改变。
+              </p>
+            ) : null}
+          </div>
+          <DialogFooter>
+            <Button
+              disabled={savingCommonConfig}
+              onClick={() => {
+                setCommonConfigDraft(null);
+                setCommonConfigFailure("");
+              }}
+              variant="secondary"
+            >
+              取消
+            </Button>
+            <Button
+              disabled={savingCommonConfig}
+              onClick={() => void saveCommonConfig()}
+            >
+              {savingCommonConfig ? (
+                <LoaderCircle className="animate-spin-slow" />
+              ) : (
+                <Save />
+              )}
+              {savingCommonConfig ? "正在保存" : "保存并使用"}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -949,6 +1422,44 @@ function isReusableVariable(profile: ConfigProfile) {
   return profile.kind === "custom" && Boolean(profile.values.env_name);
 }
 
+function profileHasProtectedValue(profile: ConfigProfile) {
+  const variable = profile.values.env_name;
+  return Boolean(variable && profile.configuredSecretFields.includes(variable));
+}
+
+function profileProvidesEnvironmentValue(profile: ConfigProfile) {
+  const variable = profile.values.env_name;
+  return Boolean(
+    variable &&
+    (profile.values.env_value?.trim() ||
+      profile.configuredSecretFields.includes(variable)),
+  );
+}
+
+function clearProfileBoundValues(
+  content: string,
+  profiles: ConfigProfile[],
+  profileIds: string[],
+) {
+  const variables = new Set(
+    profiles
+      .filter(
+        (profile) =>
+          profileIds.includes(profile.id) &&
+          profileProvidesEnvironmentValue(profile),
+      )
+      .map((profile) => profile.values.env_name)
+      .filter(Boolean),
+  );
+  let next = content;
+  for (const field of parseEnvFields(next, [])) {
+    if (variables.has(field.key)) {
+      next = replaceEnvLine(next, field.lineIndex, "");
+    }
+  }
+  return next;
+}
+
 function isSecretVariable(key: string, knownSecrets: string[]) {
   return (
     knownSecrets.includes(key) ||
@@ -964,7 +1475,7 @@ function RuntimeFieldHint({
   variable: string;
 }) {
   if (environment === "development") return null;
-  const label = environmentLabels[environment];
+  const label = environmentLabel(environment);
   if (variable === "DATABASE_URL") {
     return (
       <p className="mb-0 mt-2 text-xs text-[var(--muted-foreground)]">

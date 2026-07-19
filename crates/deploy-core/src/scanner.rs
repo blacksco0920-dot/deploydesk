@@ -156,6 +156,22 @@ pub fn inspect_project(root: &Path) -> Result<InspectionReport> {
             };
             let service_id = sanitize_id(id_source);
             let dockerfile = find_service_dockerfile(&root, package_dir, &service_id, &dockerfiles);
+            let is_desktop_client = package_dir.join("src-tauri").is_dir()
+                || package.has_dependency("@tauri-apps/api")
+                || package.has_dependency("@tauri-apps/cli")
+                || package.has_dependency("electron")
+                || package.has_dependency("electron-builder");
+            if is_desktop_client && dockerfile.is_none() {
+                diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Info,
+                    code: "desktop_client_detected".to_string(),
+                    message: format!(
+                        "已识别 {service_id} 为桌面客户端；没有显式 Dockerfile，因此不部署为服务器服务"
+                    ),
+                    path: Some(relative_string(&root, &package_path)),
+                });
+                continue;
+            }
             let detected_port = dockerfile
                 .as_deref()
                 .and_then(|path| dockerfile_exposed_port(&root.join(path)))
@@ -716,6 +732,13 @@ fn should_visit(entry: &DirEntry) -> bool {
             | ".next"
             | ".turbo"
             | "coverage"
+            | "fixtures"
+            | "__fixtures__"
+            | "examples"
+            | "test"
+            | "tests"
+            | "__tests__"
+            | "e2e"
     )
 }
 
@@ -1013,6 +1036,64 @@ mod tests {
             service.start_command.as_deref(),
             Some("node dist/server.js")
         );
+    }
+
+    #[test]
+    fn keeps_nested_examples_fixtures_and_desktop_clients_out_of_the_server_model() {
+        let directory = tempdir().expect("tempdir");
+        for path in [
+            "apps/site",
+            "apps/desktop/src-tauri",
+            "fixtures/sample-api",
+            "examples/sample-web",
+        ] {
+            fs::create_dir_all(directory.path().join(path)).expect("package directory");
+        }
+        fs::write(
+            directory.path().join("package.json"),
+            r#"{"name":"workspace-root","private":true,"workspaces":["apps/*"]}"#,
+        )
+        .expect("root package");
+        fs::write(
+            directory.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - apps/*\n",
+        )
+        .expect("workspace");
+        fs::write(
+            directory.path().join("apps/site/package.json"),
+            r#"{"name":"@sample/site","scripts":{"build":"vite build"},"dependencies":{"vite":"1"}}"#,
+        )
+        .expect("site package");
+        fs::write(
+            directory.path().join("apps/desktop/package.json"),
+            r#"{"name":"@sample/desktop","scripts":{"build":"vite build"},"dependencies":{"vite":"1","@tauri-apps/api":"2"}}"#,
+        )
+        .expect("desktop package");
+        fs::write(
+            directory.path().join("fixtures/sample-api/package.json"),
+            r#"{"name":"fixture-api","scripts":{"start":"node server.js"}}"#,
+        )
+        .expect("fixture package");
+        fs::write(
+            directory.path().join("examples/sample-web/package.json"),
+            r#"{"name":"example-web","scripts":{"build":"vite build"},"dependencies":{"vite":"1"}}"#,
+        )
+        .expect("example package");
+
+        let report = inspect_project(directory.path()).expect("inspection");
+
+        assert_eq!(
+            report
+                .services
+                .iter()
+                .map(|service| service.id.as_str())
+                .collect::<Vec<_>>(),
+            ["site"]
+        );
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "desktop_client_detected"
+                && diagnostic.path.as_deref() == Some("apps/desktop/package.json")
+        }));
     }
 
     #[test]

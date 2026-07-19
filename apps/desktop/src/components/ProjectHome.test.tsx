@@ -90,20 +90,23 @@ describe("ProjectHome", () => {
       screen.queryByRole("button", { name: "添加项目" }),
     ).not.toBeInTheDocument();
     const projectOptions = screen.getByRole("button", {
-      name: "移除 finagent 的本机项目记录",
+      name: "从列表隐藏 finagent",
     });
     expect(
-      screen.queryByRole("button", { name: "移除 finagent" }),
+      screen.queryByRole("button", { name: "确认从列表隐藏 finagent" }),
     ).not.toBeInTheDocument();
     fireEvent.click(projectOptions);
     expect(
       screen.getByRole("heading", {
-        name: "移除 finagent 的本机记录？",
+        name: "从列表隐藏 finagent？",
       }),
     ).toBeInTheDocument();
+    expect(screen.getByRole("dialog")).toHaveTextContent(
+      /连接、项目设置、\s*配置引用、版本和部署历史都会保留/,
+    );
     expect(
       screen.getByRole("button", {
-        name: "确认移除 finagent 的本机记录",
+        name: "确认从列表隐藏 finagent",
       }),
     ).toBeInTheDocument();
   });

@@ -35,4 +35,19 @@ describe("desktop window accessibility", () => {
     expect(productWorkspace).toContain("max-[760px]:flex-col");
     expect(productWorkspace).toContain("max-[760px]:flex-wrap");
   });
+
+  it("keeps the four stable project sections available at narrow widths", () => {
+    expect(productWorkspace).toContain('aria-label="项目导航"');
+    expect(productWorkspace).toContain(
+      '{ key: "overview", label: "发布中心" }',
+    );
+    expect(productWorkspace).toContain('{ key: "local", label: "在本机运行" }');
+    expect(productWorkspace).toContain('{ key: "versions", label: "版本" }');
+    expect(productWorkspace).toContain(
+      '{ key: "settings", label: "项目设置" }',
+    );
+    expect(productWorkspace).toContain(
+      "max-[760px]:grid max-[760px]:grid-cols-2",
+    );
+  });
 });

@@ -197,8 +197,13 @@ pub fn create_default_manifest(report: &InspectionReport) -> ProjectManifest {
                 kind: BuildProviderKind::Cnb,
                 repository: format!("owner/{}", report.project_name),
             },
-            registry: RegistryConfig::Cnb {
-                repository: format!("owner/{}", report.project_name),
+            // 首版默认使用腾讯云 TCR 保存不可变镜像。命名空间属于用户的
+            // 云账号资源，项目识别阶段无法可靠推断，因此保留显式占位符，
+            // 由首次上线任务在真正构建前引导用户选择或填写。
+            // Registry 仍是独立适配器；既有 CNB/OCI 清单继续兼容。
+            registry: RegistryConfig::Tcr {
+                registry: "ccr.ccs.tencentyun.com".to_string(),
+                namespace: "replace-me".to_string(),
             },
             runtime: RuntimeProviderConfig::SshDockerCompose,
             secrets: SecretProviderConfig::CnbSecretRepository,
@@ -766,25 +771,26 @@ fn standard_dockerfile(
         "FROM node:22-bookworm-slim AS build\n\n",
         "ENV COREPACK_NPM_REGISTRY=https://registry.npmmirror.com \\\n    npm_config_registry=https://registry.npmmirror.com \\\n    NO_PROXY=registry.npmmirror.com \\\n    no_proxy=registry.npmmirror.com\n\n",
         "WORKDIR /app\n",
-        "RUN corepack enable \\\n    && for attempt in 1 2 3; do \\\n         HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= corepack pnpm --version && break; \\\n         test \"$attempt\" = 3 && exit 1; \\\n         sleep $((attempt * 2)); \\\n       done\n",
+        "RUN corepack enable \\\n    && for attempt in 1 2 3; do \\\n         HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= corepack pnpm --version \\\n           && HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= corepack pnpm@10.26.1 --version \\\n           && break; \\\n         test \"$attempt\" = 3 && exit 1; \\\n         sleep $((attempt * 2)); \\\n       done\n",
         "COPY . .\n",
         "RUN --mount=type=cache,target=/root/.local/share/pnpm/store \\\n    for attempt in 1 2 3; do \\\n      HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= corepack pnpm install --frozen-lockfile && break; \\\n      test \"$attempt\" = 3 && exit 1; \\\n      sleep $((attempt * 2)); \\\n    done\n",
     );
     match detected.framework {
         Framework::NestJs => Some(format!(
-            "{header}RUN corepack pnpm --filter {} build \\\n    && corepack pnpm@10.26.1 --filter {} deploy --legacy --prod /opt/app\n\n\
+            "{header}RUN corepack pnpm --filter {}... build \\\n    && HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= corepack pnpm@10.26.1 --filter {} deploy --legacy --prod /opt/app \\\n    && mkdir -p /opt/runtime-configs \\\n    && if [ -d /app/configs ]; then cp -R /app/configs/. /opt/runtime-configs/; fi\n\n\
 FROM node:22-bookworm-slim AS runtime\n\n\
 ENV NODE_ENV=production\n\
 WORKDIR /app\n\
 COPY --from=build /opt/app ./\n\
 COPY --from=build {output_path} ./dist\n\
+COPY --from=build /opt/runtime-configs /configs\n\
 USER node\n\
 EXPOSE {}\n\
 CMD [\"node\", \"dist/main.js\"]\n",
             detected.package_name, detected.package_name, service.container_port
         )),
         Framework::Vite => Some(format!(
-            "{header}RUN corepack pnpm --filter {} run build \\\n{}\n\n{}",
+            "{header}RUN corepack pnpm --filter {}... run build \\\n{}\n\n{}",
             detected.package_name,
             stage_static_output(&output_path),
             standard_static_runtime("/opt/static", service.container_port, api_host, api_port),
@@ -798,7 +804,7 @@ CMD [\"node\", \"dist/main.js\"]\n",
                 return None;
             }
             Some(format!(
-                "{header}RUN corepack pnpm --filter {} run build:h5 \\\n{}\n\n{}",
+                "{header}RUN corepack pnpm --filter {}... run build:h5 \\\n{}\n\n{}",
                 detected.package_name,
                 stage_static_output(&output_path),
                 standard_static_runtime("/opt/static", service.container_port, api_host, api_port),
@@ -1109,6 +1115,19 @@ mod tests {
     use crate::scanner::{inspect_project, inspection_fixture};
 
     #[test]
+    fn fresh_projects_use_tcr_as_the_visible_default_version_store() {
+        let manifest = create_default_manifest(&inspection_fixture());
+
+        assert_eq!(
+            manifest.providers.registry,
+            RegistryConfig::Tcr {
+                registry: "ccr.ccs.tencentyun.com".to_string(),
+                namespace: "replace-me".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn plan_is_previewable_and_apply_creates_backups() {
         let directory = tempdir().expect("tempdir");
         let report = inspection_fixture();
@@ -1273,13 +1292,14 @@ mod tests {
         assert!(
             dockerfile
                 .after
-                .contains("pnpm --filter @example/api build")
+                .contains("pnpm --filter @example/api... build")
         );
         assert!(
             dockerfile
                 .after
                 .contains("pnpm@10.26.1 --filter @example/api deploy --legacy --prod /opt/app")
         );
+        assert!(dockerfile.after.contains("/opt/runtime-configs /configs"));
         assert!(dockerfile.after.contains("NO_PROXY=registry.npmmirror.com"));
         assert!(dockerfile.after.contains("USER node"));
     }
@@ -1716,7 +1736,7 @@ mod tests {
         assert!(
             dockerfile
                 .after
-                .contains("pnpm --filter @sample/mobile run build:h5")
+                .contains("pnpm --filter @sample/mobile... run build:h5")
         );
         assert!(
             dockerfile

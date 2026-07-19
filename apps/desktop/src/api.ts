@@ -9,16 +9,26 @@ import type {
   CnbSecretBundle,
   ConfigProfile,
   ConfigProfileInput,
+  ConnectionKind,
+  ConnectionResource,
+  DeploymentAttempt,
+  DeploymentPath,
+  DeploymentPathInput,
   DeploymentRun,
   DnsProviderHint,
   ExistingProjectConfig,
+  EnvironmentConfigBindings,
   LocalEnvWriteResult,
   LocalDevelopmentSupport,
   LocalPreviewStatus,
   LocalInfrastructureStatus,
   OnboardingStep,
+  ProjectEnvironment,
+  ProjectConnectionBindings,
+  ProjectVersion,
   ProjectProfileBinding,
   ProviderCheck,
+  PublicRouteStatus,
   PipelineIdentityResult,
   RecentProject,
   RelinkProjectResult,
@@ -37,7 +47,10 @@ import type {
   SshIdentity,
   SystemPreflight,
   WorkspacePreview,
+  VersionValidation,
+  VersionValidationState,
 } from "./types";
+import { deploymentVersionKey } from "./lib/projects";
 
 export async function selectProjectDirectory(
   title = "选择 AI 生成的整个项目文件夹（不要只选前端或后端）",
@@ -98,6 +111,8 @@ export async function getPreflight(): Promise<SystemPreflight> {
 export async function openProject(path: string): Promise<WorkspacePreview> {
   if (!isTauri()) {
     const workspace = demoWorkspace(path);
+    const adoption = readDemoWorkspaceAdoption(path);
+    if (adoption) workspace.adoption = adoption;
     const manifestYaml = localStorage.getItem(demoManifestKey(path));
     if (manifestYaml) {
       workspace.manifestExists = true;
@@ -107,6 +122,49 @@ export async function openProject(path: string): Promise<WorkspacePreview> {
     return workspace;
   }
   return invoke<WorkspacePreview>("open_project", { path });
+}
+
+export async function continueExistingDeployment(
+  path: string,
+): Promise<WorkspacePreview> {
+  if (!isTauri()) {
+    const current = await openProject(path);
+    const adoption: WorkspacePreview["adoption"] = {
+      ...current.adoption,
+      mode: "managed",
+      detected: true,
+      freshDraft: false,
+    };
+    writeDemoWorkspaceAdoption(path, adoption);
+    return { ...current, adoption };
+  }
+  return invoke<WorkspacePreview>("continue_existing_deployment", { path });
+}
+
+export async function resetProjectDeployment(
+  path: string,
+): Promise<WorkspacePreview> {
+  if (!isTauri()) {
+    const current = await openProject(path);
+    const adoption: WorkspacePreview["adoption"] = {
+      ...current.adoption,
+      mode: "fresh",
+      detected: current.adoption.detected,
+      historyImportAfter: new Date().toISOString(),
+      freshDraft: true,
+    };
+    writeDemoWorkspaceAdoption(path, adoption);
+    localStorage.setItem(
+      DEMO_RUNS_KEY,
+      JSON.stringify(readDemoRuns().filter((run) => run.projectPath !== path)),
+    );
+    const bindings = readDemoServerBindings();
+    delete bindings[demoServerBindingKey(path, "staging")];
+    delete bindings[demoServerBindingKey(path, "production")];
+    localStorage.setItem(DEMO_SERVER_BINDINGS_KEY, JSON.stringify(bindings));
+    return { ...current, adoption };
+  }
+  return invoke<WorkspacePreview>("reset_project_deployment", { path });
 }
 
 export async function listRecentProjects(): Promise<RecentProject[]> {
@@ -137,6 +195,11 @@ export async function relinkProject(
       run.projectPath === oldPath ? { ...run, projectPath: newPath } : run,
     );
     localStorage.setItem(DEMO_RUNS_KEY, JSON.stringify(runs));
+    const validations = readDemoVersionValidations(oldPath);
+    if (validations.length) {
+      writeDemoVersionValidations(newPath, validations);
+      localStorage.removeItem(demoVersionValidationsKey(oldPath));
+    }
     const oldPrefix = `abcdeploy.setting.project.${encodeURIComponent(oldPath)}.`;
     const newPrefix = `abcdeploy.setting.project.${encodeURIComponent(newPath)}.`;
     for (let index = 0; index < localStorage.length; index += 1) {
@@ -193,6 +256,301 @@ export async function setAppSetting(key: string, value: string): Promise<void> {
     return;
   }
   return invoke("set_app_setting", { key, value });
+}
+
+export async function listConnections(
+  kind?: ConnectionKind,
+): Promise<ConnectionResource[]> {
+  if (!isTauri()) {
+    const cnb = readDemoCnbAccount();
+    const cnbCheckedAt = localStorage.getItem(
+      "abcdeploy.demo.connection.checked.cnb",
+    );
+    const tcrCheckedAt = localStorage.getItem(
+      "abcdeploy.demo.connection.checked.tcr",
+    );
+    const namespace = await getAppSetting("registry.tcr.namespace");
+    const verifiedEndpoint = await getAppSetting(
+      "registry.tcr.v2.verified-endpoint",
+    );
+    const connections: ConnectionResource[] = [
+      {
+        id: "connection-cnb-default",
+        kind: "source",
+        provider: "cnb",
+        name: cnb?.connected ? `CNB · ${cnb.displayName}` : "CNB",
+        status: cnbCheckedAt
+          ? "ready"
+          : cnb?.connected
+            ? "configured"
+            : "needs_authorization",
+        lastCheckedAt: cnbCheckedAt,
+        capabilities: ["repositories", "builds", "automation"],
+        metadata: {
+          endpoint: "https://cnb.cool",
+          ...(cnb?.username ? { username: cnb.username } : {}),
+          ...(cnb?.defaultNamespace ? { namespace: cnb.defaultNamespace } : {}),
+        },
+      },
+      {
+        id: "connection-tcr-default",
+        kind: "registry",
+        provider: "tcr",
+        name: "腾讯云 TCR",
+        status: tcrCheckedAt
+          ? "ready"
+          : verifiedEndpoint
+            ? "configured"
+            : "unknown",
+        lastCheckedAt: tcrCheckedAt,
+        capabilities: ["push", "pull"],
+        metadata: {
+          endpoint: verifiedEndpoint || "ccr.ccs.tencentyun.com",
+          ...(namespace ? { namespace } : {}),
+        },
+      },
+      ...Array.from(
+        new Map(
+          Object.values(readDemoServerBindings()).map((server) => [
+            server.id,
+            server,
+          ]),
+        ).values(),
+      ).map((server): ConnectionResource => ({
+        id: `legacy-server:${server.id}`,
+        kind: "server",
+        provider: "ssh",
+        name: server.name,
+        status: "configured",
+        lastCheckedAt: server.lastCheckedAt,
+        capabilities: ["deploy", "healthcheck", "reverse-proxy"],
+        metadata: {
+          host: server.host,
+          user: server.user,
+          port: String(server.port),
+          ...(server.hostFingerprint
+            ? { hostFingerprint: server.hostFingerprint }
+            : {}),
+        },
+      })),
+    ];
+    return kind
+      ? connections.filter((connection) => connection.kind === kind)
+      : connections;
+  }
+  return invoke<ConnectionResource[]>("list_connections", {
+    kind: kind ?? null,
+  });
+}
+
+export async function getProjectConnectionBindings(
+  path: string,
+): Promise<ProjectConnectionBindings> {
+  if (!isTauri()) {
+    const serverBindings = readDemoServerBindings();
+    const manifest =
+      localStorage.getItem(demoManifestKey(path)) ??
+      demoWorkspace(path).manifestYaml;
+    const registryConnectionId = /kind:\s*tcr\b/.test(manifest)
+      ? "connection-tcr-default"
+      : null;
+    return {
+      sourceConnectionId: "connection-cnb-default",
+      staging: {
+        targetConnectionId: serverBindings[
+          demoServerBindingKey(path, "staging")
+        ]
+          ? `legacy-server:${serverBindings[demoServerBindingKey(path, "staging")].id}`
+          : null,
+        registryConnectionId,
+      },
+      production: {
+        targetConnectionId: serverBindings[
+          demoServerBindingKey(path, "production")
+        ]
+          ? `legacy-server:${serverBindings[demoServerBindingKey(path, "production")].id}`
+          : null,
+        registryConnectionId,
+      },
+    };
+  }
+  return invoke<ProjectConnectionBindings>("get_project_connection_bindings", {
+    path,
+  });
+}
+
+function deploymentPathsSettingKey(path: string) {
+  return `project.${encodeURIComponent(path)}.deployment-paths.v1`;
+}
+
+function parseDeploymentPaths(
+  value: string | null,
+  projectPath: string,
+): DeploymentPath[] {
+  if (!value) return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (candidate): candidate is DeploymentPath =>
+          Boolean(candidate) &&
+          typeof candidate === "object" &&
+          typeof (candidate as DeploymentPath).id === "string" &&
+          typeof (candidate as DeploymentPath).name === "string",
+      )
+      .map((candidate) => ({
+        ...candidate,
+        projectPath,
+        sourceConnectionId: candidate.sourceConnectionId ?? null,
+        registryConnectionId: candidate.registryConnectionId ?? null,
+        serverId: candidate.serverId ?? null,
+        configProfileIds: Array.isArray(candidate.configProfileIds)
+          ? candidate.configProfileIds.filter(
+              (profileId): profileId is string => typeof profileId === "string",
+            )
+          : [],
+        address: typeof candidate.address === "string" ? candidate.address : "",
+        routes: Array.isArray(candidate.routes)
+          ? candidate.routes.filter(
+              (route): route is DeploymentPath["routes"][number] =>
+                Boolean(route) &&
+                typeof route === "object" &&
+                typeof route.service === "string" &&
+                typeof route.host === "string" &&
+                typeof route.path === "string",
+            )
+          : [],
+        state: [
+          "draft",
+          "ready",
+          "deploying",
+          "online",
+          "needs_action",
+        ].includes(candidate.state)
+          ? candidate.state
+          : "draft",
+        lastRunId: candidate.lastRunId ?? null,
+        lastSuccessfulRevision: candidate.lastSuccessfulRevision ?? null,
+      }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Deployment paths deliberately live in application state rather than the
+ * user's source tree. Only reusable connection ids and project-scoped values
+ * are persisted; credentials remain in their existing secure stores.
+ */
+export async function listDeploymentPaths(
+  path: string,
+): Promise<DeploymentPath[]> {
+  if (isTauri()) {
+    return invoke<DeploymentPath[]>("list_deployment_paths", { path });
+  }
+  return parseDeploymentPaths(
+    await getAppSetting(deploymentPathsSettingKey(path)),
+    path,
+  );
+}
+
+export async function listDeploymentPathRuns(
+  pathId: string,
+): Promise<DeploymentRun[]> {
+  if (isTauri()) {
+    return invoke<DeploymentRun[]>("list_deployment_path_runs", { pathId });
+  }
+  return readDemoRuns()
+    .filter((run) => run.environment === "deployment")
+    .sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+}
+
+export async function redeployDeploymentPathVersion(
+  pathId: string,
+  sourceRunId: string,
+): Promise<DeploymentRun> {
+  if (isTauri()) {
+    return invoke<DeploymentRun>("redeploy_deployment_path_version", {
+      pathId,
+      sourceRunId,
+    });
+  }
+  const source = readDemoRuns().find((run) => run.id === sourceRunId);
+  if (!source) throw new Error("找不到要重新上线的版本");
+  const run: DeploymentRun = {
+    ...source,
+    id: `run-${pathId}-${Date.now()}`,
+    status: "success",
+    message: "所选历史版本已经重新上线",
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  writeDemoRun(run);
+  return run;
+}
+
+export async function saveDeploymentPath(
+  input: DeploymentPathInput,
+): Promise<DeploymentPath> {
+  if (isTauri()) {
+    return invoke<DeploymentPath>("save_deployment_path", { input });
+  }
+  const paths = await listDeploymentPaths(input.projectPath);
+  const previous = input.id
+    ? paths.find((candidate) => candidate.id === input.id)
+    : undefined;
+  const now = new Date().toISOString();
+  const path: DeploymentPath = {
+    id:
+      input.id ??
+      `path-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    projectPath: input.projectPath,
+    name: input.name.trim() || "上线",
+    sourceConnectionId: input.sourceConnectionId,
+    registryConnectionId: input.registryConnectionId,
+    serverId: input.serverId,
+    configProfileIds: Array.from(new Set(input.configProfileIds)),
+    address: input.address.trim(),
+    routes: input.routes.map((route) => ({
+      service: route.service.trim(),
+      host: route.host.trim(),
+      path: route.path.trim() || "/",
+    })),
+    state: input.state ?? previous?.state ?? "draft",
+    lastRunId: input.lastRunId ?? previous?.lastRunId ?? null,
+    lastSuccessfulRevision:
+      input.lastSuccessfulRevision ?? previous?.lastSuccessfulRevision ?? null,
+    createdAt: previous?.createdAt ?? now,
+    updatedAt: now,
+  };
+  const next = [...paths.filter((candidate) => candidate.id !== path.id), path];
+  next.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  await setAppSetting(
+    deploymentPathsSettingKey(input.projectPath),
+    JSON.stringify(next),
+  );
+  return path;
+}
+
+export async function deleteDeploymentPath(
+  projectPath: string,
+  pathId: string,
+): Promise<boolean> {
+  if (isTauri()) {
+    return invoke<boolean>("delete_deployment_path", {
+      projectPath,
+      pathId,
+    });
+  }
+  const paths = await listDeploymentPaths(projectPath);
+  const next = paths.filter((candidate) => candidate.id !== pathId);
+  if (next.length === paths.length) return false;
+  await setAppSetting(
+    deploymentPathsSettingKey(projectPath),
+    JSON.stringify(next),
+  );
+  return true;
 }
 
 export async function listConfigProfiles(): Promise<ConfigProfile[]> {
@@ -266,10 +624,11 @@ export async function bindConfigProfile(
 ): Promise<ProjectProfileBinding> {
   if (!isTauri()) {
     const binding = { environment, kind, profileId };
-    localStorage.setItem(
-      demoBindingKey(path, environment, kind),
-      JSON.stringify(binding),
+    const bindings = readDemoConfigProfileBindings(path, environment).filter(
+      (current) => current.profileId !== profileId,
     );
+    bindings.push(binding);
+    writeDemoConfigProfileBindings(path, environment, bindings);
     return binding;
   }
   return invoke<ProjectProfileBinding>("bind_config_profile", {
@@ -283,19 +642,43 @@ export async function bindConfigProfile(
 export async function listConfigProfileBindings(
   path: string,
   environment: RuntimeEnvironment,
-): Promise<ProjectProfileBinding[]> {
+): Promise<EnvironmentConfigBindings> {
   if (!isTauri()) {
-    return (["ai", "database", "redis", "dns", "registry", "custom"] as const)
-      .map((kind) =>
-        localStorage.getItem(demoBindingKey(path, environment, kind)),
-      )
-      .flatMap((value) =>
-        value ? [JSON.parse(value) as ProjectProfileBinding] : [],
-      );
+    return readDemoConfigProfileBindings(path, environment);
   }
   return invoke<ProjectProfileBinding[]>("list_config_profile_bindings", {
     path,
     environment,
+  });
+}
+
+export async function setEnvironmentConfigBindings(
+  path: string,
+  environment: RuntimeEnvironment,
+  profileIds: string[],
+): Promise<EnvironmentConfigBindings> {
+  if (!isTauri()) {
+    const profiles = readDemoConfigProfiles();
+    const uniqueIds = Array.from(new Set(profileIds));
+    const bindings = uniqueIds.map((profileId) => {
+      const profile = profiles.find((candidate) => candidate.id === profileId);
+      if (!profile) throw new Error(`所选配置中心连接已不存在：${profileId}`);
+      const supported =
+        profile.scope === "any" ||
+        (profile.scope === "local" && environment === "development") ||
+        (profile.scope === "remote" && environment !== "development");
+      if (!supported) {
+        throw new Error(`配置“${profileId}”不适用于当前运行环境`);
+      }
+      return { environment, kind: profile.kind, profileId };
+    });
+    writeDemoConfigProfileBindings(path, environment, bindings);
+    return bindings;
+  }
+  return invoke<ProjectProfileBinding[]>("set_environment_config_bindings", {
+    path,
+    environment,
+    profileIds,
   });
 }
 
@@ -592,6 +975,10 @@ export async function applyManifest(
 ): Promise<ApplyResult> {
   if (!isTauri()) {
     localStorage.setItem(demoManifestKey(path), manifestYaml);
+    const adoption = readDemoWorkspaceAdoption(path);
+    if (adoption?.mode === "fresh" && adoption.freshDraft) {
+      writeDemoWorkspaceAdoption(path, { ...adoption, freshDraft: false });
+    }
     return {
       planId: "demo-plan",
       writtenFiles: ["deploy.yaml"],
@@ -611,6 +998,10 @@ export async function saveManifestDraft(
 ): Promise<ApplyResult> {
   if (!isTauri()) {
     localStorage.setItem(demoManifestKey(path), manifestYaml);
+    const adoption = readDemoWorkspaceAdoption(path);
+    if (adoption?.mode === "fresh" && adoption.freshDraft) {
+      writeDemoWorkspaceAdoption(path, { ...adoption, freshDraft: false });
+    }
     return {
       planId: "demo-draft-plan",
       writtenFiles: ["deploy.yaml"],
@@ -732,13 +1123,154 @@ export async function bindProjectServer(
   });
 }
 
+export async function createDeploymentTask(
+  path: string,
+  environment: DeploymentRun["environment"],
+  sourceRunId?: string,
+  deploymentPathId?: string,
+): Promise<DeploymentRun> {
+  if (!isTauri()) {
+    const run: DeploymentRun = {
+      ...demoRun(path, environment),
+      status: "queued",
+      currentStage: "prepare",
+      sourceRunId: sourceRunId ?? null,
+      completedSteps: [],
+      message:
+        environment === "production"
+          ? "正式发布任务已保存，正在核对目标环境"
+          : environment === "deployment"
+            ? "上线任务已保存，正在准备当前本地项目"
+            : "测试部署任务已保存，正在准备代码和运行环境",
+    };
+    writeDemoRun(run);
+    return run;
+  }
+  return invoke<DeploymentRun>("create_deployment_task", {
+    path,
+    environment,
+    sourceRunId: sourceRunId ?? null,
+    deploymentPathId: deploymentPathId ?? null,
+  });
+}
+
+export async function beginDeploymentAttempt(
+  taskId: string,
+): Promise<DeploymentAttempt> {
+  if (!isTauri()) {
+    const now = new Date().toISOString();
+    return {
+      id: `attempt-${taskId}-1`,
+      taskId,
+      ordinal: 1,
+      status: "running",
+      currentStage: "prepare",
+      inputSnapshot: {},
+      output: {},
+      startedAt: now,
+      finishedAt: null,
+      updatedAt: now,
+    };
+  }
+  return invoke<DeploymentAttempt>("begin_deployment_attempt", { taskId });
+}
+
+export async function listDeploymentAttempts(
+  taskId: string,
+): Promise<DeploymentAttempt[]> {
+  if (!isTauri()) return [];
+  return invoke<DeploymentAttempt[]>("list_deployment_attempts", { taskId });
+}
+
+export async function pauseDeploymentTask(
+  runId: string,
+  currentStage:
+    | "prepare"
+    | "prepare-server"
+    | "write-config"
+    | "sync-source"
+    | "trigger-build",
+  issueCode: string,
+  message: string,
+  actionKind:
+    | "retry-staging-preparation"
+    | "retry-production-preparation"
+    | "deployment-path-preparation-retry",
+): Promise<DeploymentRun> {
+  if (!isTauri()) {
+    const run = readDemoRuns().find((item) => item.id === runId);
+    if (!run) throw new Error("找不到这次部署任务");
+    const paused: DeploymentRun = {
+      ...run,
+      status: "needs_action",
+      currentStage,
+      issueCode,
+      actionKind,
+      message,
+      updatedAt: new Date().toISOString(),
+    };
+    writeDemoRun(paused);
+    return paused;
+  }
+  return invoke<DeploymentRun>("pause_deployment_task", {
+    runId,
+    currentStage,
+    issueCode,
+    message,
+    actionKind,
+  });
+}
+
+export async function prepareDeploymentPathRetry(
+  runId: string,
+  repairedNode: "local" | "build" | "registry" | "server",
+): Promise<DeploymentRun> {
+  if (!isTauri()) {
+    const run = readDemoRuns().find((item) => item.id === runId);
+    if (!run) throw new Error("找不到这次上线任务");
+    const next: DeploymentRun = {
+      ...run,
+      currentStage:
+        repairedNode === "server" && run.artifacts.length
+          ? "deploy"
+          : repairedNode,
+      issueCode: null,
+      actionKind: "deployment-path-retry",
+      message: "新配置已经验证，点击“继续上线”后从这里继续",
+      updatedAt: new Date().toISOString(),
+    };
+    writeDemoRun(next);
+    return next;
+  }
+  return invoke<DeploymentRun>("prepare_deployment_path_retry", {
+    runId,
+    repairedNode,
+  });
+}
+
 export async function startStagingDeployment(
   path: string,
   expectedRevision?: string,
   preferPushBuild = false,
+  taskId?: string,
 ): Promise<DeploymentRun> {
   if (!isTauri()) {
-    const run = demoRun(path, "staging");
+    const savedTask = taskId
+      ? readDemoRuns().find((item) => item.id === taskId)
+      : undefined;
+    const run = {
+      ...(savedTask ?? demoRun(path, "staging")),
+      status: "running" as const,
+      currentStage: "build",
+      commitSha:
+        expectedRevision ??
+        savedTask?.commitSha ??
+        "0123456789abcdef0123456789abcdef01234567",
+      actionKind: null,
+      issueCode: null,
+      message: "CNB 已开始构建，关闭应用后也可以继续查看",
+      updatedAt: new Date().toISOString(),
+    };
     writeDemoRun(run);
     return run;
   }
@@ -746,6 +1278,36 @@ export async function startStagingDeployment(
     path,
     expectedRevision: expectedRevision ?? null,
     preferPushBuild,
+    taskId: taskId ?? null,
+  });
+}
+
+export async function startDeploymentPath(
+  path: string,
+  expectedRevision: string,
+  taskId: string,
+): Promise<DeploymentRun> {
+  if (!isTauri()) {
+    const savedTask = readDemoRuns().find((item) => item.id === taskId);
+    if (!savedTask) throw new Error("找不到这次上线任务");
+    const run: DeploymentRun = {
+      ...savedTask,
+      environment: "deployment",
+      status: "running",
+      currentStage: "build",
+      commitSha: expectedRevision,
+      actionKind: null,
+      issueCode: null,
+      message: "构建服务正在生成可运行版本",
+      updatedAt: new Date().toISOString(),
+    };
+    writeDemoRun(run);
+    return run;
+  }
+  return invoke<DeploymentRun>("start_deployment_path", {
+    path,
+    expectedRevision,
+    taskId,
   });
 }
 
@@ -776,23 +1338,34 @@ export async function resumeStagingDeployment(
 
 export async function promoteProductionDeployment(
   sourceRunId: string,
+  taskId?: string,
 ): Promise<DeploymentRun> {
   if (!isTauri()) {
     const source = readDemoRuns().find((run) => run.id === sourceRunId);
     if (!source || source.status !== "success") {
       throw new Error("只有健康检查通过的测试版本才能发布生产");
     }
+    const savedTask = taskId
+      ? readDemoRuns().find((item) => item.id === taskId)
+      : undefined;
     const run = {
-      ...demoRun(source.projectPath, "production"),
+      ...(savedTask ?? demoRun(source.projectPath, "production")),
+      status: "running" as const,
+      currentStage: "build",
       commitSha: source.commitSha,
       sourceRunId,
       candidateTag: source.candidateTag,
+      actionKind: null,
+      issueCode: null,
+      message: "CNB 已开始构建，关闭应用后也可以继续查看",
+      updatedAt: new Date().toISOString(),
     };
     writeDemoRun(run);
     return run;
   }
   return invoke<DeploymentRun>("promote_production_deployment", {
     sourceRunId,
+    taskId: taskId ?? null,
   });
 }
 
@@ -809,7 +1382,9 @@ export async function refreshDeployment(runId: string): Promise<DeploymentRun> {
         message:
           run.environment === "production"
             ? "生产环境已按测试通过的同一镜像摘要发布"
-            : "测试环境部署完成并通过健康检查",
+            : run.environment === "deployment"
+              ? "项目已经上线并通过公网检查"
+              : "测试环境部署完成并通过健康检查",
         completedSteps: [
           "write-config",
           "verify-build",
@@ -850,6 +1425,62 @@ export async function listDeploymentRuns(
   if (!isTauri())
     return readDemoRuns().filter((run) => run.projectPath === path);
   return invoke<DeploymentRun[]>("list_deployment_runs", { path });
+}
+
+export async function listProjectEnvironments(
+  path: string,
+): Promise<ProjectEnvironment[]> {
+  if (!isTauri()) return demoProjectEnvironments(path);
+  return invoke<ProjectEnvironment[]>("list_project_environments", { path });
+}
+
+export async function listProjectVersions(
+  path: string,
+): Promise<ProjectVersion[]> {
+  if (!isTauri()) return demoProjectVersions(path);
+  return invoke<ProjectVersion[]>("list_project_versions", { path });
+}
+
+export async function listVersionValidations(
+  path: string,
+): Promise<VersionValidation[]> {
+  if (!isTauri()) return readDemoVersionValidations(path);
+  return invoke<VersionValidation[]>("list_version_validations", { path });
+}
+
+export async function setVersionValidation(
+  path: string,
+  runId: string,
+  validationState: VersionValidationState,
+): Promise<VersionValidation> {
+  if (!isTauri()) {
+    const run = readDemoRuns().find((candidate) => candidate.id === runId);
+    if (!run || run.projectPath !== path) {
+      throw new Error("这条版本记录不属于当前项目");
+    }
+    if (run.environment !== "staging" || run.status !== "success") {
+      throw new Error("只有已经成功部署到测试环境的版本才能确认测试结果");
+    }
+    const validation: VersionValidation = {
+      versionKey: deploymentVersionKey(run),
+      state: validationState,
+      runId,
+      verifiedAt: new Date().toISOString(),
+    };
+    const current = readDemoVersionValidations(path);
+    writeDemoVersionValidations(path, [
+      validation,
+      ...current.filter(
+        (candidate) => candidate.versionKey !== validation.versionKey,
+      ),
+    ]);
+    return validation;
+  }
+  return invoke<VersionValidation>("set_version_validation", {
+    path,
+    runId,
+    validationState,
+  });
 }
 
 export async function listActiveDeploymentRuns(): Promise<DeploymentRun[]> {
@@ -905,6 +1536,28 @@ export async function detectDnsProvider(
 ): Promise<DnsProviderHint | null> {
   if (!isTauri()) return null;
   return invoke<DnsProviderHint | null>("detect_dns_provider", { host });
+}
+
+export async function checkDeploymentRoutes(
+  runId: string,
+): Promise<PublicRouteStatus[]> {
+  if (!isTauri()) {
+    return (
+      readDemoRuns()
+        .find((run) => run.id === runId)
+        ?.routeChecks?.slice() ?? []
+    );
+  }
+  return invoke<PublicRouteStatus[]>("check_deployment_routes", { runId });
+}
+
+export async function retryDeploymentCertificates(
+  runId: string,
+): Promise<PublicRouteStatus[]> {
+  if (!isTauri()) return checkDeploymentRoutes(runId);
+  return invoke<PublicRouteStatus[]>("retry_deployment_certificates", {
+    runId,
+  });
 }
 
 export async function syncExternalDeployments(
@@ -966,6 +1619,30 @@ export async function takeOverServerRoutes(
     path,
     environment,
     server,
+    confirmed: true,
+  });
+}
+
+export async function takeOverDeploymentPathRoutes(
+  runId: string,
+): Promise<DeploymentRun> {
+  if (!isTauri()) {
+    const source = readDemoRuns().find((run) => run.id === runId);
+    if (!source) throw new Error("找不到需要继续的上线任务");
+    const run: DeploymentRun = {
+      ...source,
+      status: "success",
+      currentStage: "complete",
+      issueCode: null,
+      actionKind: null,
+      message: "现有访问地址已安全接管，上线完成",
+      updatedAt: new Date().toISOString(),
+    };
+    writeDemoRun(run);
+    return run;
+  }
+  return invoke<DeploymentRun>("take_over_deployment_path_routes", {
+    runId,
     confirmed: true,
   });
 }
@@ -1078,7 +1755,7 @@ export async function loadRuntimeConfig(
 
 export async function loadExistingProjectConfig(
   path: string,
-  environment: "staging" | "production",
+  environment: Exclude<RuntimeEnvironment, "development">,
 ): Promise<ExistingProjectConfig> {
   if (!isTauri()) {
     return {
@@ -1110,7 +1787,7 @@ export async function storeRuntimeConfig(
 
 export async function getRuntimeConfigSyncStatus(
   path: string,
-  environment: "staging" | "production",
+  environment: Exclude<RuntimeEnvironment, "development">,
   server: ServerForm,
 ): Promise<RuntimeConfigSyncStatus> {
   if (!isTauri()) {
@@ -1126,7 +1803,7 @@ export async function getRuntimeConfigSyncStatus(
 
 export async function syncRuntimeConfigToServer(
   path: string,
-  environment: "staging" | "production",
+  environment: Exclude<RuntimeEnvironment, "development">,
   server: ServerForm,
 ): Promise<RuntimeConfigSyncStatus> {
   if (!isTauri()) return { stored: true, synchronized: true };
@@ -1196,6 +1873,47 @@ export async function rollbackEnvironment(
   });
 }
 
+function safeDemoConnectionText(value: unknown, fallback = ""): string {
+  return typeof value === "string" &&
+    value.length <= 240 &&
+    !/[\u0000-\u001f\u007f]/.test(value)
+    ? value
+    : fallback;
+}
+
+function readDemoCnbAccount(): CnbAccount | null {
+  const stored = localStorage.getItem("abcdeploy.demo.cnb-account");
+  if (!stored) return null;
+  try {
+    const value = JSON.parse(stored) as Record<string, unknown>;
+    const namespaces = Array.isArray(value.namespaces)
+      ? value.namespaces.flatMap((item) => {
+          if (!item || typeof item !== "object") return [];
+          const namespace = item as Record<string, unknown>;
+          const path = safeDemoConnectionText(namespace.path);
+          if (!path) return [];
+          return [
+            {
+              path,
+              displayName: safeDemoConnectionText(namespace.displayName, path),
+              accessRole: safeDemoConnectionText(namespace.accessRole),
+              canCreateRepository: namespace.canCreateRepository === true,
+            },
+          ];
+        })
+      : [];
+    return {
+      connected: value.connected === true,
+      displayName: safeDemoConnectionText(value.displayName, "CNB"),
+      username: safeDemoConnectionText(value.username),
+      defaultNamespace: safeDemoConnectionText(value.defaultNamespace),
+      namespaces,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function connectCnb(
   token: string,
   persist: boolean,
@@ -1222,6 +1940,10 @@ export async function connectCnb(
         JSON.stringify(account),
       );
     }
+    localStorage.setItem(
+      "abcdeploy.demo.connection.checked.cnb",
+      new Date().toISOString(),
+    );
     return account;
   }
   return invoke("connect_cnb", {
@@ -1233,8 +1955,8 @@ export async function connectCnb(
 
 export async function getCnbAccount(): Promise<CnbAccount> {
   if (!isTauri()) {
-    const stored = localStorage.getItem("abcdeploy.demo.cnb-account");
-    if (stored) return JSON.parse(stored) as CnbAccount;
+    const stored = readDemoCnbAccount();
+    if (stored) return stored;
     return {
       connected: false,
       displayName: "尚未连接",
@@ -1317,6 +2039,7 @@ export async function syncProjectToCnb(
   repository: string,
   branch: string,
   allowUncommitted = false,
+  taskId?: string,
 ): Promise<SourceSyncResult> {
   if (!isTauri()) {
     return {
@@ -1331,6 +2054,7 @@ export async function syncProjectToCnb(
     repository,
     branch,
     allowUncommitted,
+    taskId: taskId ?? null,
   });
 }
 
@@ -1371,6 +2095,30 @@ export async function checkRegistryCredentials(
   }
   return invoke<ProviderCheck>("check_registry_credentials", {
     registry,
+    username,
+    password,
+  });
+}
+
+export async function replaceRegistryCredentials(
+  registry: string,
+  secretPrefix: string,
+  username: string,
+  password: string,
+): Promise<ProviderCheck> {
+  if (!isTauri()) {
+    const result = await checkRegistryCredentials(registry, username, password);
+    if (result.ok && secretPrefix === "registry.tcr.v2") {
+      localStorage.setItem(
+        "abcdeploy.demo.connection.checked.tcr",
+        new Date().toISOString(),
+      );
+    }
+    return result;
+  }
+  return invoke<ProviderCheck>("replace_registry_credentials", {
+    registry,
+    secretPrefix,
     username,
     password,
   });
@@ -1440,13 +2188,70 @@ const demoPreflight: SystemPreflight = {
 
 const DEMO_PROJECTS_KEY = "abcdeploy.demo.projects";
 const DEMO_RUNS_KEY = "abcdeploy.demo.runs";
+const DEMO_VERSION_VALIDATIONS_PREFIX = "abcdeploy.demo.version-validations.";
 const DEMO_SECRETS_KEY = "abcdeploy.demo.secrets";
 const DEMO_RUNTIME_CONFIGS_KEY = "abcdeploy.demo.runtime-configs";
 const DEMO_CONFIG_PROFILES_KEY = "abcdeploy.demo.config-profiles";
 const DEMO_SERVER_BINDINGS_KEY = "abcdeploy.demo.server-bindings";
+const DEMO_WORKSPACE_ADOPTION_PREFIX = "abcdeploy.demo.workspace-adoption.";
 
 function demoManifestKey(path: string) {
   return `abcdeploy.demo.manifest.${encodeURIComponent(path)}`;
+}
+
+function demoWorkspaceAdoptionKey(path: string) {
+  return `${DEMO_WORKSPACE_ADOPTION_PREFIX}${encodeURIComponent(path)}`;
+}
+
+function readDemoWorkspaceAdoption(
+  path: string,
+): WorkspacePreview["adoption"] | null {
+  try {
+    const value = localStorage.getItem(demoWorkspaceAdoptionKey(path));
+    return value ? (JSON.parse(value) as WorkspacePreview["adoption"]) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeDemoWorkspaceAdoption(
+  path: string,
+  adoption: WorkspacePreview["adoption"],
+) {
+  localStorage.setItem(
+    demoWorkspaceAdoptionKey(path),
+    JSON.stringify(adoption),
+  );
+}
+
+function demoVersionValidationsKey(path: string) {
+  return `${DEMO_VERSION_VALIDATIONS_PREFIX}${encodeURIComponent(path)}`;
+}
+
+function readDemoVersionValidations(path: string): VersionValidation[] {
+  try {
+    const raw = localStorage.getItem(demoVersionValidationsKey(path));
+    if (!raw) return [];
+    return (JSON.parse(raw) as VersionValidation[]).filter(
+      (validation) =>
+        typeof validation.versionKey === "string" &&
+        (validation.state === "passed" || validation.state === "rejected") &&
+        typeof validation.runId === "string" &&
+        typeof validation.verifiedAt === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
+function writeDemoVersionValidations(
+  path: string,
+  validations: VersionValidation[],
+) {
+  localStorage.setItem(
+    demoVersionValidationsKey(path),
+    JSON.stringify(validations),
+  );
 }
 
 function demoServerBindingKey(
@@ -1458,9 +2263,12 @@ function demoServerBindingKey(
 
 function readDemoServerBindings(): Record<string, ServerResource> {
   try {
-    return JSON.parse(
+    const value = JSON.parse(
       localStorage.getItem(DEMO_SERVER_BINDINGS_KEY) ?? "{}",
-    ) as Record<string, ServerResource>;
+    ) as unknown;
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, ServerResource>)
+      : {};
   } catch {
     return {};
   }
@@ -1635,6 +2443,58 @@ function demoBindingKey(
   kind: ConfigProfile["kind"],
 ) {
   return `abcdeploy.demo.binding.${path}.${environment}.${kind}`;
+}
+
+function demoBindingsKey(path: string, environment: RuntimeEnvironment) {
+  return `abcdeploy.demo.bindings.${encodeURIComponent(path)}.${environment}`;
+}
+
+function readDemoConfigProfileBindings(
+  path: string,
+  environment: RuntimeEnvironment,
+): ProjectProfileBinding[] {
+  const grouped = localStorage.getItem(demoBindingsKey(path, environment));
+  if (grouped !== null) {
+    try {
+      return JSON.parse(grouped) as ProjectProfileBinding[];
+    } catch {
+      return [];
+    }
+  }
+  return (["ai", "database", "redis", "dns", "registry", "custom"] as const)
+    .map((kind) =>
+      localStorage.getItem(demoBindingKey(path, environment, kind)),
+    )
+    .flatMap((value) =>
+      value ? [JSON.parse(value) as ProjectProfileBinding] : [],
+    );
+}
+
+function writeDemoConfigProfileBindings(
+  path: string,
+  environment: RuntimeEnvironment,
+  bindings: ProjectProfileBinding[],
+) {
+  localStorage.setItem(
+    demoBindingsKey(path, environment),
+    JSON.stringify(bindings),
+  );
+  for (const kind of [
+    "ai",
+    "database",
+    "redis",
+    "dns",
+    "registry",
+    "custom",
+  ] as const) {
+    localStorage.removeItem(demoBindingKey(path, environment, kind));
+  }
+  for (const binding of bindings) {
+    localStorage.setItem(
+      demoBindingKey(path, environment, binding.kind),
+      JSON.stringify(binding),
+    );
+  }
 }
 
 function demoLocalInfrastructureStatus(): LocalInfrastructureStatus {
@@ -1933,8 +2793,177 @@ function writeDemoRun(run: DeploymentRun) {
   localStorage.setItem(DEMO_PROJECTS_KEY, JSON.stringify(projects));
 }
 
+function demoProjectEnvironments(path: string): ProjectEnvironment[] {
+  const projectRuns = readDemoRuns().filter(
+    (run) => run.projectPath === path && run.status === "success",
+  );
+  const latestSuccessful = (environment: DeploymentRun["environment"]) =>
+    projectRuns
+      .filter(
+        (run) =>
+          run.environment === environment &&
+          !(
+            run.environment === "staging" &&
+            run.actionKind === "production-approval"
+          ),
+      )
+      .sort(compareDemoRuns)[0];
+  const staging = latestSuccessful("staging");
+  const production = latestSuccessful("production");
+  const productionSource = production?.sourceRunId
+    ? projectRuns.find(
+        (run) =>
+          run.environment === "staging" && run.id === production.sourceRunId,
+      )
+    : undefined;
+  const environment = (
+    name: ProjectEnvironment["environment"],
+    displayName: string,
+    currentRun: DeploymentRun | undefined,
+    currentVersionKey: string | null,
+  ): ProjectEnvironment => ({
+    environment: name,
+    displayName,
+    status: currentVersionKey ? "healthy" : "unknown",
+    currentVersionKey,
+    currentRunId: currentRun?.id ?? null,
+  });
+
+  return [
+    environment("development", "本机环境", undefined, null),
+    environment(
+      "staging",
+      "测试环境",
+      staging,
+      staging ? deploymentVersionKey(staging) : null,
+    ),
+    environment(
+      "production",
+      "生产环境",
+      production,
+      productionSource
+        ? deploymentVersionKey(productionSource)
+        : production
+          ? deploymentVersionKey(production)
+          : null,
+    ),
+  ];
+}
+
+function demoProjectVersions(path: string): ProjectVersion[] {
+  const successfulStagingRuns = readDemoRuns()
+    .filter(
+      (run) =>
+        run.projectPath === path &&
+        run.environment === "staging" &&
+        run.status === "success" &&
+        run.actionKind !== "production-approval",
+    )
+    .sort(compareDemoRuns);
+  const validations = new Map(
+    readDemoVersionValidations(path).map((validation) => [
+      validation.versionKey,
+      validation,
+    ]),
+  );
+  const environments = demoProjectEnvironments(path);
+  const environmentKeys = new Map(
+    environments.map((environment) => [
+      environment.environment,
+      environment.currentVersionKey,
+    ]),
+  );
+  const currentStagingRunId = environments.find(
+    (environment) => environment.environment === "staging",
+  )?.currentRunId;
+  const seen = new Set<string>();
+
+  return successfulStagingRuns.flatMap((run) => {
+    const versionKey = deploymentVersionKey(run);
+    if (seen.has(versionKey)) return [];
+    seen.add(versionKey);
+    const matchingRuns = successfulStagingRuns.filter(
+      (candidate) => deploymentVersionKey(candidate) === versionKey,
+    );
+    const stagingRun =
+      matchingRuns.find((candidate) => candidate.id === currentStagingRunId) ??
+      [...matchingRuns].sort(
+        (left, right) =>
+          right.updatedAt.localeCompare(left.updatedAt) ||
+          right.startedAt.localeCompare(left.startedAt) ||
+          right.id.localeCompare(left.id),
+      )[0];
+    const currentEnvironments = (["staging", "production"] as const).filter(
+      (environment) => environmentKeys.get(environment) === versionKey,
+    );
+    const artifacts = Array.from(
+      new Map(
+        run.artifacts
+          .filter((artifact) => artifact.digest.trim())
+          .map((artifact) => {
+            const normalized = {
+              service: artifact.service.trim(),
+              image: artifact.image.trim(),
+              digest: artifact.digest.trim().toLowerCase(),
+            };
+            return [
+              `${normalized.service}\u0000${normalized.image}\u0000${normalized.digest}`,
+              normalized,
+            ] as const;
+          }),
+      ).values(),
+    ).sort(
+      (left, right) =>
+        left.service.localeCompare(right.service) ||
+        left.image.localeCompare(right.image) ||
+        left.digest.localeCompare(right.digest),
+    );
+
+    return [
+      {
+        id: `demo-version:${encodeURIComponent(versionKey)}`,
+        versionKey,
+        status: "available",
+        commitSha: run.commitSha ?? null,
+        sourceTitle: run.sourceTitle ?? null,
+        sourceConnectionId: null,
+        sourceBuildId: run.buildSerial ?? null,
+        repository: run.repository || null,
+        branch: run.branch || null,
+        candidateTag: run.candidateTag ?? null,
+        stagingRunId: stagingRun?.id ?? null,
+        artifacts,
+        validation: validations.get(versionKey) ?? null,
+        currentEnvironments,
+        createdAt: matchingRuns.reduce(
+          (earliest, candidate) =>
+            candidate.startedAt < earliest ? candidate.startedAt : earliest,
+          run.startedAt,
+        ),
+        updatedAt: run.updatedAt,
+      },
+    ];
+  });
+}
+
+function compareDemoRuns(left: DeploymentRun, right: DeploymentRun) {
+  return (
+    right.startedAt.localeCompare(left.startedAt) ||
+    right.updatedAt.localeCompare(left.updatedAt) ||
+    right.id.localeCompare(left.id)
+  );
+}
+
 function demoWorkspace(path: string): WorkspacePreview {
   return {
+    adoption: {
+      mode: "fresh",
+      detected: false,
+      repository: null,
+      pipelineExists: false,
+      historyImportAfter: null,
+      freshDraft: false,
+    },
     manifestExists: false,
     manifestYaml: `version: 1
 project:

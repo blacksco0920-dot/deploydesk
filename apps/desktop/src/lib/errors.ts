@@ -1,13 +1,19 @@
 import type { ProviderCheck, UserFacingIssue } from "../types";
 
 const CODE_PATTERN = /(AD-[A-Z]+-\d{3})[：:]\s*([\s\S]+)$/;
+const CNB_SCOPE_PATTERN = /\b(?:repo|group)-[a-z0-9-]+:(?:r|rw)\b/g;
+
+function hasOnlyMissingCnbScope(message: string, scope: string): boolean {
+  const scopes = Array.from(new Set(message.match(CNB_SCOPE_PATTERN) ?? []));
+  return scopes.length === 1 && scopes[0] === scope;
+}
 
 export function issueFromProvider(
   check: ProviderCheck,
   title = "无法准备目标服务器",
 ): UserFacingIssue {
   const code = check.code ?? "AD-SRV-299";
-  const normalizedTitle = titleForCode(code);
+  const normalizedTitle = titleForCode(code, check.summary);
   const normalizedMessage = messageForCode(code, check.summary);
   const translated =
     Boolean(normalizedTitle) || normalizedMessage !== check.summary;
@@ -39,7 +45,7 @@ export function issueFromUnknown(
   const userMessage = messageForCode(coded?.[1], displayMessage);
   return {
     code: coded?.[1] ?? "AD-APP-001",
-    title: titleForCode(coded?.[1]) ?? title,
+    title: titleForCode(coded?.[1], displayMessage) ?? title,
     message: userMessage,
     nextSteps: nextStepsForCode(coded?.[1], displayMessage),
     technicalDetails: coded
@@ -59,6 +65,11 @@ function messageForCode(code: string | undefined, original: string) {
       .replace(/容器构建/g, "本机运行版本生成")
       .replace(/镜像构建/g, "本机运行版本生成");
   }
+  if (
+    code === "AD-CNB-103" &&
+    hasOnlyMissingCnbScope(original, "repo-cnb-history:r")
+  )
+    return "已经完成的部署步骤仍然保留。请同时检查令牌的授权范围和使用范围。";
   const messages: Record<string, string> = {
     "AD-GIT-101":
       "项目里还有尚未加入代码版本的改动。为了避免发布旧内容，系统已经暂停。",
@@ -66,7 +77,10 @@ function messageForCode(code: string | undefined, original: string) {
     "AD-GIT-103": "当前选择的文件夹只是更大项目的一部分。",
     "AD-GIT-104": "当前文件夹中没有识别到可以发布的项目代码。",
     "AD-CTR-101": "系统没有识别出这个服务的可靠运行方式。",
+    "AD-CNB-101": "CNB 登录已经失效，当前部署任务和已完成步骤仍然保留。",
     "AD-CNB-103": "代码平台授权还不完整，已经完成的部署步骤仍然保留。",
+    "AD-CNB-108":
+      "系统密钥库暂时无法读取已保存的 CNB 授权，项目和部署任务不受影响。",
     "AD-CNB-203":
       "系统暂时没有从代码平台取得最新进度，当前任务和已完成步骤仍然保留。",
     "AD-CNB-204":
@@ -89,6 +103,9 @@ function messageForCode(code: string | undefined, original: string) {
     "AD-SRV-206": "服务器上已有访问规则使用相同地址，当前版本尚未切换。",
     "AD-SRV-207": "新的访问地址没有加载成功，系统已经保留上一次可用配置。",
     "AD-SRV-209": "项目服务仍在运行，但正式访问地址没有加载到服务器。",
+    "AD-SRV-210": "这个访问地址已经由另一条上线线路使用，系统没有覆盖它。",
+    "AD-SRV-211": "项目服务已经运行，但统一访问入口还没有连接到项目服务。",
+    "AD-SRV-212": "服务器暂时无法下载统一访问组件。",
     "AD-IMG-201": "运行服务器暂时无法读取本次项目版本。",
     "AD-IMG-202": "系统暂时无法验证已填写的版本仓库登录信息。",
     "AD-REG-101": "项目版本保存位置还缺少必要信息。",
@@ -107,6 +124,7 @@ function messageForCode(code: string | undefined, original: string) {
     "AD-INF-102": "系统没有完成本机运行依赖的下载。",
     "AD-INF-104": "本机数据库没有正常启动。",
     "AD-INF-105": "本机缓存服务没有正常启动。",
+    "AD-INF-202": "服务器暂时无法下载项目运行所需的基础组件。",
     "AD-INF-203": "服务器数据库没有正常运行。",
     "AD-INF-204": "服务器缓存服务没有正常运行。",
   };
@@ -130,12 +148,22 @@ function nextStepsForCode(code?: string, message = ""): string[] {
   if (code === "AD-CNB-101")
     return ["重新连接 CNB，保存成功后回到当前任务继续"];
   if (code === "AD-CNB-102") return ["检查网络能否访问 cnb.cool，然后重新尝试"];
-  if (code === "AD-CNB-103" && message.includes("repo-cnb-history:r"))
-    return ["更新 CNB 授权并勾选“读取构建记录”，然后检查新版本"];
-  if (code === "AD-CNB-103" && message.includes("repo-cnb-trigger:rw"))
+  if (
+    code === "AD-CNB-103" &&
+    hasOnlyMissingCnbScope(message, "repo-cnb-history:r")
+  )
+    return [
+      "在授权范围勾选“读取构建记录”（repo-cnb-history:r），并确认使用范围包含当前仓库或全部仓库",
+    ];
+  if (
+    code === "AD-CNB-103" &&
+    hasOnlyMissingCnbScope(message, "repo-cnb-trigger:rw")
+  )
     return ["更新 CNB 授权并勾选“触发自动构建”，然后重新部署"];
   if (code === "AD-CNB-103")
-    return ["按连接页勾选全部 5 项 CNB 权限，保存新令牌后重新检查"];
+    return [
+      "按连接页勾选全部 6 项 CNB 权限（包括读取构建详情），并确认使用范围包含当前仓库或全部仓库",
+    ];
   if (code === "AD-CNB-104")
     return ["返回 CNB 连接步骤刷新组织；没有组织时先在 CNB 创建组织"];
   if (code === "AD-CNB-105")
@@ -143,6 +171,8 @@ function nextStepsForCode(code?: string, message = ""): string[] {
   if (code === "AD-CNB-106")
     return ["在 CNB 网页确认同名仓库权限，或选择另一个仓库名"];
   if (code === "AD-CNB-107") return ["等待一分钟，再重新点击自动准备"];
+  if (code === "AD-CNB-108")
+    return ["重新打开应用；仍未恢复时再粘贴并保存新的 CNB 令牌"];
   if (code === "AD-CNB-199")
     return ["重新连接 CNB 后再试；仍失败时查看技术详情"];
   if (code === "AD-CNB-201")
@@ -212,6 +242,14 @@ function nextStepsForCode(code?: string, message = ""): string[] {
     return ["重新应用访问地址；系统已保留并恢复上一次可用配置"];
   if (code === "AD-SRV-209")
     return ["点击“重新应用地址”；系统只修复访问入口，不会重新生成项目版本"];
+  if (code === "AD-SRV-210")
+    return ["修改当前线路的访问地址，或先处理占用该地址的项目，再继续上线"];
+  if (code === "AD-SRV-211")
+    return ["点击“继续上线”，系统会重新连接访问入口，不会重新生成项目版本"];
+  if (code === "AD-SRV-212")
+    return [
+      "检查服务器能否访问公网，然后重新初始化；系统会自动切换国内镜像来源",
+    ];
   if (code === "AD-IMG-201")
     return [
       "重新检查项目版本保存位置的账号和服务器读取权限，然后从当前步骤重试",
@@ -225,6 +263,8 @@ function nextStepsForCode(code?: string, message = ""): string[] {
     return ["确认 Docker Desktop 和本机网络可用，然后重新验证"];
   if (code === "AD-NET-201")
     return ["修正 DNS 或 HTTPS；回到客户端后系统会自动检查，无需重新构建"];
+  if (code === "AD-NET-202")
+    return ["确认本机网络可用；恢复后系统会自动继续检查，不会重新部署"];
   if (code === "AD-LOC-101") return ["重新选择项目目录，然后回到本地运行"];
   if (code === "AD-LOC-102") return ["检查本地配置文件后重新保存"];
   if (code === "AD-LOC-103")
@@ -249,7 +289,9 @@ function nextStepsForCode(code?: string, message = ""): string[] {
   if (code === "AD-INF-106" || code === "AD-INF-107")
     return ["先点击“自动准备运行依赖”，完成后再控制单个服务"];
   if (code === "AD-INF-201" || code === "AD-INF-202")
-    return ["重新检查服务器连接和磁盘空间，然后再次保存远程配置"];
+    return code === "AD-INF-202"
+      ? ["点击“继续上线”重试；系统会自动优先使用国内来源，无需修改项目配置"]
+      : ["重新检查服务器连接和磁盘空间，然后再次保存远程配置"];
   if (code === "AD-INF-203" || code === "AD-INF-204")
     return ["检查服务器上的数据库或缓存状态，处理后重新生成远程配置"];
   if (code === "AD-LOC-105" || code === "AD-LOC-108")
@@ -275,7 +317,7 @@ function nextStepsForCode(code?: string, message = ""): string[] {
   return ["确认当前页面的检查项，处理后重新尝试"];
 }
 
-function titleForCode(code?: string): string | undefined {
+function titleForCode(code?: string, message = ""): string | undefined {
   if (code === "AD-GIT-101") return "项目改动还没有提交";
   if (code === "AD-GIT-102") return "部署分支需要先同步";
   if (code === "AD-GIT-103") return "请选择完整的项目文件夹";
@@ -283,7 +325,14 @@ function titleForCode(code?: string): string | undefined {
   if (code === "AD-CTR-101") return "项目运行方式还需开发处理";
   if (code === "AD-SYS-101") return "配置没有复制成功";
   if (code === "AD-SYS-102") return "系统浏览器没有打开";
-  if (code === "AD-CNB-103") return "CNB 权限还差一步";
+  if (code === "AD-CNB-101") return "需要重新连接 CNB";
+  if (
+    code === "AD-CNB-103" &&
+    hasOnlyMissingCnbScope(message, "repo-cnb-history:r")
+  )
+    return "当前令牌不能读取这个仓库的构建记录";
+  if (code === "AD-CNB-103") return "当前 CNB 授权无法完成这项操作";
+  if (code === "AD-CNB-108") return "暂时无法读取已保存的 CNB 授权";
   if (code === "AD-CNB-201") return "还差一次远程安全配置";
   if (code === "AD-CNB-202") return "远程部署任务没有开始";
   if (code === "AD-CNB-203" || code === "AD-CNB-204")
@@ -315,6 +364,9 @@ function titleForCode(code?: string): string | undefined {
   if (code === "AD-SRV-206") return "访问地址正在被旧版本使用";
   if (code === "AD-SRV-207") return "访问地址没有重新加载成功";
   if (code === "AD-SRV-209") return "正式地址没有加载成功";
+  if (code === "AD-SRV-210") return "访问地址已被其他项目使用";
+  if (code === "AD-SRV-211") return "访问入口还没连到项目服务";
+  if (code === "AD-SRV-212") return "服务器无法下载访问组件";
   if (code === "AD-IMG-201") return "项目版本无法读取";
   if (code === "AD-IMG-202") return "暂时无法验证项目版本保存位置";
   if (code === "AD-REG-101") return "项目版本保存位置还没有配置完整";
@@ -324,6 +376,7 @@ function titleForCode(code?: string): string | undefined {
   if (code === "AD-SSH-102") return "运行服务器暂时无法连接";
   if (code === "AD-SSH-103") return "服务器身份发生变化";
   if (code === "AD-NET-201") return "访问地址还没有准备好";
+  if (code === "AD-NET-202") return "这次地址检查没有完成";
   if (code === "AD-LOC-103") return "项目可能会提交真实密钥";
   if (code === "AD-LOC-104") return "本机配置还没有保存";
   if (code === "AD-LOC-106") return "本机运行环境还没有准备好";

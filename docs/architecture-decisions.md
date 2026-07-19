@@ -1,296 +1,237 @@
-# ABCDeploy 架构决策与外部依赖
+# ABCDeploy 架构决策
 
-> 状态：`0.2.0-preview.4` 封板实施基线，最近与当前工作区对齐于 2026-07-16。本文同时记录已实现决策和正式版仍需完成的外部验证。
+> 本文记录当前模型中不能由页面临时逻辑替代的领域和安全边界。
 
-## 1. 架构目标
+模型交叉参考成熟交付工具的公开设计：GitLab 把 Environment 作为持久目标、Deployment 作为版本进入环境的记录；Octopus 把 Release 定义为可重复部署到多个环境的快照；Harness 分离 Service、Environment、Infrastructure 与执行；Argo CD 分离 desired/live、sync/health 状态。ABCDeploy 不复制它们的企业复杂度，只保留这些已经被验证的领域边界：
 
-ABCDeploy 的首要约束不是“能生成多少配置”，而是让普通用户在不了解 SSH、镜像仓库和流水线密钥的情况下，仍能获得可恢复、可审计、可回滚的部署结果。
+- [GitLab Environments](https://docs.gitlab.com/ci/environments/) 与 [Deployments](https://docs.gitlab.com/ci/environments/deployments/)
+- [Octopus Releases](https://octopus.com/docs/releases) 与 [Environments](https://octopus.com/docs/infrastructure/environments)
+- [Harness Continuous Delivery overview](https://developer.harness.io/docs/continuous-delivery/overview/)
+- [Argo CD Getting Started](https://argo-cd.readthedocs.io/en/latest/getting_started/) 与 [Automated Sync](https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/)
 
-当前架构必须同时满足：
+## 1. 领域对象
 
-1. 桌面端关闭后，服务器仍能持续接收自动部署。
-2. Windows、macOS、Linux 的主流程一致，不依赖 WSL 或用户预装 Bash。
-3. 密码、令牌和私钥不进入项目文件、日志、截图或普通配置数据库。
-4. 一个 CNB 账号、镜像仓库和服务器可以被多个项目复用。
-5. 项目部署规则可进入 Git，个人凭据和本机进度不能进入 Git。
-6. 所有生产发布都能追溯到确定的提交和镜像摘要。
+| 对象 | 身份与职责 |
+| --- | --- |
+| Project | 稳定项目 ID、规范化目录、期望仓库范围和项目级工作区；Task、Attempt、Environment、Version 与页面上下文不能跨项目串线 |
+| CodeConnection / SourceBinding | `CodeConnection` 表示账号级代码平台授权；`SourceBinding` 把一个 Project 精确绑定到仓库范围，并保存验证状态、连接修订、验证时间和证据 ID。账号可共享，仓库绑定不可跨项目串用 |
+| Environment | 固定语义的 `development`、`staging`、`production` 目标 |
+| Artifact / Version | 完整源提交与每个已识别服务的不可变 Registry 引用/digest 组成的完整产物集合；缺少任一服务产物时不是完整 Version |
+| DeploymentTask | 生成版本或把已有版本放入环境的持久目标；测试任务固定完整提交，production 任务只固定目标 Version ID、环境、意图和期望结果 |
+| DeploymentAttempt | 同一任务的一次远程执行，保留冻结输入、真实输出快照、Provider 实际返回的外部编号、结果和错误；导入等无外部执行的记录不伪造编号 |
+| ConfigurationTask | 把某个 ConfigProfile revision 显式应用到精确项目 + 环境的持久目标；与部署版本的 DeploymentTask 分离 |
+| Connection | 可复用、可验证、可替换的代码平台、Registry 或服务器连接 |
+| ServerCapability | 一台服务器上可复用的运行与统一访问能力，记录 Docker、Compose、边缘 Caddy 接入方式、归属、配置入口和最近验证结果 |
+| EnvironmentBinding | 项目 + 环境对服务器 Connection、配置和地址的明确使用关系；环境语义不写入 Connection 本身 |
+| ConfigProfile | 应用级“说明、Key、Value、revision”配置资源；不反向缓存项目或环境引用 |
+| VersionValidation | 测试环境对不可变版本的业务结论与证据；不复制 Version 的提交、产物或来源任务 |
+| AutomationRule | 触发源、目标环境、期望状态、实际状态和 Provider 规则引用 |
 
-## 2. 总体边界
+核心关系：
 
-```mermaid
-flowchart LR
-    U["用户"] --> D["ABCDeploy 桌面端"]
-    D --> P["本地项目"]
-    D --> K["操作系统密钥库"]
-    D --> C["CNB API / PAT"]
-    D --> S["用户服务器"]
-    C --> B["构建流水线"]
-    B --> R["镜像仓库"]
-    B --> S
-    S --> Y["Caddy 与应用容器"]
+```text
+Project ──has──> Environment
+Project ──SourceBinding──> repository scope ──uses──> CodeConnection
+Project ──produces──> Version
+DeploymentTask = Goal(generate commit or deploy Version ID) + Environment
+DeploymentTask ──resolves/binds──> Version
+DeploymentTask ──has──> DeploymentAttempt (frozen execution inputs)
+ConfigurationTask ──applies──> ConfigProfile revision ──on success──> applied revision
+AutomationRule ──syncs──> Provider rule (never creates DeploymentTask)
+Project/Environment ──EnvironmentBinding──> Connection + ConfigProfile IDs
+Server Connection ──has one──> ServerCapability ──serves many──> Project/Environment routes
 ```
 
-桌面端负责识别、推荐、初始化、验证和展示；CNB 负责持续构建；镜像仓库保存不可变制品；用户服务器负责运行应用。可选云端服务只能承担授权中转、通知和团队协作，不能默认读取项目源码或业务密钥。
+版本与环境必须解耦。不得继续把“最新一条部署记录”同时当成当前版本、环境状态、候选资格和导航状态。
 
-## 3. 决策总表
+## 2. ADR-001：稳定导航与任务上下文分离
 
-| 编号    | 决策                                                        | 状态     | 研发门禁                           |
-| ------- | ----------------------------------------------------------- | -------- | ---------------------------------- |
-| ADR-001 | 本地状态使用 SQLite，敏感值使用操作系统密钥库               | 已接受   | 可进入技术验证                     |
-| ADR-002 | CNB、服务器、镜像仓库是全局资源，项目仅保存绑定关系         | 已接受   | 可进入研发                         |
-| ADR-003 | 无托管后端预览版使用最小权限 PAT；OAuth 留作后续升级        | 已接受   | Token 只进入系统密钥库             |
-| ADR-004 | SSH 使用内置 Rust 实现，自动发现或生成专用 Ed25519 Key      | 已接受   | 先完成三平台技术验证               |
-| ADR-005 | CNB 密钥仓库保留一次性 Web 人工步骤，客户端提供逐步引导     | 已接受   | 测试与生产文件严格隔离             |
-| ADR-006 | 评估轻量服务器 Agent，作为无法无感管理 CI 密钥时的替代方案  | 待验证   | 完成安全与运维原型后再定案         |
-| ADR-007 | staging 验证后以同一镜像摘要晋级 production                 | 已接受   | 可进入研发                         |
-| ADR-008 | 开源桌面端为主体，可选托管控制面且必须可自托管              | 原则接受 | 明确数据边界和离线降级             |
-| ADR-009 | 一条长期 `main`、短期任务分支和同一制品的环境晋级           | 已接受   | 主路径与审批分支回退均保持同一镜像 |
-| ADR-010 | Pipeline、Registry、Runtime、Secret、DNS、Approval 分层适配 | 已接受   | 首版实现 CNB + TCR/CNB + SSH/Caddy |
+项目持久化导航只允许 `overview`、`local`、`versions`、`settings`。历史的 `test`、`production` 路由迁移为 `overview`。
 
-## 4. ADR-001：状态与凭据分层保存
+每个 Project 保存独立工作区快照。添加、打开或切换项目只加载目标项目的 Task、Attempt、Environment、Version 与 AutomationRule；应用级 Connection、ServerCapability 和 ConfigProfile 才允许共享。
 
-### 决策
+普通项目入口和普通重载始终打开 `overview`。只有项目 ID 与 `overview/local/versions/settings` 页面都合法的显式 deep-link 才恢复指定项目页面；非法或不完整链接回退到当前项目 `overview`。任务入口可以携带一次性的 `deployment_id`、`environment` 和 `version_id`，在 `overview` 上打开对应任务 `Sheet`；该上下文随面板销毁，不进入新的环境页面，也不写回项目默认入口。
 
-- 使用 SQLite 保存项目索引、识别结果、部署检查点、资源元数据和操作历史。
-- 使用 macOS Keychain、Windows Credential Manager、Linux Secret Service 保存 CNB Token、SSH 私钥口令、镜像仓库凭据和其他秘密。
-- 项目仓库中的 `deploy.yaml` 只保存可公开审查的部署意图，不保存本机路径和敏感值。
-- 每次关键流程操作写入检查点，应用异常退出或重启后从最后一个安全状态恢复。
+理由：部署任务是临时状态，不能决定产品信息架构，也不能让失败任务劫持用户每次进入项目。
 
-### 项目识别
+## 3. ADR-002：环境聚合同时保留两个事实
 
-项目身份由规范化路径、Git remote 指纹和仓库根目录共同判断。项目移动后可通过 remote 指纹重新关联；同一仓库的多个 worktree 分别记录路径，但共享远程仓库身份。
+每个远程环境的聚合状态至少包含：
 
-框架识别用于选择更精确的构建、端口和健康检查策略，不作为是否存在服务的唯一依据。非 monorepo 根目录或工作区业务子包只要声明标准 Node.js `start` 或 `start:prod` 脚本，就作为通用网页服务进入规划；工作区根包可能只是统一调度器，不重复识别。系统按 npm、pnpm、Yarn 或 Bun 以及子包目录生成对应安装命令和可审查的多阶段 Dockerfile。项目声明 `build` 时在镜像构建阶段真实执行并把产物带入运行镜像，没有声明时不伪造构建命令。没有框架依赖、没有启动脚本且没有已识别 Python 入口时，才允许进入“没有识别到项目服务”的恢复路径。
+- `deployed_version`：最近一次成功且仍可信的在线版本；
+- `latest_attempt`：该环境最新的一次部署尝试；
+- `access_state`：服务、DNS 和 HTTPS 的独立结果。
+- `active_address`：当前仍对用户生效且已验证的地址；
+- `desired_address`：用户希望切换到、但尚未完成路由/DNS/HTTPS 验证的地址。
 
-包管理器声明和锁文件是两个独立事实。`packageManager` 字段足以选择 npm、pnpm、Yarn 或 Bun，但只有对应锁文件真实存在时才启用 `npm ci` 或冻结锁文件安装；没有锁文件的首次项目使用普通安装，让开发流程先产生锁文件，避免远程构建在业务代码检查前就必然失败。
+聚合规则：
 
-通用 Node.js 端口只采用项目已经明确给出的非敏感证据：项目自有 Dockerfile 的 `EXPOSE` 优先，其次读取同目录 `.env.example` 的数字 `PORT`、`APP_PORT` 或 `SERVER_PORT`，最后才使用 3000。系统不解释动态表达式，也不读取真实 `.env`，以免猜错或接触用户密钥。
+1. 新的失败、排队或取消不覆盖 `deployed_version`。
+2. 历史失败不抢占较新的成功结果。
+3. production 容器成功而地址失败时，部署结果仍为成功，访问状态单独待处理。
+4. staging 业务确认属于版本资格，不等同于容器健康检查。
+5. 环境对象不自行决定页面主动作；发布中心根据全部环境、版本资格和待处理任务计算唯一主动作。
+6. 修改地址先写入 `desired_address`；全部访问检查通过后才原子更新 `active_address` 并清空期望值。检查失败或断网不得让旧地址离线，也不得反向抹掉工作负载成功事实。
 
-“网页服务”是给用户理解访问方式的展示分类，不等于纯静态前端。通用 Node.js 的运行配置按服务端程序收集：根服务使用完整项目模板，工作区子服务使用自身模板以及根目录的非纯前端变量，确保数据库、端口和密钥真正进入容器；纯 Vite 等静态前端继续只接收公开构建变量。
+## 4. ADR-003：不可变版本与环境晋级
 
-包管理器只参与镜像构建，不参与生产容器启动。通用 Node.js 运行镜像在构建阶段完成依赖裁剪，启动时进入实际服务目录、补齐本地可执行路径并直接运行项目声明的脚本内容；这样服务器拉取镜像后不需要访问 npm、Corepack 或任何外部仓库。
+- `main` 合并触发一次构建，版本由完整提交和完整服务产物集合唯一标识；每个服务都保存不可变 `ArtifactRef = service + repository + digest + registry_connection_id@revision`。ArtifactRef 的 service ID 集合必须与 Project 的 service ID 集合精确相等，缺少、多出或重复都不能成为有效 Version。
+- staging 和 production 拉取同一 Version 中完全相同的服务产物集合；production 流水线不得重新构建、替换或遗漏某个服务产物。
+- “测试通过”是版本资格，可以被多个后续 production 部署选择。
+- 可变标签只用于检索，发布门禁以不可变摘要为准。
+- production 的发布与恢复使用同一部署模型，不创建业务代码分支。
 
-开发调试同样以服务目录为边界，不以可能重复或含特殊字符的包名作为 Shell 选择器。客户端把绝对容器目录安全引用后交给 npm、pnpm、Yarn 或 Bun 的目录参数，源码挂载仍只发生在本机开发 Compose 中。
+## 5. ADR-004：连接是可替换资源
 
-### 禁止事项
+CNB 账号、Registry 和服务器以稳定 Connection ID 保存验证状态和非敏感元数据；项目与环境只保存引用。
 
-- 不使用明文 JSON 或 Tauri Store 保存秘密。
-- 不把 Token、私钥、密码写入 SQLite、诊断包或遥测。
-- 不把用户选择项目的历史仅保存在前端内存或浏览器存储中。
+- 同一端点的凭据更新不改变 Connection ID，只推进 revision，也不删除项目历史；更换 Registry 端点建立新的活动 Connection，旧 Connection 在仍被历史 ArtifactRef 引用时保留必要的只读解析能力。
+- Code Connection 只固定账号级 provider、capabilities、验证状态与 revision；项目仓库范围由独立 `SourceBinding(project_id, code_connection_id, repository_scope, verified, verified_connection_revision, verified_at, evidence_id)` 表达。恢复、切换或添加项目只能读取并校验已有证据，不能创建、纠正或升级证据；缺证据、仓库不匹配或账号 revision 变化时降级为未验证。首次生成、已有部署接入或自动化写操作才触发明确的本地 remote + Provider 仓库读取核对，成功结果才能建立新证据。
+- 账号可用与当前项目仓库可读是两个事实。仓库核对失败不清除共享账号、不创建 Task/Attempt，也不改变 AutomationRule；只有账号失效或用户明确选择更换账号时才更新 CodeConnection 与 Token。
+- Attempt 不保存“ready”布尔值，而保存当时使用的 Code Connection revision、SourceBinding ID 和精确 repository scope。
+- 一个项目可以为 staging 与 production 绑定不同服务器。
+- 同一服务器用于两个环境时也保存两条明确环境绑定。
+- 服务器 Connection 本身不带 `staging` 或 `production` 所有权；同一已验证 Connection 可以被多个项目和环境引用，环境用途只存在于 `EnvironmentBinding`。
+- 仅凭系统密钥库存在值不能视为已验证；必须由目标端点成功接受。
+- 错误页和项目设置都必须提供更换连接入口。
 
-## 5. ADR-002：全局资源与项目绑定
+## 6. ADR-005：配置中心采用持续环境绑定
 
-### 数据模型
+配置引用的唯一事实源是 `EnvironmentBinding.config_profile_ids`；`ConfigProfile` 不保存反向 `bindings` 字符串，也不再以“一种类型只能绑定一项”限制同环境多项配置。配置中心的影响项目数和引用列表都必须从各项目环境绑定派生。
 
-| 实体                 | 作用                            | 典型字段                             |
-| -------------------- | ------------------------------- | ------------------------------------ |
-| `Workspace`          | 当前用户的本地 ABCDeploy 工作区 | 名称、默认策略、创建时间             |
-| `Project`            | 一个可部署代码仓库              | 路径、Git remote、识别结果、当前阶段 |
-| `Resource`           | 可复用外部资源                  | 类型、名称、非敏感连接信息、健康状态 |
-| `EnvironmentBinding` | 项目环境与资源的关系            | 项目、环境、服务器、域名、数据库引用 |
-| `WorkflowRun`        | 一次构建或部署                  | 提交、镜像摘要、阶段、结果、检查点   |
-| `SecretReference`    | 指向系统密钥库的引用            | 所属资源、用途、版本、到期时间       |
+- SQLite 只保存 Profile ID 和绑定关系；敏感 Value 保存到系统密钥库。
+- 绑定 Profile 被删除时，关系安全清理；项目已有运行配置不能被静默清空。
+- 环境配置生成时，以项目字段定义为骨架，再解析该环境绑定。
+- 配置完整性按项目声明的精确必填 Key 集合判断；相似名称、任意 Profile 或条目数量不得满足缺失 Key。
+- ConfigProfile 一旦被绑定，Key 身份只读；更名通过新建正确 Key 并精确解除目标项目 + 环境的旧绑定实现，不影响其他项目或环境的引用。
+- ConfigProfile 保存自身 revision，EnvironmentBinding 保存最近一次成功执行实际应用的 revision。“仅保存”不改变环境运行值，只有用户明确选择应用到目标环境才创建执行目标。
+- 显式应用创建 `ConfigurationTask`；Attempt 在开始时冻结完整 `config_profile_ids + config_profile_revisions`。只有该 Attempt 成功且目标环境的绑定集合仍与冻结集合一致时，才用整份冻结修订替换 `applied_revisions`；执行中改绑必须阻断并重新确认。Profile revision 与目标环境 applied revision 一致时不创建任务。
+- 同名冲突要求用户明确选择或按已记录优先级解决，不跨环境自动套用。
+- 主流程中可以原地创建 Profile 并绑定当前环境；保存或绑定失败时保留手填内容和原绑定。
 
-`Resource` 至少支持 `cnb_account`、`server`、`registry` 和 `dns_provider`。删除全局资源前必须展示受影响项目，不能静默级联删除。
+## 7. ADR-006：任务先持久化，尝试可追加
 
-## 6. ADR-003：CNB 授权
+创建部署任务和保存目标必须早于服务器修改、项目文件写入、Git push、CNB 触发或生产切换。测试任务在创建时固定完整 40 位源提交；production 任务只固定 Version ID、环境、意图和期望结果。当前 HEAD 后续变化不得改写测试 Task 或其 Attempt。
 
-### 预览版决策
+- 等待授权、连接、服务器确认、配置或生产确认时 Task 可以存在，但 Attempt 数必须为零；只有一次外部执行真正开始时才创建 Attempt。
+- Version 是提交、来源 Task/Attempt 与完整 ArtifactRef 集合的唯一权威对象；VersionValidation 只保存环境验证证据。资格判断必须确认 Version 服务集合与 Project 精确相等，并把 Validation 六项环境事实逐项匹配来源成功 Attempt 的输出快照及冻结输入。production Attempt 每次开始或恢复前重新判断资格，再按 Task 固定的 Version ID 解析 Version 并复制完整 ArtifactRef；不得从页面当前选择、标签、Validation 或当前 Registry 重新拼装产物。
+- Attempt 输入快照包含代码/版本目标、完整服务产物引用和 digest、代码与 Registry Connection ID/revision、SourceBinding、服务器绑定与 ServerCapability revision、完整 ConfigProfile ID/revision 集合、服务与部署定义 revision、`active_address` 和 `desired_address`；成功测试 Attempt 的输出快照另外固定实际配置/服务/部署 revision、服务器、地址与健康结果，供 Validation 交叉验证。
+- 同一目标的重试保持 Task ID 不变，只追加带当次输入快照的 Attempt。
+- 授权、production 启动、配置缺失、服务器断连和路由冲突均回到原 Task；配置修复复用配置中心，连接修复复用连接维护。修复完成后才追加新的完整输入 Attempt，旧正式版本和 `active_address` 在健康切换完成前保持不变。
+- 每个外部副作用前保存当前阶段，返回后再保存外部编号和结果。
+- 恢复使用任务中的版本、服务器连接、配置和地址快照，不重新猜测当前可变设置。
+- 只有目标工作负载健康、项目级路由已经安全切换后，才能原子更新环境的 `deployed_version`；公网 DNS、证书签发和 HTTPS 检查只更新 `access_state`，不阻止已在服务器运行的版本成为在线事实。
+- 新任务失败或暂停时，旧在线版本指针不变。
+- 已有部署接管、只读连接验证和已完成发布后的地址维护不属于部署执行，不得为了展示进度伪造 DeploymentTask 或 DeploymentAttempt。
 
-预览版不依赖 ABCDeploy 托管后端。主按钮引导用户在系统浏览器打开 CNB Token 页面：
+## 8. ADR-007：自动化规则采用期望状态与实际状态
 
-1. 打开正确的 CNB Token 页面。
-2. 告知建议名称、最小权限和有效期。
-3. 用户粘贴一次，ABCDeploy 立即验证并存入系统密钥库；当前完整能力清单为 `repo-code:rw`、`repo-cnb-history:r`、`repo-manage:rw`、`repo-cnb-trigger:rw`、`group-resource:rw`。
-4. 输入框随后只显示账号和到期状态，不回显 Token。
+自动化规则不等同于一次部署，也不以一个布尔开关代替真实状态。
 
-### OAuth 后续升级条件
+- `desired_state` 表示用户希望开启或暂停，并保存分支、行为、目标环境和 revision；
+- `observed_state` 表示 Provider 上实际状态与最近观察结果；
+- `provider_ref` 保存规则及 Connection revision，`sync_state` 独立保存待同步、已同步、失败、最近时间和错误；
+- 暂停、恢复、失败与修复都更新同一个 AutomationRule。规则同步绝不创建 DeploymentTask、DeploymentAttempt 或 Version，也不修改环境在线事实；同步失败只产生规则自己的待处理事项。
 
-CNB 已公开 Authorization Code 流程，但公开文档要求应用持有 `ClientSecret`。桌面端属于公共客户端，不能安全内置长期 `ClientSecret`。研发前需由 CNB 明确支持以下任一方式：
+## 9. ADR-008：状态与秘密分层保存
 
-1. Authorization Code + PKCE，且桌面端无需长期客户端密钥。
-2. Device Authorization Grant。
-3. Loopback Redirect + PKCE。
-4. 由 ABCDeploy 托管或自托管的授权中转服务保存 `ClientSecret`。
+| 数据 | 保存位置 |
+| --- | --- |
+| 项目、环境、版本、部署、连接元数据、绑定和任务停点 | SQLite |
+| Token、Registry 密码、SSH 私钥、敏感配置值 | 操作系统密钥库 |
+| 可重新生成的 Dockerfile、Compose、Caddy 和流水线定义 | 项目工作区或运行时生成区 |
+| 原始日志 | Provider/服务器；客户端只按需读取并脱敏 |
 
-优先级依次为 PKCE、Device Flow、最小化且可自托管的授权中转。未确认前不得把浏览器自动填写、读取 Cookie 或内嵌网页登录作为替代，也不阻塞 PAT 预览版研发。
-
-### 未来 OAuth Token 策略
-
-- Access Token 只进入系统密钥库和进程内存。
-- Refresh Token 单独保存，刷新时执行单飞控制，避免并发轮换失效。
-- 权限按能力申请，首次不申请未来可能用到的范围。
-- 到期前静默刷新；刷新失败时保留本地进度并要求重新授权。
-- 断开账号时撤销远端 Token，并清除本地引用。
-
-## 7. ADR-004：服务器接入
-
-### 主流程
-
-1. 自动读取 `ssh-agent`、SSH config 和系统常见 `.ssh` 目录，仅展示可识别身份。
-2. 先尝试已有身份，不要求用户理解文件路径。
-3. 无可用身份时，生成项目无关的 ABCDeploy 专用 Ed25519 Key。
-4. 若用户只有服务器密码，密码只用于首次安装公钥，成功后立即切换到 Key 登录。
-5. 若服务器禁止密码登录，提供一键复制公钥和对应云厂商控制台指引。
-6. 首次连接必须确认并固定主机指纹；指纹变化视为高风险错误。
-
-### 实现约束
-
-- 使用 Rust SSH 库实现连接、SFTP、端口探测和命令执行。
-- 不调用 WSL、`bash`、`sshpass` 或平台特定 shell 作为主流程依赖。
-- 预览版使用用户提供并验证过的现有服务器账号，只给该账号幂等安装项目专用公钥；自动创建权限受限的 `abcdeploy` 操作系统用户属于后续安全加固，不能写成当前已实现行为。
-- 私钥不可导出到项目目录，日志仅记录 Key 指纹。
-- 技术验证覆盖 Windows 11、当前与前一版 macOS、Ubuntu LTS。
-
-## 8. ADR-005：CI 密钥生命周期
-
-### 产品要求
-
-普通用户不能被要求理解或填写：
-
-- CNB 密钥仓库 URL。
-- SSH 私钥的文本内容。
-- 镜像仓库密码的流水线变量名。
-- 原始 `envs.yml` 或 CI YAML。
-
-正式版目标是自动创建最小权限部署身份、写入必要秘密、验证可用性、记录到期时间，并支持轮换和撤销。预览版遵守 CNB 的安全边界，把不能通过受支持 API 完成的动作显性化。
-
-### 必须向 CNB 确认
-
-1. 是否有创建密钥仓库的稳定 API。
-2. 是否有创建、更新、列举版本和删除密钥文件的 API。
-3. 是否能通过 API 配置流水线所需的加密变量，且响应不返回明文。
-4. 是否支持仓库级、环境级权限和 production 审批。
-5. 是否能创建可轮换、可撤销、最小权限的部署身份。
-6. OAuth Scope 是否覆盖以上能力，审核要求和限流规则是什么。
-
-### 预览版路径
-
-CNB Secret 类型仓库不能 clone，当前支持的公开 API 也不提供文件写入。ABCDeploy 生成带中文说明的测试、生产配置，分别复制到剪贴板并打开准确的 CNB Web 页面；用户完成一次保存后，流水线只引用变量名。界面必须明确这是 CNB 的安全审计步骤，不能宣称全自动。用户确认保存后，若剪贴板仍是刚才生成的安全配置则主动清空；用户已经复制其他内容时不得覆盖。
-
-## 9. ADR-006：服务器 Agent 备选方案
-
-若 CNB 无法通过稳定 API 管理 CI 部署密钥，研发需比较两种路径：
-
-| 方案                                       | 优点                                         | 代价                                     |
-| ------------------------------------------ | -------------------------------------------- | ---------------------------------------- |
-| CNB Pipeline 通过受限 SSH 部署             | 组件少、与现有流程兼容                       | 私钥生命周期依赖 CNB 密钥能力            |
-| ABCDeploy Agent 在服务器拉取已签名部署任务 | 无需把 SSH 私钥交给 CI，可统一回滚与健康检查 | 需要升级、安全更新、任务认证和可用控制面 |
-
-Agent 若进入 P0，必须满足：
-
-- 单容器或单二进制安装，可自动升级与回滚。
-- 默认仅发起出站连接，不要求开放管理端口。
-- 任务包含项目、环境、镜像摘要、有效期和防重放随机数，并经过签名。
-- 以非 root 用户运行；提权能力白名单化。
-- 开源协议与桌面端兼容，托管控制面可被自托管实现替代。
-- 桌面端离线时，已配置项目仍能正常自动部署。
-
-在威胁建模和 30 天无人值守验证完成前，不选择 Agent 方案。
-
-## 10. ADR-007：构建一次，逐级晋级
-
-默认分支提交只构建一次镜像。staging 验证通过后，production 发布引用相同的镜像摘要，不重新构建，也不把 staging 的数据库或配置复制到 production。
-
-“同一镜像”指同一业务制品；“不同环境”仍使用各自独立的域名、环境变量、数据库、存储卷和访问权限。这样生产上线的是已经测试过的代码，而不是把测试环境整体搬到生产。
-
-测试通过是版本资格，不是“最后一次测试”的单一指针。多个不可变版本可以同时保留为生产候选；每次发布或恢复必须绑定明确版本，未决生产任务完成或取消前不得替换候选。
-
-## 11. ADR-008：开源桌面端与可选控制面
-
-### 原则
-
-- 本地项目识别、配置生成、服务器初始化和凭据保管属于开源桌面端能力。
-- 团队协作、跨设备同步、授权中转和通知可以由可选控制面提供。
-- 用户不登录 ABCDeploy 账号也应能完成单机核心流程。
-- 控制面必须公布收集字段、保存期限、删除方式和自托管边界。
-- 任何涉及源码、业务环境变量或服务器 Shell 的远程传输都需单独授权。
-
-### 跨设备
-
-项目规则随 Git 同步；全局资源仅同步非敏感元数据；凭据默认不跨设备同步。新电脑通过重新授权或端到端加密的恢复包接入，不能从云端以明文恢复。
-
-## 12. ADR-009：主干开发与环境晋级
-
-### 决策
-
-- 新项目只保留 `main` 一条长期分支。
-- AI 或开发者在短期 `feature/<task>` 分支工作，合并后删除。
-- development、staging 和 production 使用 CNB 原生部署环境表达，不创建同名长期分支。
-- `main` 更新后构建一次并自动部署 staging；production 只能晋级 staging 已验证的同一镜像摘要。
-- 主路径由 ABCDeploy 使用 CNB 构建触发能力执行生产晋级，不依赖业务 `production` 分支。
-- 令牌缺少触发权限时，可以把已验证的完整提交推送到专用 `deploydesk-production` 控制分支，并由仓库内 `cnb:apply` 调用同一生产流水线。该分支不承载业务代码分叉、不重新构建镜像，也不计入版本目录或测试状态。
-
-### 理由
-
-三条长期环境分支需要反复合并，容易产生漂移、冲突和“分支已更新但服务器未更新”的双重状态。把发布身份固定为完整提交 SHA 与镜像摘要后，分支只需解决代码协作，部署环境由独立状态机管理。
-
-### 兼容策略
-
-- 导入已有 `test/main`、`staging/main` 或 `main/production` 项目时，先保持现有触发规则。
-- 新默认只应用于新项目或用户明确确认的迁移。
-- CNB H5 的原生部署和审批页面必须真机验收；若交互不可用，可在 `main` 分支详情页生成“发布正式”按钮，但不改变分支模型。
-
-完整流程见 [分支、环境与版本晋级（历史基线）](archive/v1/deployment-model.md)。
-
-## 13. ADR-010：厂商适配边界
-
-### 决策
-
-- CNB 是首版 Pipeline Provider，不是所有产品模型的命名空间。
-- TCR 是国内轻量服务器的推荐 OCI Registry Provider；CNB 制品库是少配置一套账号的回退，其他云厂商 Registry 与 Harbor 可按同一契约扩展。
-- Registry 必须分别保存构建端 `push endpoint` 和服务器端 `pull endpoint`，两者可因地域、内网和云厂商不同而不同。
-- Runtime、Secret、DNS、Approval 和 Reverse Proxy 各自拥有独立适配器，不能用一个云厂商选择同时控制所有能力。
-- 同一服务器允许跨项目并行构建，但 Compose 与 Caddy 变更使用服务器级锁串行执行。
-
-### 不变量
-
-任何 Provider 组合都必须维持：完整提交可追溯、镜像按摘要部署、测试与生产配置隔离、生产显式审批、发布后从目标运行态复核摘要。
-
-## 14. 威胁模型摘要
-
-| 风险                 | 默认控制                                               |
-| -------------------- | ------------------------------------------------------ |
-| Token 或私钥进入日志 | 结构化日志字段白名单、敏感值检测、诊断包二次扫描       |
-| 恶意仓库诱导执行命令 | 识别阶段只读；生成后展示高风险动作；命令使用结构化参数 |
-| SSH 中间人攻击       | 首次展示指纹、后续严格固定、变化时阻断                 |
-| OAuth Token 权限过大 | 最小 Scope、短期 Access Token、可撤销 Refresh Token    |
-| 供应链镜像被替换     | 使用镜像摘要、生成制品清单、可选签名验证               |
-| production 误发布    | 环境视觉区分、人工晋级、影响范围确认、可回滚           |
-| 控制面被攻破         | 最少持有秘密、端到端加密、租户隔离、审计和自托管       |
-| 本机被窃取           | 系统密钥库、自动锁定、敏感操作重新认证                 |
-
-## 15. CNB 官方确认模板
-
-向 CNB 提交以下问题，并要求提供稳定文档或可验证示例：
-
-> 我们正在开发面向桌面端公共客户端的开源部署工具 ABCDeploy。请确认 OAuth 是否支持 PKCE、Device Flow 或无需在客户端内置 ClientSecret 的 Loopback Redirect；相关 Scope、Token 生命周期和应用审核流程是什么？另外，是否有稳定 API 用于创建密钥仓库、写入或轮换密钥文件、配置加密流水线变量，以及创建最小权限部署身份？上述能力是否允许第三方 OAuth 应用调用？
-
-答复、验证日期、接口版本和测试结果必须记录到本文。仅有口头答复不能解除研发门禁。
-
-## 16. 正式版放行检查表
-
-- [x] 预览版 PAT 最小权限、验证和系统密钥库保存完成实现。
-- [x] CNB 密钥仓库一次性 Web 操作在产品中显性展示。
-- [ ] CNB 公共客户端授权方式完成真实账号验证后替换 PAT 主路径。
-- [ ] CI 密钥创建、使用、轮换和撤销获得稳定 API 后完成端到端验证。
-- [ ] SSH 连接在三种操作系统均不依赖额外运行时。
-- [ ] 本机数据库损坏与应用中断恢复测试通过。
-- [ ] 系统密钥库不可用时有明确阻断和修复指引。
-- [ ] Agent 与纯 SSH 路径完成书面取舍并通过安全评审。
-- [ ] 生产晋级、回滚和审计记录模型通过测试。
-- [ ] CNB H5 的 staging 查看、production 审批和部署流程完成手机真机验收。
-- [ ] 控制面的数据边界、隐私说明和自托管方案可评审。
-
-## 17. 官方参考
-
-- [CNB OAuth 应用开发](https://docs.cnb.cool/zh/oauth/developer.html)
-- [CNB 访问令牌](https://docs.cnb.cool/zh/guide/access-token.html)
-- [CNB 密钥仓库](https://docs.cnb.cool/zh/repo/secret.html)
-- [CNB 自定义部署流程](https://docs.cnb.cool/zh/build/deploy.html)
-- [CNB 手动触发流水线](https://docs.cnb.cool/zh/build/web-trigger.html)
-- [CNB 访问令牌页面](https://cnb.cool/profile/token)
-- [DORA：Trunk-based development](https://dora.dev/capabilities/trunk-based-development/)
-- [Microsoft：Windows OpenSSH 密钥管理](https://learn.microsoft.com/zh-cn/windows-server/administration/openssh/openssh_keymanagement)
-
-上述链接用于确认当前公开能力；涉及稳定性、权限和第三方应用审核的结论仍需 CNB 书面答复与隔离账号验证。
+禁止把 Token、私钥、完整环境文件、带凭据 URL 或第三方原始错误写入普通日志、通知、截图或持久化任务描述。
+
+## 10. ADR-009：Provider 边界
+
+首版组合与职责：
+
+| Provider | 首版实现 | 职责 |
+| --- | --- | --- |
+| Source / Pipeline | CNB | 仓库、事件、构建、部署记录和日志 |
+| Registry | 腾讯云 TCR | 查询和保存 OCI 镜像、标签、digest |
+| Runtime | Linux + SSH + Docker Compose | 启停版本、健康检查、回滚和运行日志 |
+| Proxy | Caddy | 服务器边缘路由、TLS 和项目级配置片段 |
+| DNS | 公共 DNS 检查 + 控制台链接 | 解析检查，不持有云账号权限 |
+
+产品领域不出现厂商专用状态枚举。Provider 响应先映射为统一 Version、Deployment、Connection 和 AccessState。GitHub 不属于首版默认链路。
+
+## 11. ADR-010：流水线是后台执行器
+
+CNB 阶段不会直接成为客户端页签。客户端只展示用户阶段：准备项目、生成/确认版本、启动服务、确认可用。
+
+状态查询按事实来源分工：
+
+- 构建与远程任务：CNB API；
+- 版本和 digest：Registry API/OCI 协议；
+- 容器、Compose、Caddy 和服务器日志：绑定服务器的 SSH 连接；
+- DNS、HTTPS 与公开响应：客户端从公网检查。
+
+不得用 CNB 构建状态推断服务器一定在线，也不得只用公网 HTTPS 失败断言容器部署失败。
+
+## 12. ADR-011：服务器和 Caddy
+
+- 服务器 Connection 与环境无关。任何服务器首次绑定到任一环境时，严格按“验证凭据 → 确认并固定主机指纹 → 检查运行前提 → 分类共享访问服务 → 展示并确认影响 → 标记 Connection/ServerCapability 已验证 → 创建 EnvironmentBinding”执行；任一步未完成都不得提前绑定。
+- Docker Compose 项目、目录、网络、卷和配置按项目 + 环境隔离。
+- `ServerCapability` 属于服务器，不属于项目；一台服务器只接入一个占用 80/443 的服务器级共享 Docker Caddy 容器。多个项目和环境通过各自拥有的 `sites` 片段复用它，不为每个项目安装代理。项目容器内部用于提供静态文件的 Caddy 不属于这套边缘能力。
+- 干净且受支持的服务器指 Docker Engine/Compose 已可用且 80/443 无占用，可以在单独确认后准备运行目录和共享 Caddy 容器；缺少 Docker/Compose 或用户权限时先记录为前提缺失，不误判为空服务器。裸机自动安装尚未闭环。
+- 已有兼容 Docker Caddy 只有在能够确认容器、配置入口、可写 `sites` 挂载和 reload 方式时才自动复用；普通新增或更新只写当前项目 + 环境拥有的片段，不重写主 Caddyfile。
+- systemd Caddy、其他反向代理、多个代理、未知配置来源或无法确认 reload 方式时记为冲突能力，停止自动初始化；只保留诊断并要求更换服务器或由维护人员先整理，不通过覆盖主配置“尝试修复”。
+- Caddy 变更使用服务器级锁；修改前备份，修改后在目标容器执行 `caddy validate`，再 reload；任一步失败都 rollback 原片段和原配置并再次验证。
+- production 选择全新服务器时必须执行与 staging 相同的完整初始化检查。该要求当前仍是待实现运行时门禁，不能因为原型能选择服务器就标记为已经完成。
+- 地址归属分三类处理：当前项目拥有的路由可幂等修复；其他 ABCDeploy 项目拥有的路由只能通过明确的“转移地址”流程处理；旧服务、第三方或未知归属路由直接阻断，不提供一次确认式接管。
+- 当前桌面运行时尚有一条旧兼容路径，会把主 Caddyfile 中的同地址块视为可确认接管；它没有项目归属证据，因此不满足本 ADR，必须在正式实现验收前删除或改成只读诊断。初始化脚本也需补宿主机进程级 80/443 识别，不能只检查 Docker 容器。
+- 移除项目或环境只删除其拥有且可证明归属的路由片段，不卸载共享 Caddy，也不触碰其他项目路由。
+- 不自动删除未知容器、目录、数据卷或第三方代理配置。
+
+## 13. ADR-012：项目识别和迁移
+
+项目身份优先使用稳定存储 ID 与规范化路径；Git Remote 和项目指纹用于移动恢复，不单独作为主键。
+
+当前模型迁移要求：
+
+- 历史 `test` / `production` 场景映射到 `overview`；
+- 历史部署记录原样保留，并通过聚合模型推导环境状态；
+- 原有单配置绑定无损迁移为多 Profile 环境绑定；
+- 旧的单一服务器绑定不得自动声明为两个环境均已验证，缺失环境在首次使用时确认。
+
+已有部署接入使用独立、持久化的采用状态：
+
+- `pending`：只表示检测到已有部署定义；禁止远程同步和旧连接恢复；
+- `managed`：用户明确选择继续管理，允许只读导入已有版本；
+- `fresh`：用户选择重新设置，只清除本机项目级部署事实并使用内存中的全新草稿，不覆盖项目目录里的旧文件。
+
+进入 `managed` 前依次验证代码 Connection、Registry Connection、服务器完整身份和 ServerCapability。只有服务器身份与本机线索匹配时，系统才保存不可变 `DiscoverySnapshot`：主机指纹、服务器 Connection、观察时间，以及各环境检测到的 Version/ArtifactRef、ConfigRef、地址和健康结果。最终确认只能从该快照映射已证明事实；快照没有证明值存在的配置仍然缺失。采用过程不创建 deployment-kind Task/Attempt、不执行部署，也不允许用本机保存的凭据或历史 `ready` 布尔值直接推断线上健康。最终确认后允许创建 completed `kind=import` 审计 Task/Attempt，作为导入 Version 的来源证据；它们不得带远程副作用或冒充一次部署。
+
+进入 `fresh` 时记录远程历史截断时间。后续即使重新开启同步，也只能导入该时间之后产生的构建，避免旧任务在重启或异步回调后复活。全局连接、系统密钥库、项目文件以及 CNB、Registry、服务器上的资源都不属于重新设置的清理范围。
+
+## 14. 风险等级
+
+| 等级 | 示例 | 默认行为 |
+| --- | --- | --- |
+| 只读 | 扫描、查询版本、检查 DNS | 自动执行 |
+| 本地写入 | 生成项目文件、保存非敏感绑定 | 说明影响后执行 |
+| 远程初始化 | 创建仓库、准备受支持服务器、初始化共享 Caddy 或复用已经符合契约的 Caddy | 展示影响后单独确认并记录；无法证明兼容时阻断 |
+| 生产变更 | 发布、恢复、路由切换 | 强确认与审计 |
+| 破坏性操作 | 删除数据、未知资源、DNS | P0 不自动执行 |
+
+## 15. 架构验收不变量
+
+1. 版本可独立列出，不依赖某个环境页面存在。
+2. 任一测试通过版本可以部署 production，且完整服务产物集合逐项不变。
+3. staging 和 production 的服务器、配置、任务与状态不会相互覆盖。
+4. 更新凭据后可以继续原任务，项目和版本历史不变。
+5. 最近失败不会抹掉在线版本，地址失败不会抹掉容器成功。
+6. 普通进入项目不携带任务上下文。
+7. 任一外部副作用发生前已经存在可恢复的 DeploymentTask。
+8. Version 是提交、来源任务和完整 ArtifactRef 的唯一权威；VersionValidation 只保存验证证据，AutomationRule 保存独立规则事实。
+9. 同一服务器的项目共享一个 ServerCapability；任一项目的路由变更都不会重写或删除其他项目和未知服务配置。
+10. Version 的每个服务产物在 staging 与 production 完全一致；不能只校验一个代表性 digest。
+11. 等待用户输入的 Task 没有 Attempt，Attempt 只对应真实执行并保留完整输入快照。
+12. 服务器 Connection 不带环境语义，首次环境绑定前已经完成身份、前提、访问能力与影响确认。
+13. `active_address` 在 `desired_address` 全部验证通过前保持不变；地址维护不制造部署记录。
+14. CodeConnection 可以跨项目共享，但 SourceBinding 必须精确匹配当前 Project、repository scope、Connection revision 并持有真实验证证据；恢复和切换不能生成证据，错误、缺证据或过期绑定不能进入 Attempt。
+15. 配置引用只存在于 EnvironmentBinding；ConfigProfile 不缓存反向 bindings，applied revision 只由成功且输入仍一致的 Attempt 推进。
+16. Version 的服务集合必须与 Project 精确相等；Validation 六项环境事实必须与来源 Attempt 输出及冻结输入一致，production 每次执行前重新验证资格。
