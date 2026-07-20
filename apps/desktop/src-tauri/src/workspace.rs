@@ -1453,6 +1453,21 @@ impl WorkspaceState {
             .map_err(public_storage_error)
     }
 
+    pub fn connection_by_id(&self, id: &str) -> Result<ConnectionResource, String> {
+        let connection = self.connection.lock().map_err(lock_error)?;
+        connection
+            .query_row(
+                "SELECT id, kind, provider, name, status, last_checked_at,
+                        capabilities_json, metadata_json
+                 FROM connections WHERE id = ?1",
+                [id],
+                connection_resource_from_row,
+            )
+            .optional()
+            .map_err(public_storage_error)?
+            .ok_or_else(|| "所选连接已经不存在，请重新选择".to_string())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_compat_connection(
         &self,

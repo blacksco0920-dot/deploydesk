@@ -13,6 +13,10 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@douyinfe/semi-icons": "2.101.0",
+    "@douyinfe/semi-ui": "2.101.0",
+    "@flowgram.ai/free-layout-editor": "1.0.12",
+    "@flowgram.ai/free-snap-plugin": "1.0.12",
     "@radix-ui/react-collapsible": "^1.1.16",
     "@radix-ui/react-dialog": "^1.1.19",
     "@radix-ui/react-dropdown-menu": "^2.1.20",

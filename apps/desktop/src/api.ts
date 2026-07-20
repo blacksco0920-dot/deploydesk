@@ -1223,7 +1223,7 @@ export async function pauseDeploymentTask(
 
 export async function prepareDeploymentPathRetry(
   runId: string,
-  repairedNode: "local" | "build" | "registry" | "server",
+  repairedNode: "local" | "build" | "registry" | "server" | "routes",
 ): Promise<DeploymentRun> {
   if (!isTauri()) {
     const run = readDemoRuns().find((item) => item.id === runId);
@@ -1231,9 +1231,11 @@ export async function prepareDeploymentPathRetry(
     const next: DeploymentRun = {
       ...run,
       currentStage:
-        repairedNode === "server" && run.artifacts.length
-          ? "deploy"
-          : repairedNode,
+        repairedNode === "routes"
+          ? "server"
+          : repairedNode === "server" && run.artifacts.length
+            ? "deploy"
+            : repairedNode,
       issueCode: null,
       actionKind: "deployment-path-retry",
       message: "新配置已经验证，点击“继续上线”后从这里继续",

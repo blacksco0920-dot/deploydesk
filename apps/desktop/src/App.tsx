@@ -1,6 +1,12 @@
-import { isTauri } from "@tauri-apps/api/core";
 import { LoaderCircle } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { Toaster, toast } from "sonner";
 import { parseDocument } from "yaml";
 import {
@@ -38,12 +44,11 @@ import {
   syncExternalDeployments,
   syncProjectToCnb,
 } from "./api";
-import { AppShell } from "./components/AppShell";
+import { ApplicationFrame } from "./components/ApplicationFrame";
 import { ConfigurationCenter } from "./components/ConfigurationCenter";
-import { DeploymentPathWorkspace } from "./components/DeploymentPathWorkspace";
 import { ExistingDeploymentChoice } from "./components/ExistingDeploymentChoice";
 import { secretRepositoryFromManifest } from "./components/ProductWorkspace";
-import { ProjectHome } from "./components/ProjectHome";
+import { ProjectGallery } from "./components/ProjectGallery";
 import { issueFromUnknown } from "./lib/errors";
 import {
   deploymentVersionKey,
@@ -63,6 +68,12 @@ import type {
   VersionValidation,
   WorkspacePreview,
 } from "./types";
+
+const DeploymentPathWorkspace = lazy(() =>
+  import("./components/DeploymentPathWorkspace").then((module) => ({
+    default: module.DeploymentPathWorkspace,
+  })),
+);
 
 type AppScreen = "home" | "configuration" | "project";
 type ProjectScene =
@@ -306,15 +317,15 @@ export function sameProjectPath(left: string, right: string) {
 
 function App() {
   const [screen, setScreen] = useState<AppScreen>("home");
-  const [preflight, setPreflight] = useState<SystemPreflight | null>(null);
-  const [preflightChecking, setPreflightChecking] = useState(true);
+  const [, setPreflight] = useState<SystemPreflight | null>(null);
+  const [, setPreflightChecking] = useState(true);
   const [projects, setProjects] = useState<RecentProject[]>([]);
   const [workspace, setWorkspace] = useState<WorkspacePreview | null>(null);
   const [projectPath, setProjectPath] = useState("");
   const [runs, setRuns] = useState<DeploymentRun[]>([]);
   const [activeRuns, setActiveRuns] = useState<DeploymentRun[]>([]);
   const [attentionRuns, setAttentionRuns] = useState<DeploymentRun[]>([]);
-  const [completedRuns, setCompletedRuns] = useState<DeploymentRun[]>([]);
+  const [, setCompletedRuns] = useState<DeploymentRun[]>([]);
   const [setupTasks, setSetupTasks] = useState<ProjectSetupTask[]>([]);
   const [verificationTasks, setVerificationTasks] = useState<
     ProjectVerificationTask[]
@@ -1013,66 +1024,6 @@ function App() {
     void openProjectScene(project, "overview");
   }
 
-  async function openDeploymentTask(
-    project: RecentProject,
-    taskRun?: DeploymentRun,
-  ) {
-    const taskScene = taskRun
-      ? deploymentSceneForRun(taskRun)
-      : deploymentSceneForProject(project);
-    const sourceVersion = taskRun
-      ? deploymentVersionForRun(taskRun)
-      : deploymentVersionForProject(project);
-    const taskPanel: ProjectTaskPanel =
-      taskScene === "production"
-        ? "production"
-        : taskScene === "test"
-          ? "test"
-          : "settings";
-    await openProjectTaskPanel(project, taskPanel, sourceVersion ?? "");
-  }
-
-  async function openSetupTask(project: RecentProject, task: ProjectSetupTask) {
-    const taskScene = setupSceneForTask(task);
-    const taskPanel: ProjectTaskPanel =
-      taskScene === "production"
-        ? "production"
-        : taskScene === "test"
-          ? "test"
-          : "settings";
-    await openProjectTaskPanel(project, taskPanel);
-  }
-
-  async function openProjectTaskPanel(
-    project: RecentProject,
-    taskPanel: ProjectTaskPanel,
-    productionVersionId = "",
-  ) {
-    const settingKey = `project.${encodeURIComponent(project.path)}`;
-    const navigationIntent = {
-      scene: "overview" as const,
-      productionVersionId,
-      taskPanel,
-    };
-    setProjectInitialScene("overview");
-    void setAppSetting(`${settingKey}.scene`, "overview").catch(
-      () => undefined,
-    );
-    if (
-      shouldReuseProjectWorkspace(projectPath, project.path, Boolean(workspace))
-    ) {
-      setProjectNavigationIntent(navigationIntent);
-      setProjectViewRevision((current) => current + 1);
-      setScreen("project");
-      return;
-    }
-    await loadProject(project.path, navigationIntent);
-  }
-
-  async function openVerificationTask(project: RecentProject) {
-    await openProjectTaskPanel(project, "test");
-  }
-
   async function openProjectScene(project: RecentProject, scene: ProjectScene) {
     const settingKey = `project.${encodeURIComponent(project.path)}`;
     const navigationIntent = { scene, productionVersionId: "" };
@@ -1420,19 +1371,15 @@ function App() {
 
   const content =
     screen === "home" ? (
-      <ProjectHome
-        embedded
+      <ProjectGallery
         loading={loading}
-        onDemo={() => void loadProject("/demo/ecat-energy")}
         onForget={(project) => void forgetRecent(project)}
         onOpen={openRecentProject}
         onSelect={() => void selectProject()}
-        preflight={preflight}
         projects={projects}
         releaseReadyPaths={releaseReadyPaths}
         selectingProject={selectingProject}
         selectionIssue={projectSelectionIssue}
-        showDemo={!isTauri()}
         setupTasks={setupTasks}
         taskRuns={taskRuns}
         verificationTasks={verificationTasks}
@@ -1448,27 +1395,42 @@ function App() {
         workspace={workspace}
       />
     ) : workspace ? (
-      <DeploymentPathWorkspace
-        autoCreateDefault={recognizedProjectPath === projectPath}
-        key={`${projectPath}:${projectViewRevision}`}
-        onDeploy={deployPath}
-        onError={reportError}
-        onRefresh={refreshRun}
-        onRunUpdated={(run) => {
-          setRuns((current) => mergeDeploymentRun(current, run));
-          setActiveRuns((current) =>
-            current.filter((item) => item.id !== run.id),
-          );
-          setAttentionRuns((current) => [
-            run,
-            ...current.filter((item) => item.id !== run.id),
-          ]);
-        }}
-        onSaveManifest={saveManifest}
-        path={projectPath}
-        runs={runs}
-        workspace={workspace}
-      />
+      <Suspense
+        fallback={
+          <div className="grid h-full min-h-0 place-items-center bg-[#f7f7fb] text-sm text-[var(--muted-foreground)] dark:bg-[#18181c]">
+            <span className="inline-flex items-center gap-2">
+              <LoaderCircle className="size-4 animate-spin" />
+              正在打开部署工作流
+            </span>
+          </div>
+        }
+      >
+        <DeploymentPathWorkspace
+          autoCreateDefault={recognizedProjectPath === projectPath}
+          key={`${projectPath}:${projectViewRevision}`}
+          onBack={() => {
+            setRecognizedProjectPath("");
+            setScreen("home");
+          }}
+          onDeploy={deployPath}
+          onError={reportError}
+          onRefresh={refreshRun}
+          onRunUpdated={(run) => {
+            setRuns((current) => mergeDeploymentRun(current, run));
+            setActiveRuns((current) =>
+              current.filter((item) => item.id !== run.id),
+            );
+            setAttentionRuns((current) => [
+              run,
+              ...current.filter((item) => item.id !== run.id),
+            ]);
+          }}
+          onSaveManifest={saveManifest}
+          path={projectPath}
+          runs={runs}
+          workspace={workspace}
+        />
+      </Suspense>
     ) : (
       <ProjectLoadingState
         mode={projectLoadMode}
@@ -1479,12 +1441,7 @@ function App() {
 
   return (
     <>
-      <AppShell
-        activePath={screen === "project" ? projectPath : ""}
-        completedRuns={completedRuns}
-        setupTasks={setupTasks}
-        taskRuns={taskRuns}
-        verificationTasks={verificationTasks}
+      <ApplicationFrame
         activeView={
           screen === "configuration"
             ? "configuration"
@@ -1492,14 +1449,6 @@ function App() {
               ? "projects"
               : "project"
         }
-        loading={selectingProject || (loading && projects.length === 0)}
-        onAddProject={() => void selectProject()}
-        onOpenDeployment={(project, run) =>
-          void openDeploymentTask(project, run)
-        }
-        onOpenSetup={(project, task) => void openSetupTask(project, task)}
-        onOpenVerification={(project) => void openVerificationTask(project)}
-        onOpenProject={openRecentProject}
         onShowConfiguration={() => {
           setRecognizedProjectPath("");
           setScreen("configuration");
@@ -1508,14 +1457,9 @@ function App() {
           setRecognizedProjectPath("");
           setScreen("home");
         }}
-        preflight={preflight}
-        preflightChecking={preflightChecking}
-        onRetryPreflight={() => void refreshPreflight(true)}
-        projects={projects}
-        releaseReadyPaths={releaseReadyPaths}
       >
         {content}
-      </AppShell>
+      </ApplicationFrame>
 
       <Toaster closeButton position="top-right" richColors />
     </>

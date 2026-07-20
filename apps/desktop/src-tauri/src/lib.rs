@@ -2147,6 +2147,13 @@ fn prepare_deployment_path_retry_inner(
             };
             "运行服务器"
         }
+        "routes" => {
+            // Public routing is an independent reconciliation step. When only
+            // the address changes, keep the already-running immutable images
+            // and resume at verification instead of recreating containers.
+            run.current_stage = "server".to_string();
+            "访问地址"
+        }
         _ => return Err("要继续的线路节点不正确".to_string()),
     };
     run.issue_code = None;
@@ -2868,8 +2875,55 @@ fn scoped_postgres_identifier(value: &str, path_id: &str) -> String {
 fn deployment_path_manifest(
     run: &DeploymentRun,
     path: &DeploymentPath,
+    state: &WorkspaceState,
 ) -> Result<ProjectManifest, String> {
     let mut manifest = deployment_manifest(run)?;
+    let registry_connection_id = path
+        .registry_connection_id
+        .as_deref()
+        .ok_or_else(|| "请先在线路中选择版本仓库".to_string())?;
+    let registry_connection = state.connection_by_id(registry_connection_id)?;
+    if registry_connection.kind != "registry" {
+        return Err("所选连接不是版本仓库，请重新选择".to_string());
+    }
+    if registry_connection.status != "ready" {
+        return Err("版本仓库连接尚未验证，请重新连接后继续".to_string());
+    }
+    manifest.providers.registry = match registry_connection.provider.as_str() {
+        "tcr" => {
+            let registry = registry_connection
+                .metadata
+                .get("endpoint")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| valid_registry_host(value))
+                .ok_or_else(|| "版本仓库连接缺少有效地址，请重新连接".to_string())?;
+            let namespace = registry_connection
+                .metadata
+                .get("namespace")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| valid_registry_namespace(value))
+                .ok_or_else(|| "版本仓库连接缺少有效命名空间，请重新连接".to_string())?;
+            RegistryConfig::Tcr {
+                registry: registry.to_string(),
+                namespace: namespace.to_string(),
+            }
+        }
+        "cnb" => {
+            let repository = registry_connection
+                .metadata
+                .get("repository")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| validate_repository_slug(value).is_ok())
+                .unwrap_or(&manifest.providers.build.repository);
+            RegistryConfig::Cnb {
+                repository: repository.to_string(),
+            }
+        }
+        _ => return Err("当前版本仓库类型暂不支持这条部署线路".to_string()),
+    };
     let environment = &mut manifest.environments.production;
     if let Some(database) = environment.database.as_mut() {
         database.name = scoped_postgres_identifier(&database.name, &path.id);
@@ -2906,6 +2960,12 @@ async fn deployment_path_runtime_content(
         Err(error) => return Err(error),
     };
     let original = Zeroizing::new(content.clone());
+    let path_managed_variables = deployment_path_managed_runtime_variables(manifest);
+    let required_variables = required_runtime_variables(manifest, EnvironmentName::Production)
+        .into_iter()
+        .filter(|variable| !path_managed_variables.contains(variable))
+        .collect::<Vec<_>>();
+    content = ensure_runtime_template_variables(content, &required_variables);
     // A persisted deployment line may predate newly discovered non-secret
     // defaults in .env.example. Reuse those safe project defaults without
     // making the user re-enter them, while never importing secret values or
@@ -2921,7 +2981,26 @@ async fn deployment_path_runtime_content(
     let (merged, _) = fill_managed_runtime_dependencies(&content, &safe_defaults);
     content.zeroize();
     content = merged;
-    let required_variables = required_runtime_variables(manifest, EnvironmentName::Production);
+    // Internal signing/session secrets do not represent an external account
+    // and should never become a setup chore for a beginner. Generate them once
+    // per deployment line, keep them in the system keychain, and reuse the
+    // same value on subsequent releases. Provider credentials remain explicit
+    // and are never synthesized here.
+    let mut generated_secrets = BTreeMap::new();
+    for variable in empty_runtime_variables(&content) {
+        if internal_runtime_secret(&variable) {
+            let value = load_or_generate_runtime_secret(root, &path.id, &variable)?;
+            generated_secrets.insert(variable, value.to_string());
+        }
+    }
+    if !generated_secrets.is_empty() {
+        let (filled, _) = fill_empty_runtime_values(&content, &generated_secrets);
+        for value in generated_secrets.values_mut() {
+            value.zeroize();
+        }
+        content.zeroize();
+        content = filled;
+    }
     let mut managed_variables = Vec::new();
     if manifest.environments.production.database.is_some() {
         managed_variables.push("DATABASE_URL".to_string());
@@ -2995,7 +3074,7 @@ async fn transfer_deployment_path_artifacts(
     path: &DeploymentPath,
     state: &WorkspaceState,
 ) -> Result<Vec<DeploymentArtifact>, String> {
-    let manifest = deployment_path_manifest(run, path)?;
+    let manifest = deployment_path_manifest(run, path, state)?;
     let profile = verified_deployment_path_profile(path, state).await?;
     let revision = checked_git_revision(run.commit_sha.as_deref())?
         .ok_or_else(|| "无法确认要保存的构建版本".to_string())?;
@@ -3134,7 +3213,7 @@ async fn deploy_deployment_path_to_server(
     path: &DeploymentPath,
     state: &WorkspaceState,
 ) -> Result<(), String> {
-    let manifest = deployment_path_manifest(run, path)?;
+    let manifest = deployment_path_manifest(run, path, state)?;
     let profile = verified_deployment_path_profile(path, state).await?;
     let caddy_check = caddy::bootstrap_server(&profile, true)
         .await
@@ -3286,7 +3365,7 @@ async fn verify_deployment_path(
     path: &DeploymentPath,
     state: &WorkspaceState,
 ) -> Result<(), String> {
-    let manifest = deployment_path_manifest(run, path)?;
+    let manifest = deployment_path_manifest(run, path, state)?;
     let profile = verified_deployment_path_profile(path, state).await?;
     let namespace = format!("{}-{}", manifest.project.name, path.id);
     let expected = manifest
@@ -4876,6 +4955,22 @@ async fn sync_external_deployments(
             &manifest.providers.build.repository,
             &record.serial,
         )? {
+            // The deployment-path workflow owns its task from the local snapshot
+            // through registry transfer, server mutation and the final route
+            // check.  The legacy CNB-history importer only knows that the remote
+            // build finished; treating that as a complete environment deployment
+            // overwrites the live path task with `verify-existing-deployment`
+            // before the desktop can transfer the immutable images to TCR.
+            //
+            // Keep returning the row so callers can refresh their local list, but
+            // never let the legacy importer mutate a run already bound to a path.
+            if deployment_path_owns_history_reconciliation(
+                environment,
+                state.deployment_path_for_run(&run.id).is_ok(),
+            ) {
+                imported.push(run);
+                continue;
+            }
             apply_version_title(&mut run, &record, &root);
             // 旧版本先插入本机时间再更新 CNB 时间，但 SQLite 的 upsert 曾没有更新
             // started_at，导致数月前的失败记录排在刚成功的版本前面。每次后台同步都
@@ -5045,6 +5140,13 @@ fn build_record_environment_order(record: &CnbBuildRecord) -> u8 {
         Some("production") => 2,
         _ => 3,
     }
+}
+
+fn deployment_path_owns_history_reconciliation(
+    environment: &str,
+    bound_to_deployment_path: bool,
+) -> bool {
+    environment == "deployment" && bound_to_deployment_path
 }
 
 fn latest_success_serials_by_environment(
@@ -6177,7 +6279,7 @@ async fn take_over_deployment_path_routes_inner(
         return Err("当前上线任务没有需要接管的服务器地址".to_string());
     }
     let path = state.deployment_path_for_run(&run.id)?;
-    let manifest = deployment_path_manifest(&run, &path)?;
+    let manifest = deployment_path_manifest(&run, &path, state)?;
     let profile = verified_deployment_path_profile(&path, state).await?;
     let routes = deployment_path_routes(&path);
     let root_routes = routes
@@ -7305,6 +7407,38 @@ fn url_encode_userinfo(value: &str) -> String {
     encoded
 }
 
+fn ensure_runtime_template_variables(mut content: String, required: &[String]) -> String {
+    let existing = content
+        .lines()
+        .filter_map(|line| {
+            let left = line.split_once('=')?.0;
+            let key = left
+                .trim()
+                .strip_prefix("export ")
+                .unwrap_or_else(|| left.trim())
+                .trim();
+            valid_environment_variable(key).then(|| key.to_string())
+        })
+        .collect::<BTreeSet<_>>();
+    let missing = required
+        .iter()
+        .filter(|variable| !existing.contains(*variable))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return content;
+    }
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if !content.is_empty() {
+        content.push_str("\n# ABCDeploy 检测到的必要配置\n");
+    }
+    for variable in missing {
+        writeln!(&mut content, "{variable}=").expect("writing to a String is infallible");
+    }
+    content
+}
+
 fn runtime_defaults(
     content: &str,
     secret_variables: &BTreeSet<String>,
@@ -7667,6 +7801,24 @@ fn valid_registry_host(value: &str) -> bool {
                     .last()
                     .is_some_and(u8::is_ascii_alphanumeric)
         })
+}
+
+fn valid_registry_namespace(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= 100
+        && value == value.to_ascii_lowercase()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
 }
 
 fn check_registry_login(
@@ -9099,11 +9251,12 @@ fn runtime_config_template(
         .map(|variable| variable.name.clone())
         .collect::<BTreeSet<_>>();
     let prepare_content = |content: String| {
-        if environment == EnvironmentName::Development {
+        let content = if environment == EnvironmentName::Development {
             content
         } else {
             remote_runtime_content(&content, &secret_variables, true)
-        }
+        };
+        ensure_runtime_template_variables(content, &required_variables)
     };
     let mut sections = Vec::new();
     for relative in &inspection.environment_files {
@@ -9235,6 +9388,25 @@ fn required_runtime_variables(
     variables.sort();
     variables.dedup();
     variables
+}
+
+fn deployment_path_managed_runtime_variables(
+    manifest: &deploy_core::ProjectManifest,
+) -> BTreeSet<String> {
+    const OCR_URL_VARIABLE: &str = "PP_OCRV6_TINY_URL";
+    let has_ocr = manifest.services.iter().any(|service| service.id == "ocr");
+    if has_ocr
+        && manifest.services.iter().any(|service| {
+            service
+                .runtime_env
+                .iter()
+                .any(|variable| variable.name == OCR_URL_VARIABLE)
+        })
+    {
+        BTreeSet::from([OCR_URL_VARIABLE.to_string()])
+    } else {
+        BTreeSet::new()
+    }
 }
 
 fn parse_runtime_environment(value: &str) -> Result<EnvironmentName, String> {
@@ -10129,7 +10301,7 @@ fn local_development_services(
                 container_port,
                 Some(build_target),
                 format!(
-                    "node -e \"fetch('http://127.0.0.1:{}{}').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))\"",
+                    "node -e \"fetch('http://127.0.0.1:{}{}').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
                     container_port, service.healthcheck.path
                 ),
             )
@@ -11604,65 +11776,55 @@ async fn run_pilot_validation(
     state.mark_project_fresh_draft_saved(&root)?;
     state.set_project_step(&root, "workspace")?;
 
-    let source = state
-        .list_connections(Some("source"))?
-        .into_iter()
-        .find(|connection| connection.provider == "cnb" && connection.status == "ready")
-        .ok_or_else(|| "没有可用的构建服务连接".to_string())?;
-    let registry = state
-        .list_connections(Some("registry"))?
-        .into_iter()
-        .find(|connection| connection.status == "ready")
-        .ok_or_else(|| "没有可用的版本仓库连接".to_string())?;
-    let server = state
-        .list_servers()?
-        .into_iter()
-        .find(|server| server.key_path_exists && server.host_fingerprint.is_some())
-        .ok_or_else(|| "没有已验证的运行服务器".to_string())?;
-    let service = manifest
-        .services
-        .iter()
-        .find(|service| service.kind == ServiceKind::Web)
-        .or_else(|| {
-            manifest
-                .services
-                .iter()
-                .find(|service| service.kind == ServiceKind::Static)
-        })
-        .or_else(|| {
-            manifest
-                .services
-                .iter()
-                .find(|service| service.kind != ServiceKind::Worker)
-        })
-        .ok_or_else(|| "试点项目没有可以公开验收的服务".to_string())?;
-    let project_slug = pilot_slug(&manifest.project.name);
-    let path_id = format!("path-pilot-{project_slug}");
-    let public_host = "h5.finagent.cloud".to_string();
-    let public_path = format!("/abcdeploy-pilot-{project_slug}/");
+    // The pilot must exercise the same line that the user sees in the UI.
+    // Creating a hidden parallel line would let it take over the same public
+    // host while the visible line still reported an older version as online.
     let existing = state
         .list_deployment_paths(&root)?
         .into_iter()
-        .find(|path| path.id == path_id);
+        .find(|path| path.name == "上线")
+        .or_else(|| state.list_deployment_paths(&root).ok()?.into_iter().next())
+        .ok_or_else(|| "请先在客户端创建并配置一条可见的上线线路".to_string())?;
+    if existing.routes.is_empty() {
+        return Err("请先在线路的运行服务器节点设置访问地址".to_string());
+    }
+    let source_id = existing
+        .source_connection_id
+        .as_deref()
+        .ok_or_else(|| "请先在线路中选择构建服务".to_string())?;
+    let source = state.connection_by_id(source_id)?;
+    if source.kind != "source" || source.provider != "cnb" || source.status != "ready" {
+        return Err("线路当前选择的构建服务尚未验证".to_string());
+    }
+    let registry_id = existing
+        .registry_connection_id
+        .as_deref()
+        .ok_or_else(|| "请先在线路中选择版本仓库".to_string())?;
+    let registry = state.connection_by_id(registry_id)?;
+    if registry.kind != "registry" || registry.status != "ready" {
+        return Err("线路当前选择的版本仓库尚未验证".to_string());
+    }
+    let server_id = existing
+        .server_id
+        .as_deref()
+        .ok_or_else(|| "请先在线路中选择运行服务器".to_string())?;
+    let server = state.server_by_id(server_id)?;
+    if !server.key_path_exists || server.host_fingerprint.is_none() {
+        return Err("线路当前选择的运行服务器尚未验证".to_string());
+    }
     let path = state.save_deployment_path(DeploymentPathInput {
-        id: Some(path_id),
+        id: Some(existing.id.clone()),
         project_path: root.to_string_lossy().into_owned(),
-        name: "上线验收".to_string(),
+        name: existing.name.clone(),
         source_connection_id: Some(source.id),
         registry_connection_id: Some(registry.id),
         server_id: Some(server.id),
-        config_profile_ids: existing
-            .as_ref()
-            .map_or_else(Vec::new, |path| path.config_profile_ids.clone()),
-        address: public_host.clone(),
-        routes: vec![workspace::DeploymentPathRoute {
-            service: service.id.clone(),
-            host: public_host,
-            path: public_path,
-        }],
+        config_profile_ids: existing.config_profile_ids.clone(),
+        address: existing.address.clone(),
+        routes: existing.routes.clone(),
         state: Some("ready".to_string()),
-        last_run_id: None,
-        last_successful_revision: existing.and_then(|path| path.last_successful_revision),
+        last_run_id: existing.last_run_id.clone(),
+        last_successful_revision: existing.last_successful_revision,
     })?;
     seed_pilot_runtime_config(&root, &path.id)?;
 
@@ -11805,46 +11967,44 @@ fn pilot_evidence(
     }
 }
 
-fn pilot_slug(value: &str) -> String {
-    let slug = value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    slug.trim_matches('-').to_string()
-}
-
 fn seed_pilot_runtime_config(root: &Path, path_id: &str) -> Result<(), String> {
     let target_key = runtime_config_key(root, path_id)?;
-    if read_keyring_secret(&target_key).is_ok_and(|value| !value.trim().is_empty()) {
-        return Ok(());
-    }
-    for scope in ["production", "staging", "development"] {
-        let key = runtime_config_key(root, scope)?;
-        if let Ok(mut value) = read_keyring_secret(&key)
-            && !value.trim().is_empty()
-        {
-            let remote = remote_runtime_content(&value, &BTreeSet::new(), false);
+    let mut content = match read_keyring_secret(&target_key) {
+        Ok(value) if !value.trim().is_empty() => Zeroizing::new(value),
+        Ok(mut value) => {
             value.zeroize();
-            write_keyring_secret(&target_key, &remote)?;
-            return Ok(());
+            Zeroizing::new(String::new())
+        }
+        Err(error) if error == "missing" => Zeroizing::new(String::new()),
+        Err(error) => return Err(error),
+    };
+    if content.trim().is_empty() {
+        for scope in ["production", "staging", "development"] {
+            let key = runtime_config_key(root, scope)?;
+            if let Ok(mut value) = read_keyring_secret(&key)
+                && !value.trim().is_empty()
+            {
+                *content = remote_runtime_content(&value, &BTreeSet::new(), false);
+                value.zeroize();
+                break;
+            }
         }
     }
-    for filename in [".env.production", ".env.staging", ".env"] {
-        let path = root.join(filename);
-        if let Ok(mut value) = fs::read_to_string(path)
-            && !value.trim().is_empty()
-        {
-            let remote = remote_runtime_content(&value, &BTreeSet::new(), false);
-            value.zeroize();
-            write_keyring_secret(&target_key, &remote)?;
-            return Ok(());
+    if content.trim().is_empty() {
+        for filename in [".env.production", ".env.staging", ".env"] {
+            let path = root.join(filename);
+            if let Ok(mut value) = fs::read_to_string(path)
+                && !value.trim().is_empty()
+            {
+                *content = remote_runtime_content(&value, &BTreeSet::new(), false);
+                value.zeroize();
+                break;
+            }
         }
+    }
+
+    if !content.trim().is_empty() {
+        write_keyring_secret(&target_key, &content)?;
     }
     Ok(())
 }
@@ -12013,25 +12173,28 @@ mod tests {
 
     use super::{
         BASE64, CNB_ACCOUNT_CACHE_KEY, CNB_KEYCHAIN_UNAVAILABLE_ERROR, CnbBuildRecord,
-        CnbTokenResolutionError, DeploymentArtifact, DeploymentRun, LocalPreviewService,
-        LocalPreviewStatus, ProjectRelinkIdentity, REMOTE_DEPENDENCY_SCRIPT, ServerRouteProblem,
-        ServerRouteProblemKind, StoredCnbToken, WorkspaceState, apply_container_log_diagnostic,
-        apply_deployed_service_states, apply_planned_local_build_strategies,
-        apply_public_route_checks, apply_runner_log_diagnostic, apply_server_route_problem,
-        apply_server_route_problems, apply_server_route_takeover_problem, apply_version_title,
-        build_environment_for_event, build_serial_for_revision, cache_secret, cached_cnb_account,
-        cached_secret, caddy_certificate_reload_script, caddy_main_route_rewrite_shell_function,
+        CnbTokenResolutionError, DeploymentArtifact, DeploymentPath, DeploymentRun,
+        LocalPreviewService, LocalPreviewStatus, ProjectRelinkIdentity, REMOTE_DEPENDENCY_SCRIPT,
+        RegistryConfig, ServerRouteProblem, ServerRouteProblemKind, StoredCnbToken, WorkspaceState,
+        apply_container_log_diagnostic, apply_deployed_service_states,
+        apply_planned_local_build_strategies, apply_public_route_checks,
+        apply_runner_log_diagnostic, apply_server_route_problem, apply_server_route_problems,
+        apply_server_route_takeover_problem, apply_version_title, build_environment_for_event,
+        build_serial_for_revision, cache_secret, cached_cnb_account, cached_secret,
+        caddy_certificate_reload_script, caddy_main_route_rewrite_shell_function,
         caddy_route_declared_shell_function, certificate_retry_allowed, cloud_setup_required,
         cnb_account_from_responses, cnb_build_history_error, cnb_keyring_issue, cnb_public_error,
         cnb_secret_filename, container_runtime_env, create_deployment_git_snapshot,
         deployment_manifest, deployment_needs_public_route_recheck, deployment_owned_paths,
-        deployment_routing_manifest, ensure_git_repository_for_sync, evict_cached_secret,
+        deployment_path_managed_runtime_variables, deployment_path_manifest,
+        deployment_path_owns_history_reconciliation, deployment_routing_manifest,
+        ensure_git_repository_for_sync, ensure_runtime_template_variables, evict_cached_secret,
         existing_cnb_repository, fill_empty_runtime_values, fill_managed_runtime_dependencies,
-        git_failure, git_stdout, interrupted_public_route_status, interrupted_route_check_message,
-        is_deployment_internal_path, is_deployment_owned_path, is_production_approval_build,
-        latest_success_serials_by_environment, load_existing_project_config,
-        local_build_failure_summary, local_build_proxy_attempts, local_database_name,
-        local_git_title, local_infrastructure_compose, local_start_failure,
+        git_failure, git_stdout, internal_runtime_secret, interrupted_public_route_status,
+        interrupted_route_check_message, is_deployment_internal_path, is_deployment_owned_path,
+        is_production_approval_build, latest_success_serials_by_environment,
+        load_existing_project_config, local_build_failure_summary, local_build_proxy_attempts,
+        local_database_name, local_git_title, local_infrastructure_compose, local_start_failure,
         looks_like_dependency_network_text, ordered_build_records, overlay_server_route_problems,
         parse_deployed_service_states, parse_deployment_artifacts, parse_local_container_readiness,
         parse_managed_local_port_owner, pause_deployment_path_after_deploy_error,
@@ -12853,6 +13016,23 @@ providers:
     }
 
     #[test]
+    fn runtime_template_adds_new_manifest_requirements_without_overwriting_values() {
+        let prepared = ensure_runtime_template_variables(
+            "NODE_ENV=production\nDATABASE_URL=postgresql://db/app\n".to_string(),
+            &[
+                "NODE_ENV".to_string(),
+                "DATABASE_URL".to_string(),
+                "AUTH_TOKEN_SECRET".to_string(),
+            ],
+        );
+
+        assert_eq!(prepared.matches("NODE_ENV=").count(), 1);
+        assert!(prepared.contains("DATABASE_URL=postgresql://db/app"));
+        assert!(prepared.contains("# ABCDeploy 检测到的必要配置"));
+        assert!(prepared.ends_with("AUTH_TOKEN_SECRET=\n"));
+    }
+
+    #[test]
     fn remote_runtime_config_clears_local_and_secret_example_values() {
         let project = tempdir().expect("temp project");
         let template = concat!(
@@ -12910,6 +13090,27 @@ providers:
     }
 
     #[test]
+    fn only_internal_application_secrets_are_safe_to_generate() {
+        for variable in [
+            "AUTH_TOKEN_SECRET",
+            "JWT_SECRET",
+            "FINAGENT_SESSION_SECRET",
+            "COOKIE_SECRET",
+            "ENCRYPTION_KEY",
+        ] {
+            assert!(internal_runtime_secret(variable), "{variable}");
+        }
+        for variable in [
+            "MINIMAX_API_KEY",
+            "TCR_PASSWORD",
+            "CNB_TOKEN",
+            "DATABASE_URL",
+        ] {
+            assert!(!internal_runtime_secret(variable), "{variable}");
+        }
+    }
+
+    #[test]
     fn static_build_variables_do_not_block_server_runtime() {
         let project = tempdir().expect("project");
         fs::create_dir_all(project.path().join("src")).expect("source directory");
@@ -12938,6 +13139,41 @@ providers:
             !required_runtime_variables(&manifest, EnvironmentName::Production)
                 .contains(&"VITE_API_BASE_URL".to_string())
         );
+    }
+
+    #[test]
+    fn deployment_path_does_not_ask_users_for_managed_ocr_service_urls() {
+        let project = tempdir().expect("project");
+        fs::write(
+            project.path().join("package.json"),
+            r#"{"name":"sample-api","scripts":{"start":"node server.js"}}"#,
+        )
+        .expect("package manifest");
+        fs::write(project.path().join("server.js"), "process.exit(0);\n").expect("entrypoint");
+        let inspection = deploy_core::inspect_project(project.path()).expect("inspection");
+        let mut manifest = deploy_core::create_default_manifest(&inspection);
+        manifest.services[0]
+            .runtime_env
+            .push(deploy_core::model::EnvironmentVariable {
+                name: "PP_OCRV6_TINY_URL".to_string(),
+                required: true,
+                secret: false,
+                default: None,
+                description: String::new(),
+            });
+        let mut ocr = manifest.services[0].clone();
+        ocr.id = "ocr".to_string();
+        ocr.image = "sample-ocr".to_string();
+        ocr.container_port = 8000;
+        ocr.runtime_env.clear();
+        manifest.services.push(ocr);
+
+        assert_eq!(
+            deployment_path_managed_runtime_variables(&manifest),
+            BTreeSet::from(["PP_OCRV6_TINY_URL".to_string()])
+        );
+        manifest.services.retain(|service| service.id != "ocr");
+        assert!(deployment_path_managed_runtime_variables(&manifest).is_empty());
     }
 
     #[test]
@@ -13528,6 +13764,25 @@ providers:
     }
 
     #[test]
+    fn legacy_history_sync_never_overwrites_a_bound_deployment_path_run() {
+        assert!(deployment_path_owns_history_reconciliation(
+            "deployment",
+            true
+        ));
+        assert!(!deployment_path_owns_history_reconciliation(
+            "deployment",
+            false
+        ));
+        assert!(!deployment_path_owns_history_reconciliation(
+            "staging", true
+        ));
+        assert!(!deployment_path_owns_history_reconciliation(
+            "production",
+            true
+        ));
+    }
+
+    #[test]
     fn imports_cnb_history_oldest_first_and_keeps_latest_result_per_line_kind() {
         let payload = json!({
             "data": [
@@ -13766,6 +14021,49 @@ providers:
             repaired.action_kind.as_deref(),
             Some("deployment-path-retry")
         );
+    }
+
+    #[test]
+    fn repaired_deployment_path_routes_keep_existing_artifacts_on_the_server() {
+        let directory = tempdir().expect("temporary workspace");
+        let state = WorkspaceState::open(&directory.path().join("workspace.sqlite3"))
+            .expect("open workspace");
+        let mut deployment = run();
+        deployment.project_path = directory
+            .path()
+            .canonicalize()
+            .expect("canonical project path")
+            .to_string_lossy()
+            .into_owned();
+        deployment.environment = "deployment".to_string();
+        deployment.status = "needs_action".to_string();
+        deployment.current_stage = "server".to_string();
+        deployment.issue_code = Some("AD-NET-201".to_string());
+        deployment.action_kind = Some("deployment-path-route-check".to_string());
+        deployment.artifacts.push(DeploymentArtifact {
+            service: "web".to_string(),
+            image: "registry.example.com/sample/web".to_string(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+        });
+        state
+            .remember_project(directory.path(), "sample", true, 1)
+            .expect("remember project");
+        state
+            .save_deployment_run(&deployment)
+            .expect("save interrupted run");
+
+        let repaired =
+            prepare_deployment_path_retry_inner(deployment.id, "routes".to_string(), &state)
+                .expect("prepare route retry");
+
+        assert_eq!(repaired.current_stage, "server");
+        assert_eq!(repaired.artifacts.len(), 1);
+        assert_eq!(repaired.issue_code, None);
+        assert_eq!(
+            repaired.action_kind.as_deref(),
+            Some("deployment-path-retry")
+        );
+        assert!(repaired.message.contains("访问地址"));
     }
 
     #[test]
@@ -14179,6 +14477,111 @@ providers:
                 .completed_steps
                 .contains(&"healthcheck".to_string())
         );
+    }
+
+    #[test]
+    fn deployment_path_uses_the_selected_registry_connection_over_stale_manifest_defaults() {
+        let project = tempdir().expect("temp project");
+        fs::write(
+            project.path().join("deploy.yaml"),
+            r#"version: 1
+project: { name: sample }
+source: { provider: local, repository: "", release_branch: main }
+services:
+  - id: api
+    kind: api
+    image: sample-api
+    context: .
+    dockerfile: Dockerfile
+    container_port: 3000
+    healthcheck: { path: /health }
+environments:
+  development: { target: { kind: local, namespace: sample-development } }
+  staging:
+    target: { kind: server, server: default, namespace: sample-staging }
+    domains: []
+  production:
+    target: { kind: server, server: default, namespace: sample-production }
+    domains: []
+providers:
+  build: { kind: cnb, repository: team/sample }
+  registry: { kind: tcr, registry: ccr.ccs.tencentyun.com, namespace: replace-me }
+"#,
+        )
+        .expect("write manifest");
+        for arguments in [
+            vec!["init", "-q"],
+            vec!["add", "deploy.yaml"],
+            vec![
+                "-c",
+                "user.name=ABCDeploy Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "snapshot",
+            ],
+        ] {
+            assert!(
+                Command::new("git")
+                    .current_dir(project.path())
+                    .args(arguments)
+                    .status()
+                    .expect("run git")
+                    .success()
+            );
+        }
+        let revision = git_stdout(project.path(), &["rev-parse", "HEAD"])
+            .expect("read revision")
+            .trim()
+            .to_string();
+        let state = WorkspaceState::open(&project.path().join("workspace.sqlite3"))
+            .expect("open workspace");
+        state
+            .upsert_compat_connection(
+                "registry-finagent",
+                "registry",
+                "tcr",
+                "腾讯云 TCR",
+                Some("registry.tcr.v2.password"),
+                &BTreeMap::from([
+                    ("endpoint".to_string(), "ccr.ccs.tencentyun.com".to_string()),
+                    ("namespace".to_string(), "finagent".to_string()),
+                ]),
+                &["push".to_string(), "pull".to_string()],
+                "ready",
+                None,
+            )
+            .expect("save registry connection");
+        let mut deployment = run();
+        deployment.project_path = project.path().to_string_lossy().into_owned();
+        deployment.commit_sha = Some(revision);
+        deployment.environment = "deployment".to_string();
+        let path = DeploymentPath {
+            id: "path-sample".to_string(),
+            project_path: deployment.project_path.clone(),
+            name: "上线".to_string(),
+            source_connection_id: None,
+            registry_connection_id: Some("registry-finagent".to_string()),
+            server_id: None,
+            config_profile_ids: Vec::new(),
+            address: String::new(),
+            routes: Vec::new(),
+            state: "ready".to_string(),
+            last_run_id: None,
+            last_successful_revision: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let resolved =
+            deployment_path_manifest(&deployment, &path, &state).expect("resolve path manifest");
+
+        assert!(matches!(
+            resolved.providers.registry,
+            RegistryConfig::Tcr { ref registry, ref namespace }
+                if registry == "ccr.ccs.tencentyun.com" && namespace == "finagent"
+        ));
     }
 
     #[test]

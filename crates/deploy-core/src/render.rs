@@ -105,6 +105,13 @@ enum ReleaseChannel {
     Verified,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RemoteDeployOptions<'a> {
+    route_hosts: &'a [String],
+    include_health_diagnostics: bool,
+    filter_service_environment: bool,
+}
+
 pub fn render_project_files(manifest: &ProjectManifest) -> Result<Vec<GeneratedFile>> {
     let mut files = Vec::new();
     files.push(GeneratedFile {
@@ -213,7 +220,11 @@ pub fn render_deployment_path_bundle(
         // transaction after the services are healthy. The Compose transaction
         // deliberately does not touch Caddy, so a transient route failure can
         // be retried without recreating the application.
-        &[],
+        RemoteDeployOptions {
+            route_hosts: &[],
+            include_health_diagnostics: true,
+            filter_service_environment: true,
+        },
     );
     let root_caddy = render_deployment_path_caddy(manifest, path_key, &root_routes);
     let root_route_targets = root_routes
@@ -232,8 +243,9 @@ pub fn render_deployment_path_bundle(
             Ok((
                 route.host.clone(),
                 format!(
-                    "{}-{path_key}-{}:{}",
-                    manifest.project.name, service.id, service.container_port
+                    "{}:{}",
+                    deployment_path_service_alias(manifest, path_key, service),
+                    service.container_port
                 ),
             ))
         })
@@ -266,8 +278,10 @@ fn render_deployment_path_compose(
     network_name: &str,
     environment: &EnvironmentConfig,
 ) -> Result<String> {
-    let uses_shared_infrastructure =
-        environment.database.is_some() || environment.redis_namespace.is_some();
+    let uses_shared_infrastructure = manifest
+        .services
+        .iter()
+        .any(|service| service_uses_shared_infrastructure(service, environment));
     let mut services = BTreeMap::new();
     for service in &manifest.services {
         let image_variable = image_variable(service);
@@ -294,43 +308,45 @@ fn render_deployment_path_compose(
                 );
             }
         }
-        if service
-            .dockerfile
-            .starts_with(".deploydesk/generated/build/Dockerfile.")
-            && matches!(service.kind, ServiceKind::Static | ServiceKind::Web)
+        if matches!(service.kind, ServiceKind::Static | ServiceKind::Web)
             && let Some(api) = manifest
                 .services
                 .iter()
                 .find(|candidate| candidate.kind == ServiceKind::Api)
         {
-            runtime.insert("API_HOST".to_string(), api.id.clone());
+            runtime.insert(
+                "API_HOST".to_string(),
+                deployment_path_service_alias(manifest, path_key, api),
+            );
             runtime.insert("API_PORT".to_string(), api.container_port.to_string());
         }
-        let health_command = service.healthcheck.command.clone().unwrap_or_else(|| {
+        inject_deployment_path_service_dependencies(manifest, path_key, service, &mut runtime);
+        let mut health_command = service.healthcheck.command.clone().unwrap_or_else(|| {
             match service.kind {
                 ServiceKind::Static => format!(
                     "wget -Y off -q --spider http://127.0.0.1:{}{}",
                     service.container_port, service.healthcheck.path
                 ),
                 ServiceKind::Api | ServiceKind::Web | ServiceKind::Worker => format!(
-                    "node -e \"fetch('http://127.0.0.1:{}{}').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))\"",
+                    "node -e \"fetch('http://127.0.0.1:{}{}').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
                     service.container_port, service.healthcheck.path
                 ),
             }
         });
+        append_custom_frontend_api_health_gate(manifest, service, &mut health_command);
         let generated_caddy_runtime = service
             .dockerfile
             .starts_with(".deploydesk/generated/build/Dockerfile.")
             && health_command.starts_with("wget -Y off -q --spider ");
         let mut aliases = vec![
-            format!("{}-{path_key}-{}", manifest.project.name, service.id),
+            deployment_path_service_alias(manifest, path_key, service),
             service.image.clone(),
         ];
         aliases.sort();
         aliases.dedup();
         let mut service_networks =
             BTreeMap::from([("apps".to_string(), ComposeServiceNetwork { aliases })]);
-        if uses_shared_infrastructure {
+        if service_uses_shared_infrastructure(service, environment) {
             service_networks.insert(
                 "infrastructure".to_string(),
                 ComposeServiceNetwork {
@@ -344,11 +360,7 @@ fn render_deployment_path_compose(
                 image: Some(format!("${{{image_variable}:?请填写不可变镜像地址}}")),
                 build: None,
                 restart: "unless-stopped".to_string(),
-                env_file: if service.runtime_env.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![".runtime.env".to_string()]
-                },
+                env_file: deployment_path_service_env_files(service),
                 extra_hosts: Vec::new(),
                 ports: Vec::new(),
                 environment: runtime,
@@ -434,7 +446,7 @@ fn render_deployment_path_caddy(
         } else {
             route.host.clone()
         };
-        let alias = format!("{}-{path_key}-{}", manifest.project.name, service.id);
+        let alias = deployment_path_service_alias(manifest, path_key, service);
         lines.push(String::new());
         lines.push(format!("{site_address} {{"));
         lines.push(format!(
@@ -893,7 +905,7 @@ fn render_compose(
                 service.container_port, service.healthcheck.path
             ),
             ServiceKind::Api | ServiceKind::Web | ServiceKind::Worker => format!(
-                "node -e \"fetch('http://127.0.0.1:{}{}').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))\"",
+                "node -e \"fetch('http://127.0.0.1:{}{}').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
                 service.container_port, service.healthcheck.path
             ),
         });
@@ -2025,8 +2037,58 @@ fn remote_deploy_script(
         network,
         &site_name,
         &persisted_runtime_file,
-        &route_hosts,
+        RemoteDeployOptions {
+            route_hosts: &route_hosts,
+            include_health_diagnostics: false,
+            filter_service_environment: false,
+        },
     )
+}
+
+fn deployment_path_service_environment_filter(manifest: &ProjectManifest) -> String {
+    let mut services = manifest
+        .services
+        .iter()
+        .filter(|service| !service.runtime_env.is_empty())
+        .collect::<Vec<_>>();
+    services.sort_by(|left, right| left.id.cmp(&right.id));
+    if services.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec![
+        "prepare_service_environment() {".to_string(),
+        "  rm -f .runtime.*.env .runtime.*.env.next".to_string(),
+    ];
+    for service in services {
+        let output = format!(".runtime.{}.env", service.id);
+        let next = format!("{output}.next");
+        let mut variable_names = service
+            .runtime_env
+            .iter()
+            .map(|variable| variable.name.as_str())
+            .collect::<Vec<_>>();
+        variable_names.sort_unstable();
+        variable_names.dedup();
+        let patterns = variable_names
+            .iter()
+            .map(|name| format!("{}*", shell_quote(&format!("{name}="))))
+            .collect::<Vec<_>>()
+            .join("|");
+        lines.extend([
+            format!("  : > {}", shell_quote(&next)),
+            "  while IFS= read -r runtime_line || [ -n \"$runtime_line\" ]; do".to_string(),
+            format!(
+                "    case \"$runtime_line\" in {patterns}) printf '%s\\n' \"$runtime_line\" >> {} ;; esac",
+                shell_quote(&next)
+            ),
+            "  done < .runtime.env".to_string(),
+            format!("  chmod 600 {}", shell_quote(&next)),
+            format!("  mv -f {} {}", shell_quote(&next), shell_quote(&output)),
+        ]);
+    }
+    lines.push("}".to_string());
+    lines.push(String::new());
+    lines.join("\n")
 }
 
 fn remote_deploy_script_for_target(
@@ -2036,11 +2098,33 @@ fn remote_deploy_script_for_target(
     network: &str,
     site_name: &str,
     persisted_runtime_file: &str,
-    route_hosts: &[String],
+    options: RemoteDeployOptions<'_>,
 ) -> String {
     let compose = "docker compose --env-file .release.env -f docker-compose.yml";
     let migration_steps = remote_migration_steps(manifest, environment, compose);
-    let partial_route_script = caddy_partial_route_activation_script(route_hosts);
+    let partial_route_script = caddy_partial_route_activation_script(options.route_hosts);
+    let health_diagnostics = if options.include_health_diagnostics {
+        format!(
+            "  {compose} ps >&2 || true\n  for container_id in $({compose} ps -q); do\n    docker inspect --format '{{{{range .State.Health.Log}}}}{{{{.Output}}}}{{{{end}}}}' \"$container_id\" >&2 || true\n  done\n"
+        )
+    } else {
+        String::new()
+    };
+    let service_environment_filter = if options.filter_service_environment {
+        deployment_path_service_environment_filter(manifest)
+    } else {
+        String::new()
+    };
+    let prepare_service_environment = if service_environment_filter.is_empty() {
+        String::new()
+    } else {
+        "prepare_service_environment\n".to_string()
+    };
+    let restore_service_environment = if service_environment_filter.is_empty() {
+        String::new()
+    } else {
+        "    prepare_service_environment\n".to_string()
+    };
     let prune_from = manifest.release.keep_releases.saturating_add(1);
     format!(
         r#"set -eu
@@ -2076,13 +2160,13 @@ restore_previous() {{
     if [ -f "$file.previous" ]; then mv -f "$file.previous" "$file"; fi
   done
 }}
-for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
+{service_environment_filter}for file in docker-compose.yml .runtime.env .release.env Caddyfile; do
   test -f "$file.next"
   backup_file "$file"
   mv "$file.next" "$file"
 done
 chmod 600 .runtime.env .release.env
-release_id="$(sed -n 's/^DEPLOYDESK_RELEASE_ID=//p' .release.env | head -n 1)"
+{prepare_service_environment}release_id="$(sed -n 's/^DEPLOYDESK_RELEASE_ID=//p' .release.env | head -n 1)"
 case "$release_id" in ''|*[!A-Za-z0-9._-]*) echo '发布记录标识无效' >&2; exit 1 ;; esac
 if {compose} config --quiet && \
    {compose} pull && \
@@ -2090,9 +2174,9 @@ if {compose} config --quiet && \
   :
 else
   deploy_status=$?
-  if [ "{auto_rollback}" = "true" ] && [ -f .release.env.previous ]; then
+{health_diagnostics}  if [ "{auto_rollback}" = "true" ] && [ -f .release.env.previous ]; then
     restore_previous
-    {compose} pull || true
+{restore_service_environment}    {compose} pull || true
     {compose} up -d --remove-orphans --force-recreate --wait --wait-timeout 180 || true
   fi
   exit "$deploy_status"
@@ -2155,9 +2239,17 @@ fi"#,
         persisted_runtime_file = persisted_runtime_file,
         compose = compose,
         migration_steps = migration_steps,
+        health_diagnostics = health_diagnostics,
+        service_environment_filter = service_environment_filter,
+        prepare_service_environment = prepare_service_environment,
+        restore_service_environment = restore_service_environment,
         auto_rollback = manifest.release.auto_rollback,
         prune_from = prune_from,
-        activate_caddy_routes = if route_hosts.is_empty() { "0" } else { "1" },
+        activate_caddy_routes = if options.route_hosts.is_empty() {
+            "0"
+        } else {
+            "1"
+        },
         site_name = site_name,
         network = shell_quote(network),
         partial_route_script = partial_route_script,
@@ -2260,6 +2352,111 @@ fn service_alias(
     )
 }
 
+fn deployment_path_service_alias(
+    manifest: &ProjectManifest,
+    path_key: &str,
+    service: &ServiceConfig,
+) -> String {
+    format!("{}-{path_key}-{}", manifest.project.name, service.id)
+}
+
+fn deployment_path_service_env_files(service: &ServiceConfig) -> Vec<String> {
+    if service.runtime_env.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(".runtime.{}.env", service.id)]
+    }
+}
+
+fn inject_deployment_path_service_dependencies(
+    manifest: &ProjectManifest,
+    path_key: &str,
+    service: &ServiceConfig,
+    runtime: &mut BTreeMap<String, String>,
+) {
+    const OCR_URL_VARIABLE: &str = "PP_OCRV6_TINY_URL";
+    if !service
+        .runtime_env
+        .iter()
+        .any(|variable| variable.name == OCR_URL_VARIABLE)
+    {
+        return;
+    }
+    // `ocr` is the deployment protocol's deliberately small convention for a
+    // project-owned OCR service. The generated value contains no credentials
+    // and always stays on the isolated deployment-path network.
+    let Some(ocr) = manifest
+        .services
+        .iter()
+        .find(|candidate| candidate.id == "ocr")
+    else {
+        return;
+    };
+    runtime.insert(
+        OCR_URL_VARIABLE.to_string(),
+        format!(
+            "http://{}:{}/ocr/recognize",
+            deployment_path_service_alias(manifest, path_key, ocr),
+            ocr.container_port
+        ),
+    );
+}
+
+fn service_uses_shared_infrastructure(
+    service: &ServiceConfig,
+    environment: &EnvironmentConfig,
+) -> bool {
+    if environment.database.is_none() && environment.redis_namespace.is_none() {
+        return false;
+    }
+    match service.kind {
+        ServiceKind::Api | ServiceKind::Worker | ServiceKind::Web => true,
+        ServiceKind::Static => false,
+    }
+}
+
+fn append_custom_frontend_api_health_gate(
+    manifest: &ProjectManifest,
+    service: &ServiceConfig,
+    health_command: &mut String,
+) {
+    if service
+        .dockerfile
+        .starts_with(".deploydesk/generated/build/Dockerfile.")
+        || service.healthcheck.command.is_some()
+        || !matches!(service.kind, ServiceKind::Static | ServiceKind::Web)
+    {
+        return;
+    }
+    let Some(api) = manifest.services.iter().find(|candidate| {
+        candidate.kind == ServiceKind::Api && candidate.healthcheck.path.starts_with("/api/")
+    }) else {
+        return;
+    };
+    let probe_url = format!(
+        "http://127.0.0.1:{}{}",
+        service.container_port, api.healthcheck.path
+    );
+    let diagnostic = format!(
+        "AD-CTR-102：{} 无法通过自带前端反向代理访问 {}；请让代理配置使用 API_HOST 和 API_PORT",
+        service.id, api.id
+    );
+    let probe = match service.kind {
+        ServiceKind::Static => format!(
+            "wget -Y off -q --spider {probe_url} || {{ echo {}; exit 1; }}",
+            shell_quote(&diagnostic)
+        ),
+        ServiceKind::Web => format!(
+            "node -e \"fetch('{probe_url}').then(r=>{{if(!r.ok)throw Error(r.status)}}).catch(()=>{{console.error({});process.exit(1)}})\"",
+            serde_json::to_string(&diagnostic).unwrap_or_else(|_| "\"AD-CTR-102\"".to_string())
+        ),
+        ServiceKind::Api | ServiceKind::Worker => return,
+    };
+    health_command.push_str(" && (");
+    health_command.push_str(&probe);
+    health_command.push(')');
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -2352,7 +2549,7 @@ mod tests {
                 && file.content.contains("example-app-staging-api")
                 && file.content.contains("- example-app-api")
                 && file.content.contains(".runtime.env")
-                && file.content.contains("r.status<500?0:1")
+                && file.content.contains("r.ok?0:1")
                 && file.content.contains("abcdeploy-infra")
         }));
         assert!(files.iter().any(|file| {
@@ -2592,6 +2789,202 @@ mod tests {
         assert_eq!(
             compose["services"]["web"]["environment"]["API_PORT"],
             "3000"
+        );
+    }
+
+    #[test]
+    fn deployment_paths_use_unique_api_aliases_and_actual_ports_for_frontends() {
+        let mut first = create_default_manifest(&inspection_fixture());
+        first.project.name = "alpha-app".to_string();
+        first.services[0].container_port = 3202;
+        let mut h5 = first.services[0].clone();
+        h5.id = "h5".to_string();
+        h5.kind = ServiceKind::Static;
+        h5.image = "alpha-app-h5".to_string();
+        h5.dockerfile = "infra/Dockerfile.h5".to_string();
+        h5.container_port = 80;
+        h5.healthcheck.path = "/".to_string();
+        h5.healthcheck.command = None;
+        h5.runtime_env.clear();
+        h5.migration = None;
+        first.services.push(h5);
+
+        let mut second = first.clone();
+        second.project.name = "beta-app".to_string();
+        second.services[0].image = "beta-app-api".to_string();
+        second.services[1].image = "beta-app-h5".to_string();
+
+        let first_compose = render_deployment_path_compose(
+            &first,
+            "line-one",
+            "alpha-app-line-one",
+            "deploydesk-alpha-app-line-one",
+            &first.environments.production,
+        )
+        .expect("render first deployment path");
+        let second_compose = render_deployment_path_compose(
+            &second,
+            "line-one",
+            "beta-app-line-one",
+            "deploydesk-beta-app-line-one",
+            &second.environments.production,
+        )
+        .expect("render second deployment path");
+        let first_compose: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&first_compose).expect("parse first compose");
+        let second_compose: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&second_compose).expect("parse second compose");
+
+        assert_eq!(
+            first_compose["services"]["h5"]["environment"]["API_HOST"],
+            "alpha-app-line-one-api"
+        );
+        assert_eq!(
+            second_compose["services"]["h5"]["environment"]["API_HOST"],
+            "beta-app-line-one-api"
+        );
+        assert_eq!(
+            first_compose["services"]["h5"]["environment"]["API_PORT"],
+            "3202"
+        );
+        assert!(
+            first_compose["services"]["h5"]["networks"]
+                .get("infrastructure")
+                .is_none(),
+            "a static frontend must not inherit the shared infrastructure network"
+        );
+        assert!(
+            first_compose["services"]["api"]["networks"]
+                .get("infrastructure")
+                .is_some(),
+            "the API still needs the shared database/redis network"
+        );
+        let health = first_compose["services"]["h5"]["healthcheck"]["test"][1]
+            .as_str()
+            .expect("h5 health command");
+        assert!(health.contains("http://127.0.0.1:80/api/health"));
+        assert!(health.contains("AD-CTR-102"));
+    }
+
+    #[test]
+    fn deployment_paths_manage_ocr_urls_with_service_scoped_environment_files() {
+        let mut first = create_default_manifest(&inspection_fixture());
+        first.project.name = "alpha-app".to_string();
+        first.services[0].runtime_env.extend([
+            EnvironmentVariable {
+                name: "PP_OCRV6_TINY_URL".to_string(),
+                required: false,
+                secret: false,
+                default: None,
+                description: String::new(),
+            },
+            EnvironmentVariable {
+                name: "API_ONLY".to_string(),
+                required: false,
+                secret: true,
+                default: None,
+                description: String::new(),
+            },
+        ]);
+        let mut ocr = first.services[0].clone();
+        ocr.id = "ocr".to_string();
+        ocr.image = "alpha-app-ocr".to_string();
+        ocr.dockerfile = "apps/ocr/Dockerfile".to_string();
+        ocr.container_port = 8901;
+        ocr.healthcheck.path = "/health".to_string();
+        ocr.runtime_env.clear();
+        ocr.migration = None;
+        first.services.push(ocr);
+        let mut h5 = first.services[0].clone();
+        h5.id = "h5".to_string();
+        h5.kind = ServiceKind::Static;
+        h5.image = "alpha-app-h5".to_string();
+        h5.dockerfile = "infra/Dockerfile.h5".to_string();
+        h5.container_port = 80;
+        h5.healthcheck.path = "/".to_string();
+        h5.healthcheck.command = None;
+        h5.runtime_env = vec![EnvironmentVariable {
+            name: "VITE_API_BASE_URL".to_string(),
+            required: false,
+            secret: false,
+            default: Some("/api".to_string()),
+            description: String::new(),
+        }];
+        h5.migration = None;
+        first.services.push(h5);
+
+        let mut second = first.clone();
+        second.project.name = "beta-app".to_string();
+        let first_bundle =
+            render_deployment_path_bundle(&first, "line-one", &[]).expect("render first OCR path");
+        let second_bundle = render_deployment_path_bundle(&second, "line-one", &[])
+            .expect("render second OCR path");
+        let first_compose: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&first_bundle.compose).expect("parse first OCR compose");
+        let second_compose: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&second_bundle.compose).expect("parse second OCR compose");
+
+        assert_eq!(
+            first_compose["services"]["api"]["environment"]["PP_OCRV6_TINY_URL"],
+            "http://alpha-app-line-one-ocr:8901/ocr/recognize"
+        );
+        assert_eq!(
+            second_compose["services"]["api"]["environment"]["PP_OCRV6_TINY_URL"],
+            "http://beta-app-line-one-ocr:8901/ocr/recognize"
+        );
+        assert_eq!(
+            first_compose["services"]["api"]["env_file"][0],
+            ".runtime.api.env"
+        );
+        assert_eq!(
+            first_compose["services"]["h5"]["env_file"][0],
+            ".runtime.h5.env"
+        );
+        assert!(
+            first_compose["services"]["ocr"]["environment"]
+                .get("PP_OCRV6_TINY_URL")
+                .is_none()
+        );
+        assert!(
+            first_compose["services"]["h5"]["environment"]
+                .get("PP_OCRV6_TINY_URL")
+                .is_none()
+        );
+        assert!(
+            first_compose["services"]["ocr"]["networks"]["apps"]["aliases"]
+                .as_sequence()
+                .is_some_and(|aliases| aliases
+                    .iter()
+                    .any(|alias| { alias.as_str() == Some("alpha-app-line-one-ocr") }))
+        );
+
+        let directory = tempfile::tempdir().expect("service environment directory");
+        fs::write(
+            directory.path().join(".runtime.env"),
+            "PP_OCRV6_TINY_URL=http://wrong.example\nAPI_ONLY=secret-value\nVITE_API_BASE_URL=/api\nUNDECLARED=value\n",
+        )
+        .expect("write aggregate runtime environment");
+        let filter = deployment_path_service_environment_filter(&first);
+        let status = Command::new("bash")
+            .current_dir(directory.path())
+            .arg("-c")
+            .arg(format!("{filter}prepare_service_environment\n"))
+            .status()
+            .expect("filter service environments");
+        assert!(status.success());
+        let api_environment = fs::read_to_string(directory.path().join(".runtime.api.env"))
+            .expect("read API environment");
+        let h5_environment = fs::read_to_string(directory.path().join(".runtime.h5.env"))
+            .expect("read H5 environment");
+        assert!(api_environment.contains("PP_OCRV6_TINY_URL=http://wrong.example"));
+        assert!(api_environment.contains("API_ONLY=secret-value"));
+        assert!(!api_environment.contains("VITE_API_BASE_URL"));
+        assert!(!api_environment.contains("UNDECLARED"));
+        assert_eq!(h5_environment, "VITE_API_BASE_URL=/api\n");
+        assert!(
+            first_bundle
+                .deploy_script
+                .contains("prepare_service_environment")
         );
     }
 

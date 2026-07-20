@@ -107,6 +107,43 @@ describe("AppShell multi-project workspace", () => {
     expect(onOpenDeployment).toHaveBeenCalledWith(projects()[0], activeRun());
   });
 
+  it("uses generic上线 language for deployment-path activity", () => {
+    const project = {
+      ...projects()[0],
+      latestEnvironment: "deployment" as const,
+      latestStatus: "running" as const,
+    };
+    const run = {
+      ...activeRun(),
+      environment: "deployment" as const,
+      message: "构建服务正在生成可运行版本",
+    };
+    render(
+      <AppShell
+        activePath={project.path}
+        taskRuns={[run]}
+        activeView="project"
+        loading={false}
+        onAddProject={vi.fn()}
+        onOpenDeployment={vi.fn()}
+        onOpenProject={vi.fn()}
+        onShowConfiguration={vi.fn()}
+        onShowProjects={vi.fn()}
+        preflight={null}
+        projects={[project]}
+      >
+        <div>当前工作区</div>
+      </AppShell>,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "finagent 正在上线" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /待处理/ }));
+    expect(screen.getByText("正在上线 · 生成版本")).toBeInTheDocument();
+    expect(screen.queryByText(/测试版/)).not.toBeInTheDocument();
+  });
+
   it("does not claim local runtime is ready when only cloud deployment is ready", () => {
     render(
       <AppShell
