@@ -4,7 +4,9 @@ use std::io::Write;
 use std::path::{Component, Path};
 
 use chrono::Utc;
+use regex::Regex;
 use sha2::{Digest, Sha256};
+use walkdir::WalkDir;
 
 use crate::error::{DeployError, Result};
 use crate::manifest::validate_manifest;
@@ -197,8 +199,13 @@ pub fn create_default_manifest(report: &InspectionReport) -> ProjectManifest {
                 kind: BuildProviderKind::Cnb,
                 repository: format!("owner/{}", report.project_name),
             },
-            registry: RegistryConfig::Cnb {
-                repository: format!("owner/{}", report.project_name),
+            // 首版默认使用腾讯云 TCR 保存不可变镜像。命名空间属于用户的
+            // 云账号资源，项目识别阶段无法可靠推断，因此保留显式占位符，
+            // 由首次上线任务在真正构建前引导用户选择或填写。
+            // Registry 仍是独立适配器；既有 CNB/OCI 清单继续兼容。
+            registry: RegistryConfig::Tcr {
+                registry: "ccr.ccs.tencentyun.com".to_string(),
+                namespace: "replace-me".to_string(),
             },
             runtime: RuntimeProviderConfig::SshDockerCompose,
             secrets: SecretProviderConfig::CnbSecretRepository,
@@ -645,6 +652,26 @@ pub fn build_plan(
                 resolution: "让项目编程 AI 补充生产可用的 Dockerfile，然后重新识别项目。"
                     .to_string(),
             });
+            continue;
+        }
+        if let Some(mismatch) = custom_frontend_proxy_port_mismatch(root, manifest, service) {
+            blockers.push(PlanBlocker {
+                code: "AD-CTR-102".to_string(),
+                title: format!("{} 的前后端转发端口不一致", service.id),
+                detail: format!(
+                    "{} 把请求转发到 {}:{}，但部署协议中 {} 的容器端口是 {}。继续上线会导致前端请求返回 502。",
+                    mismatch.path,
+                    mismatch.host,
+                    mismatch.configured_port,
+                    mismatch.api_id,
+                    mismatch.actual_port,
+                ),
+                service: Some(service.id.clone()),
+                resolution: format!(
+                    "把自带反向代理改为读取 API_HOST 和 API_PORT，或至少将目标改为 {}:{}，然后重新识别项目。",
+                    mismatch.api_id, mismatch.actual_port
+                ),
+            });
         }
     }
 
@@ -659,6 +686,143 @@ pub fn build_plan(
         blockers,
         warnings,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FrontendProxyPortMismatch {
+    path: String,
+    host: String,
+    configured_port: u16,
+    api_id: String,
+    actual_port: u16,
+}
+
+fn custom_frontend_proxy_port_mismatch(
+    root: &Path,
+    manifest: &ProjectManifest,
+    service: &ServiceConfig,
+) -> Option<FrontendProxyPortMismatch> {
+    if service
+        .dockerfile
+        .starts_with(".deploydesk/generated/build/Dockerfile.")
+        || !matches!(service.kind, ServiceKind::Static | ServiceKind::Web)
+    {
+        return None;
+    }
+    let dockerfile_path = root.join(&service.dockerfile);
+    let dockerfile = fs::read_to_string(&dockerfile_path).ok()?;
+    let mut candidates = vec![dockerfile_path];
+    for line in dockerfile.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(instruction) = fields.next() else {
+            continue;
+        };
+        if !instruction.eq_ignore_ascii_case("COPY") && !instruction.eq_ignore_ascii_case("ADD") {
+            continue;
+        }
+        let sources = fields
+            .filter(|field| !field.starts_with("--"))
+            .map(|field| field.trim_matches(['\'', '"', ',', '[', ']']))
+            .collect::<Vec<_>>();
+        for source in sources.iter().take(sources.len().saturating_sub(1)) {
+            let source = Path::new(source);
+            if source.is_absolute()
+                || source
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir))
+            {
+                continue;
+            }
+            let source_path = root.join(&service.context).join(source);
+            if source_path.is_file() && is_reverse_proxy_config(&source_path) {
+                candidates.push(source_path);
+            } else if source_path.is_dir() {
+                candidates.extend(
+                    WalkDir::new(source_path)
+                        .max_depth(6)
+                        .follow_links(false)
+                        .into_iter()
+                        .filter_map(std::result::Result::ok)
+                        .filter(|entry| entry.file_type().is_file())
+                        .map(walkdir::DirEntry::into_path)
+                        .filter(|path| is_reverse_proxy_config(path)),
+                );
+            }
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    let upstream =
+        Regex::new(r"(?i)(?:https?://)?(?P<host>[a-z][a-z0-9._-]*):(?P<port>[0-9]{2,5})")
+            .expect("valid upstream regex");
+    let api_services = manifest
+        .services
+        .iter()
+        .filter(|candidate| candidate.kind == ServiceKind::Api)
+        .collect::<Vec<_>>();
+    for candidate in candidates {
+        let Ok(metadata) = fs::metadata(&candidate) else {
+            continue;
+        };
+        if metadata.len() > 256 * 1024 {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&candidate) else {
+            continue;
+        };
+        for captures in upstream.captures_iter(&content) {
+            let Some(host) = captures.name("host").map(|value| value.as_str()) else {
+                continue;
+            };
+            let Some(configured_port) = captures
+                .name("port")
+                .and_then(|value| value.as_str().parse::<u16>().ok())
+            else {
+                continue;
+            };
+            let Some(api) = api_services.iter().copied().find(|api| {
+                host.eq_ignore_ascii_case(&api.id)
+                    || host.eq_ignore_ascii_case(&api.image)
+                    || (api_services.len() == 1
+                        && (host.eq_ignore_ascii_case("api")
+                            || host.eq_ignore_ascii_case("backend")))
+            }) else {
+                continue;
+            };
+            if configured_port == api.container_port {
+                continue;
+            }
+            return Some(FrontendProxyPortMismatch {
+                path: candidate
+                    .strip_prefix(root)
+                    .unwrap_or(&candidate)
+                    .to_string_lossy()
+                    .into_owned(),
+                host: host.to_string(),
+                configured_port,
+                api_id: api.id.clone(),
+                actual_port: api.container_port,
+            });
+        }
+    }
+    None
+}
+
+fn is_reverse_proxy_config(path: &Path) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if file_name.eq_ignore_ascii_case("Caddyfile") {
+        return true;
+    }
+    matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("conf" | "caddy" | "tmpl" | "template")
+    )
 }
 
 fn render_standard_dockerfiles(
@@ -766,25 +930,26 @@ fn standard_dockerfile(
         "FROM node:22-bookworm-slim AS build\n\n",
         "ENV COREPACK_NPM_REGISTRY=https://registry.npmmirror.com \\\n    npm_config_registry=https://registry.npmmirror.com \\\n    NO_PROXY=registry.npmmirror.com \\\n    no_proxy=registry.npmmirror.com\n\n",
         "WORKDIR /app\n",
-        "RUN corepack enable \\\n    && for attempt in 1 2 3; do \\\n         HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= corepack pnpm --version && break; \\\n         test \"$attempt\" = 3 && exit 1; \\\n         sleep $((attempt * 2)); \\\n       done\n",
+        "RUN corepack enable \\\n    && for attempt in 1 2 3; do \\\n         HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= corepack pnpm --version \\\n           && HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= corepack pnpm@10.26.1 --version \\\n           && break; \\\n         test \"$attempt\" = 3 && exit 1; \\\n         sleep $((attempt * 2)); \\\n       done\n",
         "COPY . .\n",
         "RUN --mount=type=cache,target=/root/.local/share/pnpm/store \\\n    for attempt in 1 2 3; do \\\n      HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= corepack pnpm install --frozen-lockfile && break; \\\n      test \"$attempt\" = 3 && exit 1; \\\n      sleep $((attempt * 2)); \\\n    done\n",
     );
     match detected.framework {
         Framework::NestJs => Some(format!(
-            "{header}RUN corepack pnpm --filter {} build \\\n    && corepack pnpm@10.26.1 --filter {} deploy --legacy --prod /opt/app\n\n\
+            "{header}RUN corepack pnpm --filter {}... build \\\n    && HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= corepack pnpm@10.26.1 --filter {} deploy --legacy --prod /opt/app \\\n    && mkdir -p /opt/runtime-configs \\\n    && if [ -d /app/configs ]; then cp -R /app/configs/. /opt/runtime-configs/; fi\n\n\
 FROM node:22-bookworm-slim AS runtime\n\n\
 ENV NODE_ENV=production\n\
 WORKDIR /app\n\
 COPY --from=build /opt/app ./\n\
 COPY --from=build {output_path} ./dist\n\
+COPY --from=build /opt/runtime-configs /configs\n\
 USER node\n\
 EXPOSE {}\n\
 CMD [\"node\", \"dist/main.js\"]\n",
             detected.package_name, detected.package_name, service.container_port
         )),
         Framework::Vite => Some(format!(
-            "{header}RUN corepack pnpm --filter {} run build \\\n{}\n\n{}",
+            "{header}RUN corepack pnpm --filter {}... run build \\\n{}\n\n{}",
             detected.package_name,
             stage_static_output(&output_path),
             standard_static_runtime("/opt/static", service.container_port, api_host, api_port),
@@ -798,7 +963,7 @@ CMD [\"node\", \"dist/main.js\"]\n",
                 return None;
             }
             Some(format!(
-                "{header}RUN corepack pnpm --filter {} run build:h5 \\\n{}\n\n{}",
+                "{header}RUN corepack pnpm --filter {}... run build:h5 \\\n{}\n\n{}",
                 detected.package_name,
                 stage_static_output(&output_path),
                 standard_static_runtime("/opt/static", service.container_port, api_host, api_port),
@@ -1109,6 +1274,19 @@ mod tests {
     use crate::scanner::{inspect_project, inspection_fixture};
 
     #[test]
+    fn fresh_projects_use_tcr_as_the_visible_default_version_store() {
+        let manifest = create_default_manifest(&inspection_fixture());
+
+        assert_eq!(
+            manifest.providers.registry,
+            RegistryConfig::Tcr {
+                registry: "ccr.ccs.tencentyun.com".to_string(),
+                namespace: "replace-me".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn plan_is_previewable_and_apply_creates_backups() {
         let directory = tempdir().expect("tempdir");
         let report = inspection_fixture();
@@ -1273,13 +1451,14 @@ mod tests {
         assert!(
             dockerfile
                 .after
-                .contains("pnpm --filter @example/api build")
+                .contains("pnpm --filter @example/api... build")
         );
         assert!(
             dockerfile
                 .after
                 .contains("pnpm@10.26.1 --filter @example/api deploy --legacy --prod /opt/app")
         );
+        assert!(dockerfile.after.contains("/opt/runtime-configs /configs"));
         assert!(dockerfile.after.contains("NO_PROXY=registry.npmmirror.com"));
         assert!(dockerfile.after.contains("USER node"));
     }
@@ -1716,7 +1895,7 @@ mod tests {
         assert!(
             dockerfile
                 .after
-                .contains("pnpm --filter @sample/mobile run build:h5")
+                .contains("pnpm --filter @sample/mobile... run build:h5")
         );
         assert!(
             dockerfile
@@ -1762,6 +1941,63 @@ mod tests {
         assert!(compose.after.contains("timeout: 2s"));
         assert!(compose.after.contains("retries: 15"));
         assert!(compose.after.contains("start_period: 1s"));
+    }
+
+    #[test]
+    fn blocks_a_custom_frontend_proxy_that_targets_the_wrong_api_port() {
+        let directory = tempdir().expect("tempdir");
+        fs::create_dir_all(directory.path().join("infra/docker/nginx"))
+            .expect("create proxy directory");
+        fs::write(
+            directory.path().join("infra/Dockerfile.h5"),
+            "FROM nginx:alpine\nCOPY infra/docker/nginx/h5.conf /etc/nginx/conf.d/default.conf\n",
+        )
+        .expect("write frontend Dockerfile");
+        let proxy_path = directory.path().join("infra/docker/nginx/h5.conf");
+        fs::write(
+            &proxy_path,
+            "server { listen 80; location /api/ { proxy_pass http://api:3000; } }\n",
+        )
+        .expect("write proxy config");
+
+        let report = inspection_fixture();
+        let mut manifest = create_default_manifest(&report);
+        manifest.services[0].container_port = 3202;
+        let mut h5 = manifest.services[0].clone();
+        h5.id = "h5".to_string();
+        h5.kind = ServiceKind::Static;
+        h5.image = "example-app-h5".to_string();
+        h5.dockerfile = "infra/Dockerfile.h5".to_string();
+        h5.container_port = 80;
+        h5.healthcheck.path = "/".to_string();
+        h5.healthcheck.command = None;
+        h5.runtime_env.clear();
+        h5.migration = None;
+        manifest.services.push(h5);
+
+        let plan = build_plan(directory.path(), &report, &manifest).expect("mismatched plan");
+        let blocker = plan
+            .blockers
+            .iter()
+            .find(|blocker| blocker.code == "AD-CTR-102")
+            .expect("proxy mismatch blocker");
+        assert_eq!(blocker.service.as_deref(), Some("h5"));
+        assert!(blocker.detail.contains("infra/docker/nginx/h5.conf"));
+        assert!(blocker.detail.contains("api:3000"));
+        assert!(blocker.detail.contains("3202"));
+
+        fs::write(
+            proxy_path,
+            "server { listen 80; location /api/ { proxy_pass http://api:3202; } }\n",
+        )
+        .expect("fix proxy config");
+        let corrected = build_plan(directory.path(), &report, &manifest).expect("corrected plan");
+        assert!(
+            corrected
+                .blockers
+                .iter()
+                .all(|blocker| blocker.code != "AD-CTR-102")
+        );
     }
 
     #[test]

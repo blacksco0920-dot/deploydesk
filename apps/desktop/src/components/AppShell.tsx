@@ -306,11 +306,11 @@ export function AppShell({
               badge={
                 setupAttentionItems.length +
                   verificationAttentionItems.length +
-                  attentionItems.length || undefined
+                  manualAttentionItems.length || undefined
               }
               badgeTone={hasBlockingAttention ? "warning" : "accent"}
               icon={Activity}
-              label="部署任务"
+              label="待处理"
               onClick={() => setActivityOpen(true)}
             />
           </nav>
@@ -406,9 +406,9 @@ export function AppShell({
       <Dialog onOpenChange={setActivityOpen} open={activityOpen}>
         <DialogContent className="max-h-[78vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>部署任务</DialogTitle>
+            <DialogTitle>待处理与最近活动</DialogTitle>
             <DialogDescription>
-              不需要停留在部署页面；系统会继续处理，需要你时会保留明确的下一步。
+              这里只汇总需要你处理的事项和最近结果；部署操作从对应项目的发布中心发起。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-5">
@@ -645,13 +645,15 @@ function DeploymentTaskCard({
     currentStage,
   );
   const title = active
-    ? `${environment === "production" ? "正在发布正式版" : "正在部署测试版"} · ${activityStageLabel(currentStage, environment)}`
+    ? `${environment === "deployment" ? "正在上线" : environment === "production" ? "正在发布正式版" : "正在部署测试版"} · ${activityStageLabel(currentStage, environment)}`
     : status === "needs_action"
       ? deploymentNeedsActionStatus(environment, run?.actionKind)
       : status === "failed"
-        ? environment === "production"
-          ? "正式发布没有完成"
-          : "测试部署没有完成"
+        ? environment === "deployment"
+          ? "上次上线没有完成"
+          : environment === "production"
+            ? "正式发布没有完成"
+            : "测试部署没有完成"
         : recentProjectStatus(project, run);
   const tone = active
     ? "border-[var(--accent)]/30 bg-[var(--accent-soft)]"
@@ -729,8 +731,16 @@ export function activityTaskAction(
   if (status === "needs_action") {
     return (
       {
+        "deployment-path-route-check": "检查访问地址",
+        "deployment-path-route-repair": "修复访问地址",
+        "deployment-path-route-takeover": "确认地址接管",
+        "deployment-path-retry": "继续上线",
         "route-check":
-          environment === "production" ? "设置正式地址" : "验证测试版",
+          environment === "deployment"
+            ? "检查访问地址"
+            : environment === "production"
+              ? "设置正式地址"
+              : "验证测试版",
         "route-repair": "修复访问地址",
         "route-takeover": "确认地址接管",
         "local-preview": "验证测试版",
@@ -756,8 +766,16 @@ function activityPendingStepLabel(
 ) {
   return (
     {
+      "deployment-path-route-check": "检查访问地址",
+      "deployment-path-route-repair": "修复访问地址",
+      "deployment-path-route-takeover": "确认地址接管",
+      "deployment-path-retry": "继续上线",
       "route-check":
-        environment === "production" ? "设置正式地址" : "验证测试版",
+        environment === "deployment"
+          ? "检查访问地址"
+          : environment === "production"
+            ? "设置正式地址"
+            : "验证测试版",
       "route-repair": "修复访问地址",
       "route-takeover": "确认地址接管",
       "local-preview": "验证测试版",
@@ -776,11 +794,14 @@ export function completedActivitySummary(
   run?: DeploymentRun,
   testVerified = false,
 ) {
-  return (run?.environment ?? project.latestEnvironment) === "production"
-    ? "测试通过的同一版本已经上线，正式地址可以访问"
-    : testVerified
-      ? "测试结果已经确认，可以查看当前版本"
-      : "测试版已经正常运行，可以查看当前结果";
+  const environment = run?.environment ?? project.latestEnvironment;
+  return environment === "deployment"
+    ? "上线完成，访问地址可以打开"
+    : environment === "production"
+      ? "测试通过的同一版本已经上线，正式地址可以访问"
+      : testVerified
+        ? "测试结果已经确认，可以查看当前版本"
+        : "测试版已经正常运行，可以查看当前结果";
 }
 
 export function completedTestVerified(
@@ -839,12 +860,20 @@ export function activityUserMessage(
   if (status === "failed" || status === "needs_action") {
     const environment = run?.environment ?? project.latestEnvironment;
     const actionKind = run?.actionKind ?? project.latestActionKind;
-    if (actionKind === "route-check") {
-      return environment === "production"
-        ? "服务已经启动；打开项目查看需要设置的正式地址，完成后返回自动检查。"
-        : "测试版已经启动；打开项目后可以从这台电脑验证。";
+    if (
+      actionKind === "route-check" ||
+      actionKind === "deployment-path-route-check"
+    ) {
+      return environment === "deployment"
+        ? "应用已经启动；打开项目处理访问地址，完成后继续检查，不会重新构建。"
+        : environment === "production"
+          ? "服务已经启动；打开项目查看需要设置的正式地址，完成后返回自动检查。"
+          : "测试版已经启动；打开项目后可以从这台电脑验证。";
     }
-    if (actionKind === "route-repair") {
+    if (
+      actionKind === "route-repair" ||
+      actionKind === "deployment-path-route-repair"
+    ) {
       return "服务已经启动；打开项目修复访问地址，不会重新部署版本。";
     }
     const issue = issueFromUnknown(
@@ -853,9 +882,11 @@ export function activityUserMessage(
     );
     const title =
       issueCode === "AD-NET-201"
-        ? environment === "production"
-          ? "正式地址还没有准备好"
-          : "测试地址还没有准备好"
+        ? environment === "deployment"
+          ? "访问地址还没有准备好"
+          : environment === "production"
+            ? "正式地址还没有准备好"
+            : "测试地址还没有准备好"
         : issue.title;
     return `${title}；打开项目后可以从当前步骤继续。`;
   }

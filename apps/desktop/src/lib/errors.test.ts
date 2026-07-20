@@ -78,6 +78,14 @@ describe("user-facing deployment errors", () => {
     expect(address.title).toBe("访问地址还没有准备好");
     expect(address.nextSteps[0]).toContain("回到客户端后系统会自动检查");
     expect(address.nextSteps[0]).toContain("无需重新构建");
+
+    const interrupted = issueFromUnknown(
+      "AD-NET-202: 本机网络中断，地址状态没有完成复核",
+    );
+    expect(interrupted.title).toBe("这次地址检查没有完成");
+    expect(interrupted.nextSteps).toEqual([
+      "确认本机网络可用；恢复后系统会自动继续检查，不会重新部署",
+    ]);
   });
 
   it("turns a missing Caddy route into a route-only recovery step", () => {
@@ -88,6 +96,46 @@ describe("user-facing deployment errors", () => {
     expect(issue.nextSteps).toEqual([
       "点击“重新应用地址”；系统只修复访问入口，不会重新生成项目版本",
     ]);
+  });
+
+  it("separates an occupied address from a disconnected project route", () => {
+    const occupied = issueFromUnknown(
+      "AD-SRV-210：example.com 已由另一个项目管理",
+    );
+    const disconnected = issueFromUnknown(
+      "AD-SRV-211：统一 Caddy 尚未连接项目网络",
+    );
+
+    expect(occupied.title).toBe("访问地址已被其他项目使用");
+    expect(occupied.message).not.toContain("Caddy");
+    expect(occupied.nextSteps[0]).toContain("修改当前线路的访问地址");
+    expect(disconnected.title).toBe("访问入口还没连到项目服务");
+    expect(disconnected.nextSteps[0]).toContain("不会重新生成项目版本");
+  });
+
+  it("explains a failed server component download without exposing registry jargon", () => {
+    const issue = issueFromUnknown(
+      "AD-SRV-212：服务器暂时无法从 Docker Hub 下载 caddy 镜像",
+    );
+
+    expect(issue.title).toBe("服务器无法下载访问组件");
+    expect(issue.message).toBe("服务器暂时无法下载统一访问组件。");
+    expect(issue.message).not.toContain("Docker");
+    expect(issue.nextSteps[0]).toContain("自动切换国内镜像来源");
+    expect(issue.technicalDetails[0]).toContain("Docker Hub");
+  });
+
+  it("explains a failed runtime component download as an automatic retry", () => {
+    const issue = issueFromUnknown(
+      "AD-INF-202：服务器暂时无法从 Docker Hub 下载 postgres:16-alpine",
+    );
+
+    expect(issue.title).toBe("服务器运行依赖没有准备完成");
+    expect(issue.message).toBe("服务器暂时无法下载项目运行所需的基础组件。");
+    expect(issue.message).not.toMatch(/Docker|postgres|镜像/);
+    expect(issue.nextSteps[0]).toContain("继续上线");
+    expect(issue.nextSteps[0]).toContain("国内来源");
+    expect(issue.technicalDetails[0]).toContain("Docker Hub");
   });
 
   it("turns a missing CNB organization into a novice-friendly recovery step", () => {
@@ -149,16 +197,40 @@ describe("user-facing deployment errors", () => {
     expect(issue.nextSteps[0]).not.toContain("Git");
   });
 
-  it("names the missing CNB permission without exposing its code", () => {
+  it("explains both CNB authorization and repository usage range", () => {
     const issue = issueFromUnknown(
       "AD-CNB-103：CNB 授权缺少“构建记录读取”权限（repo-cnb-history:r）",
     );
 
-    expect(issue.title).toBe("CNB 权限还差一步");
+    expect(issue.title).toBe("当前令牌不能读取这个仓库的构建记录");
     expect(issue.message).not.toContain("repo-cnb-history:r");
     expect(issue.technicalDetails[0]).toContain("repo-cnb-history:r");
     expect(issue.nextSteps[0]).toContain("读取构建记录");
-    expect(issue.nextSteps[0]).not.toContain("repo-cnb-history:r");
+    expect(issue.nextSteps[0]).toContain("repo-cnb-history:r");
+    expect(issue.nextSteps[0]).toContain("使用范围");
+    expect(issue.nextSteps[0]).toContain("当前仓库或全部仓库");
+  });
+
+  it("keeps multi-scope CNB failures on the complete authorization guidance", () => {
+    const issue = issueFromUnknown(
+      "AD-CNB-103：Missing required scopes: repo-cnb-history:r, repo-cnb-trigger:rw",
+    );
+
+    expect(issue.title).toBe("当前 CNB 授权无法完成这项操作");
+    expect(issue.nextSteps[0]).toContain("全部 6 项 CNB 权限");
+    expect(issue.nextSteps[0]).toContain("使用范围");
+    expect(issue.title).not.toContain("构建记录");
+  });
+
+  it("distinguishes a temporary Keychain read failure from invalid CNB scope", () => {
+    const issue = issueFromUnknown(
+      "AD-CNB-108：无法从系统密钥库读取已保存的 CNB 令牌",
+    );
+
+    expect(issue.title).toBe("暂时无法读取已保存的 CNB 授权");
+    expect(issue.message).toContain("系统密钥库");
+    expect(issue.message).not.toContain("权限不足");
+    expect(issue.nextSteps[0]).toContain("重新打开应用");
   });
 
   it("keeps multiline provider responses behind technical details", () => {
@@ -166,7 +238,7 @@ describe("user-facing deployment errors", () => {
       'AD-CNB-103：CNB 授权缺少“触发构建”权限（repo-cnb-trigger:rw）\n原始信息：\n{"errcode":10023,"errmsg":"Missing required scopes: repo-cnb-trigger:rw"}',
     );
 
-    expect(issue.title).toBe("CNB 权限还差一步");
+    expect(issue.title).toBe("当前 CNB 授权无法完成这项操作");
     expect(issue.message).toBe(
       "代码平台授权还不完整，已经完成的部署步骤仍然保留。",
     );

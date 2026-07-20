@@ -9,14 +9,13 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react(), tailwindcss()],
 
-  build: {
-    rollupOptions: {
-      output: {
-        manualChunks(id) {
-          return id.includes("node_modules") ? "vendor" : undefined;
-        },
-      },
-    },
+  // FlowGram uses styled-components internally. Its CSSOM "speedy" writer
+  // expects HTMLStyleElement.sheet to be available synchronously, which is not
+  // guaranteed by the WKWebView embedded in a signed macOS Tauri app. The
+  // supported text-node writer avoids styled-components error #17 without
+  // forking or replacing any FlowGram component.
+  define: {
+    SC_DISABLE_SPEEDY: "true",
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`

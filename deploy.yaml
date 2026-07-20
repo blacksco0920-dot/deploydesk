@@ -70,9 +70,14 @@ providers:
     kind: tcr
     registry: ccr.ccs.tencentyun.com
     namespace: finagent
+  runtime: ssh_docker_compose
+  secrets: cnb_secret_repository
+  approval: cnb_deployment
+  dns: manual
   reverse_proxy: caddy
 release:
   image_tag_template: sha-{commit}
+  candidate_tag_template: deploydesk-{commit}
   production_mode: approval
   keep_releases: 5
   auto_rollback: true

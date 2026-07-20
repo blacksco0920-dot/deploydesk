@@ -2,16 +2,21 @@
 name: abcdeploy-development
 services:
   site:
-    image: ${DEPLOYDESK_SITE_IMAGE:?请填写不可变镜像地址}
-    restart: unless-stopped
-    env_file:
-    - .runtime.env
+    build:
+      context: ../../..
+      dockerfile: apps/site/Dockerfile
+    restart: no
+    extra_hosts:
+    - host.docker.internal:host-gateway
+    ports:
+    - 127.0.0.1:4173:80
     environment:
       DEPLOYDESK_ENV: development
     networks:
       apps:
         aliases:
         - abcdeploy-development-site
+        - abcdeploy-site
     labels:
       deploydesk.environment: development
       deploydesk.project: abcdeploy
@@ -19,12 +24,12 @@ services:
     healthcheck:
       test:
       - CMD-SHELL
-      - wget -q --spider http://127.0.0.1:80/
+      - wget -Y off -q --spider http://127.0.0.1:80/
       interval: 10s
       timeout: 5s
       retries: 12
       start_period: 20s
 networks:
   apps:
-    external: true
+    external: false
     name: deploydesk-abcdeploy-development

@@ -85,7 +85,7 @@ describe("AppShell multi-project workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "所有项目" }));
     expect(onShowProjects).toHaveBeenCalledTimes(1);
 
-    fireEvent.click(screen.getByRole("button", { name: /部署任务/ }));
+    fireEvent.click(screen.getByRole("button", { name: /待处理/ }));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     expect(screen.getByText(/正在部署测试版 · 生成版本/)).toBeInTheDocument();
     expect(screen.getByText("自动处理中 ›")).toBeInTheDocument();
@@ -105,6 +105,43 @@ describe("AppShell multi-project workspace", () => {
     expect(screen.queryByText(/镜像摘要/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /finagent/ }));
     expect(onOpenDeployment).toHaveBeenCalledWith(projects()[0], activeRun());
+  });
+
+  it("uses generic上线 language for deployment-path activity", () => {
+    const project = {
+      ...projects()[0],
+      latestEnvironment: "deployment" as const,
+      latestStatus: "running" as const,
+    };
+    const run = {
+      ...activeRun(),
+      environment: "deployment" as const,
+      message: "构建服务正在生成可运行版本",
+    };
+    render(
+      <AppShell
+        activePath={project.path}
+        taskRuns={[run]}
+        activeView="project"
+        loading={false}
+        onAddProject={vi.fn()}
+        onOpenDeployment={vi.fn()}
+        onOpenProject={vi.fn()}
+        onShowConfiguration={vi.fn()}
+        onShowProjects={vi.fn()}
+        preflight={null}
+        projects={[project]}
+      >
+        <div>当前工作区</div>
+      </AppShell>,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "finagent 正在上线" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /待处理/ }));
+    expect(screen.getByText("正在上线 · 生成版本")).toBeInTheDocument();
+    expect(screen.queryByText(/测试版/)).not.toBeInTheDocument();
   });
 
   it("does not claim local runtime is ready when only cloud deployment is ready", () => {
@@ -207,7 +244,7 @@ describe("AppShell multi-project workspace", () => {
         <div />
       </AppShell>,
     );
-    fireEvent.click(screen.getByRole("button", { name: "部署任务" }));
+    fireEvent.click(screen.getByRole("button", { name: "待处理" }));
     expect(screen.getByText("当前没有待处理任务")).toBeInTheDocument();
   });
 
@@ -240,7 +277,7 @@ describe("AppShell multi-project workspace", () => {
     expect(
       screen.getByRole("button", { name: "crm 需要重新找到项目" }),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /部署任务 1/ }));
+    fireEvent.click(screen.getByRole("button", { name: /待处理 1/ }));
     expect(screen.getByText("重新找到项目 ›")).toBeInTheDocument();
     fireEvent.click(
       screen.getByText("重新找到项目 ›").closest("button") as HTMLElement,
@@ -285,13 +322,15 @@ describe("AppShell multi-project workspace", () => {
     );
 
     expect(
-      screen.getByRole("button", { name: /部署任务 1/ }),
+      screen.getByRole("button", { name: /待处理 1/ }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: /finagent 还差网页保存/ }),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /部署任务 1/ }));
-    const taskDialog = screen.getByRole("dialog", { name: "部署任务" });
+    fireEvent.click(screen.getByRole("button", { name: /待处理 1/ }));
+    const taskDialog = screen.getByRole("dialog", {
+      name: "待处理与最近活动",
+    });
     expect(screen.queryByText(/当前没有.*任务/)).not.toBeInTheDocument();
     expect(within(taskDialog).getByText("还差网页保存")).toBeInTheDocument();
     expect(within(taskDialog).getByText("继续保存 ›")).toBeInTheDocument();
@@ -347,8 +386,10 @@ describe("AppShell multi-project workspace", () => {
       </AppShell>,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /部署任务 2/ }));
-    const taskDialog = screen.getByRole("dialog", { name: "部署任务" });
+    fireEvent.click(screen.getByRole("button", { name: /待处理 1/ }));
+    const taskDialog = screen.getByRole("dialog", {
+      name: "待处理与最近活动",
+    });
     expect(screen.getByText("等待你处理")).toBeInTheDocument();
     expect(screen.getByText("自动处理中")).toBeInTheDocument();
     expect(within(taskDialog).getByText("还差网页保存")).toBeInTheDocument();
@@ -397,7 +438,7 @@ describe("AppShell multi-project workspace", () => {
     expect(
       screen.getByRole("button", { name: /finagent 下一步：部署测试版/ }),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /部署任务 1/ }));
+    fireEvent.click(screen.getByRole("button", { name: /待处理 1/ }));
     expect(screen.getByText("现在可以继续")).toBeInTheDocument();
     expect(screen.getByText("首次上线设置已完成")).toBeInTheDocument();
     expect(
@@ -451,9 +492,7 @@ describe("AppShell multi-project workspace", () => {
     expect(
       screen.getByRole("button", { name: /crm 正式版可以访问/ }),
     ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "部署任务" }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "待处理" })).toBeInTheDocument();
     expect(screen.queryByText(/下一步：部署测试版/)).not.toBeInTheDocument();
   });
 
@@ -510,7 +549,7 @@ describe("AppShell multi-project workspace", () => {
     expect(
       screen.getByRole("button", { name: /finagent 等待确认测试结果/ }),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /部署任务 1/ }));
+    fireEvent.click(screen.getByRole("button", { name: /待处理 1/ }));
     expect(screen.getByText("等待你确认")).toBeInTheDocument();
     expect(screen.getByText("确认测试结果")).toBeInTheDocument();
     expect(
@@ -589,7 +628,7 @@ describe("AppShell multi-project workspace", () => {
     expect(
       screen.getByRole("button", { name: /finagent 还差准备测试环境/ }),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /部署任务/ }));
+    fireEvent.click(screen.getByRole("button", { name: /待处理/ }));
     expect(
       screen.getByText("运行服务器、测试配置或测试地址还需要继续准备。"),
     ).toBeInTheDocument();
@@ -697,7 +736,7 @@ describe("AppShell multi-project workspace", () => {
       </AppShell>,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "部署任务" }));
+    fireEvent.click(screen.getByRole("button", { name: "待处理" }));
     expect(
       screen.getByText("当前没有自动处理或需要你操作的任务"),
     ).toBeInTheDocument();
@@ -778,8 +817,10 @@ describe("AppShell multi-project workspace", () => {
       </AppShell>,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "部署任务" }));
-    const taskDialog = screen.getByRole("dialog", { name: "部署任务" });
+    fireEvent.click(screen.getByRole("button", { name: "待处理" }));
+    const taskDialog = screen.getByRole("dialog", {
+      name: "待处理与最近活动",
+    });
     expect(
       within(taskDialog).getAllByRole("button", { name: /查看结果/ }),
     ).toHaveLength(4);
@@ -828,8 +869,10 @@ describe("AppShell multi-project workspace", () => {
       </AppShell>,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /部署任务/ }));
-    const taskDialog = screen.getByRole("dialog", { name: "部署任务" });
+    fireEvent.click(screen.getByRole("button", { name: /待处理/ }));
+    const taskDialog = screen.getByRole("dialog", {
+      name: "待处理与最近活动",
+    });
     expect(
       within(taskDialog).getByText("正式发布没有完成"),
     ).toBeInTheDocument();
@@ -894,8 +937,10 @@ describe("AppShell multi-project workspace", () => {
         name: /finagent 正式版已部署，还差地址/,
       }),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /部署任务/ }));
-    const taskDialog = screen.getByRole("dialog", { name: "部署任务" });
+    fireEvent.click(screen.getByRole("button", { name: /待处理/ }));
+    const taskDialog = screen.getByRole("dialog", {
+      name: "待处理与最近活动",
+    });
     expect(
       within(taskDialog).getByText("正式版已部署，还差地址"),
     ).toBeInTheDocument();
@@ -945,7 +990,7 @@ describe("AppShell multi-project workspace", () => {
       </AppShell>,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /部署任务/ }));
+    fireEvent.click(screen.getByRole("button", { name: /待处理/ }));
     expect(screen.getByText(/的版本/)).toBeInTheDocument();
     expect(
       screen.queryByText(/harden ABCDeploy staging recovery/),
@@ -963,7 +1008,7 @@ describe("AppShell multi-project workspace", () => {
     };
 
     expect(activityUserMessage(project)).toBe(
-      "CNB 权限还差一步；打开项目后可以从当前步骤继续。",
+      "当前 CNB 授权无法完成这项操作；打开项目后可以从当前步骤继续。",
     );
     expect(activityUserMessage(project)).not.toContain("errcode");
   });

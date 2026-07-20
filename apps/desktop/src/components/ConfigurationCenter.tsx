@@ -1,20 +1,32 @@
 import {
+  AlertCircle,
+  CheckCircle2,
+  CircleDashed,
+  Code2,
   Eye,
   EyeOff,
   KeyRound,
   LoaderCircle,
+  Package,
   Pencil,
   Plus,
+  RefreshCw,
   Search,
+  Server,
   Trash2,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   deleteConfigProfile,
+  listConnections,
   listConfigProfiles,
   saveConfigProfile,
 } from "../api";
-import type { ConfigProfile } from "../types";
+import type {
+  ConfigProfile,
+  ConnectionKind,
+  ConnectionResource,
+} from "../types";
 import { Button } from "./ui/button";
 import {
   Dialog,
@@ -39,9 +51,14 @@ interface ConfigurationDraft {
 
 const emptyDraft: ConfigurationDraft = { description: "", key: "", value: "" };
 
+type ConfigurationCenterView = "connections" | "configurations";
+
 export function ConfigurationCenter({ onError }: ConfigurationCenterProps) {
+  const [view, setView] = useState<ConfigurationCenterView>("connections");
+  const [connections, setConnections] = useState<ConnectionResource[]>([]);
+  const [connectionsLoading, setConnectionsLoading] = useState(true);
   const [profiles, setProfiles] = useState<ConfigProfile[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [profilesLoading, setProfilesLoading] = useState(true);
   const [query, setQuery] = useState("");
   const [editing, setEditing] = useState<ConfigProfile | "new" | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ConfigProfile | null>(
@@ -51,20 +68,32 @@ export function ConfigurationCenter({ onError }: ConfigurationCenterProps) {
   const [saving, setSaving] = useState(false);
   const [showValue, setShowValue] = useState(false);
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
+  const refreshConnections = useCallback(async () => {
+    setConnectionsLoading(true);
+    try {
+      setConnections(await listConnections());
+    } catch (error) {
+      onError(toMessage(error));
+    } finally {
+      setConnectionsLoading(false);
+    }
+  }, [onError]);
+
+  const refreshProfiles = useCallback(async () => {
+    setProfilesLoading(true);
     try {
       setProfiles((await listConfigProfiles()).filter(isUserConfiguration));
     } catch (error) {
       onError(toMessage(error));
     } finally {
-      setLoading(false);
+      setProfilesLoading(false);
     }
   }, [onError]);
 
   useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    void refreshConnections();
+    void refreshProfiles();
+  }, [refreshConnections, refreshProfiles]);
 
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
@@ -122,7 +151,7 @@ export function ConfigurationCenter({ onError }: ConfigurationCenterProps) {
       });
       setEditing(null);
       setDraft(emptyDraft);
-      await refresh();
+      await refreshProfiles();
     } catch (error) {
       onError(toMessage(error));
     } finally {
@@ -136,7 +165,7 @@ export function ConfigurationCenter({ onError }: ConfigurationCenterProps) {
     try {
       await deleteConfigProfile(pendingDelete.id);
       setPendingDelete(null);
-      await refresh();
+      await refreshProfiles();
     } catch (error) {
       onError(toMessage(error));
     } finally {
@@ -160,10 +189,10 @@ export function ConfigurationCenter({ onError }: ConfigurationCenterProps) {
         <div>
           <strong className="block text-sm font-semibold">配置中心</strong>
           <span className="text-[11px] text-[var(--muted-foreground)]">
-            可选工具 · 保存后可在项目中直接选择
+            可复用资源 · 保存后可在项目中直接选择
           </span>
         </div>
-        {profiles.length ? (
+        {view === "configurations" && profiles.length ? (
           <Button
             onClick={() => openEditor("new")}
             size="sm"
@@ -176,95 +205,122 @@ export function ConfigurationCenter({ onError }: ConfigurationCenterProps) {
       </header>
 
       <main className="min-h-0 overflow-auto">
-        <div className="mx-auto w-full max-w-[920px] px-6 py-8">
-          <div className="mb-8 flex items-end justify-between gap-5 max-[760px]:flex-col max-[760px]:items-stretch">
-            <div>
-              <h1 className="m-0 text-2xl font-semibold">常用配置</h1>
-              <p className="mb-0 mt-2 max-w-2xl text-sm leading-6 text-[var(--muted-foreground)]">
-                这里不是上线前置步骤。项目缺少配置时可以直接填写；只有经常重复使用的值，才需要保存到这里。
-              </p>
-            </div>
-            {profiles.length > 5 ? (
-              <label className="relative block w-56 max-[760px]:w-full">
-                <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-[var(--subtle-foreground)]" />
-                <Input
-                  aria-label="搜索配置"
-                  className="pl-9"
-                  onChange={(event) => setQuery(event.target.value)}
-                  placeholder="搜索说明或配置名称"
-                  value={query}
-                />
-              </label>
-            ) : null}
+        <div className="mx-auto w-full max-w-[1040px] px-6 py-7">
+          <div
+            aria-label="配置中心分类"
+            className="mb-7 flex w-fit rounded-lg bg-[var(--muted)] p-1"
+            role="tablist"
+          >
+            <CenterTab
+              active={view === "connections"}
+              label="可复用连接"
+              onClick={() => setView("connections")}
+            />
+            <CenterTab
+              active={view === "configurations"}
+              label="常用配置"
+              onClick={() => setView("configurations")}
+            />
           </div>
 
-          {loading ? (
-            <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-[var(--muted-foreground)]">
-              <LoaderCircle className="animate-spin-slow" />
-              正在读取配置
-            </div>
-          ) : filtered.length ? (
-            <section className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
-              <div className="grid grid-cols-[minmax(180px,1.4fr)_minmax(170px,1fr)_minmax(150px,1fr)_80px] gap-4 border-b border-[var(--border)] bg-[var(--muted)] px-4 py-2.5 text-[11px] font-medium text-[var(--muted-foreground)] max-[760px]:hidden">
-                <span>配置说明</span>
-                <span>配置名称</span>
-                <span>配置值</span>
-                <span className="text-right">操作</span>
-              </div>
-              {filtered.map((profile) => {
-                const key = configurationKey(profile);
-                const secret = profile.secretFields.includes(key);
-                return (
-                  <div
-                    className="grid min-h-[66px] grid-cols-[minmax(180px,1.4fr)_minmax(170px,1fr)_minmax(150px,1fr)_80px] items-center gap-4 border-b border-[var(--border)] px-4 last:border-b-0 max-[760px]:grid-cols-[minmax(0,1fr)_auto] max-[760px]:gap-x-3 max-[760px]:gap-y-1 max-[760px]:py-3"
-                    key={profile.id}
-                  >
-                    <strong className="truncate text-sm font-medium max-[760px]:col-start-1">
-                      {profile.name}
-                    </strong>
-                    <code className="truncate text-xs text-[var(--muted-foreground)] max-[760px]:col-start-1">
-                      {key}
-                    </code>
-                    <span className="truncate text-xs text-[var(--muted-foreground)] max-[760px]:col-start-1">
-                      {secret ? "••••••••" : profile.values.env_value}
-                    </span>
-                    <div className="flex justify-end gap-1 max-[760px]:col-start-2 max-[760px]:row-span-3 max-[760px]:row-start-1 max-[760px]:self-center">
-                      <Button
-                        aria-label={`编辑 ${profile.name}`}
-                        onClick={() => openEditor(profile)}
-                        size="icon"
-                        variant="ghost"
-                      >
-                        <Pencil />
-                      </Button>
-                      <Button
-                        aria-label={`删除 ${profile.name}`}
-                        onClick={() => setPendingDelete(profile)}
-                        size="icon"
-                        variant="ghost"
-                      >
-                        <Trash2 />
-                      </Button>
-                    </div>
-                  </div>
-                );
-              })}
-            </section>
+          {view === "connections" ? (
+            <ConnectionsPanel
+              connections={connections}
+              loading={connectionsLoading}
+              onRefresh={() => void refreshConnections()}
+            />
           ) : (
-            <section className="flex min-h-[300px] flex-col items-center justify-center border-y border-[var(--border)] text-center">
-              <span className="mb-4 grid size-11 place-items-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent)]">
-                <KeyRound className="size-5" />
-              </span>
-              <h2 className="m-0 text-base font-semibold">
-                暂时不需要添加配置
-              </h2>
-              <p className="mb-5 mt-2 max-w-md text-sm leading-6 text-[var(--muted-foreground)]">
-                先在项目中正常填写即可。以后遇到经常重复使用的值，再保存到这里方便复用。
-              </p>
-              <Button onClick={() => openEditor("new")} variant="secondary">
-                <Plus />
-                保存一项常用配置
-              </Button>
+            <section aria-label="常用配置">
+              <div className="mb-8 flex items-end justify-between gap-5 max-[760px]:flex-col max-[760px]:items-stretch">
+                <div>
+                  <h1 className="m-0 text-2xl font-semibold">常用配置</h1>
+                  <p className="mb-0 mt-2 max-w-2xl text-sm leading-6 text-[var(--muted-foreground)]">
+                    环境变量模板单独保存在这里，不会被当作账号或服务器连接。项目缺值时可以直接引用。
+                  </p>
+                </div>
+                {profiles.length > 5 ? (
+                  <label className="relative block w-56 max-[760px]:w-full">
+                    <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-[var(--subtle-foreground)]" />
+                    <Input
+                      aria-label="搜索配置"
+                      className="pl-9"
+                      onChange={(event) => setQuery(event.target.value)}
+                      placeholder="搜索说明或配置名称"
+                      value={query}
+                    />
+                  </label>
+                ) : null}
+              </div>
+
+              {profilesLoading ? (
+                <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-[var(--muted-foreground)]">
+                  <LoaderCircle className="animate-spin-slow" />
+                  正在读取常用配置
+                </div>
+              ) : filtered.length ? (
+                <section className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
+                  <div className="grid grid-cols-[minmax(180px,1.4fr)_minmax(170px,1fr)_minmax(150px,1fr)_80px] gap-4 border-b border-[var(--border)] bg-[var(--muted)] px-4 py-2.5 text-[11px] font-medium text-[var(--muted-foreground)] max-[760px]:hidden">
+                    <span>配置说明</span>
+                    <span>配置名称</span>
+                    <span>配置值</span>
+                    <span className="text-right">操作</span>
+                  </div>
+                  {filtered.map((profile) => {
+                    const key = configurationKey(profile);
+                    const secret = profile.secretFields.includes(key);
+                    return (
+                      <div
+                        className="grid min-h-[66px] grid-cols-[minmax(180px,1.4fr)_minmax(170px,1fr)_minmax(150px,1fr)_80px] items-center gap-4 border-b border-[var(--border)] px-4 last:border-b-0 max-[760px]:grid-cols-[minmax(0,1fr)_auto] max-[760px]:gap-x-3 max-[760px]:gap-y-1 max-[760px]:py-3"
+                        key={profile.id}
+                      >
+                        <strong className="truncate text-sm font-medium max-[760px]:col-start-1">
+                          {profile.name}
+                        </strong>
+                        <code className="truncate text-xs text-[var(--muted-foreground)] max-[760px]:col-start-1">
+                          {key}
+                        </code>
+                        <span className="truncate text-xs text-[var(--muted-foreground)] max-[760px]:col-start-1">
+                          {secret ? "••••••••" : profile.values.env_value}
+                        </span>
+                        <div className="flex justify-end gap-1 max-[760px]:col-start-2 max-[760px]:row-span-3 max-[760px]:row-start-1 max-[760px]:self-center">
+                          <Button
+                            aria-label={`编辑 ${profile.name}`}
+                            onClick={() => openEditor(profile)}
+                            size="icon"
+                            variant="ghost"
+                          >
+                            <Pencil />
+                          </Button>
+                          <Button
+                            aria-label={`删除 ${profile.name}`}
+                            onClick={() => setPendingDelete(profile)}
+                            size="icon"
+                            variant="ghost"
+                          >
+                            <Trash2 />
+                          </Button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </section>
+              ) : (
+                <section className="flex min-h-[300px] flex-col items-center justify-center border-y border-[var(--border)] text-center">
+                  <span className="mb-4 grid size-11 place-items-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent)]">
+                    <KeyRound className="size-5" />
+                  </span>
+                  <h2 className="m-0 text-base font-semibold">
+                    暂时不需要添加配置
+                  </h2>
+                  <p className="mb-5 mt-2 max-w-md text-sm leading-6 text-[var(--muted-foreground)]">
+                    先在项目中正常填写即可。以后遇到经常重复使用的值，再保存到这里方便复用。
+                  </p>
+                  <Button onClick={() => openEditor("new")} variant="secondary">
+                    <Plus />
+                    保存一项常用配置
+                  </Button>
+                </section>
+              )}
             </section>
           )}
         </div>
@@ -402,6 +458,282 @@ export function ConfigurationCenter({ onError }: ConfigurationCenterProps) {
       </Dialog>
     </div>
   );
+}
+
+function CenterTab({
+  active,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      aria-selected={active}
+      className={`min-w-28 rounded-md px-4 py-2 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-[var(--focus)] ${
+        active
+          ? "bg-[var(--surface)] font-medium text-[var(--foreground)] shadow-sm"
+          : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+      }`}
+      onClick={onClick}
+      role="tab"
+      type="button"
+    >
+      {label}
+    </button>
+  );
+}
+
+const connectionSections: Array<{
+  description: string;
+  empty: string;
+  icon: typeof Code2;
+  kind: ConnectionKind;
+  singleton: boolean;
+  title: string;
+}> = [
+  {
+    kind: "source",
+    title: "代码平台",
+    description: "读取项目代码并触发自动构建",
+    empty: "还没有保存代码平台连接",
+    icon: Code2,
+    singleton: true,
+  },
+  {
+    kind: "registry",
+    title: "版本仓库",
+    description: "保存每次上线生成的可运行版本",
+    empty: "还没有保存版本仓库连接",
+    icon: Package,
+    singleton: true,
+  },
+  {
+    kind: "server",
+    title: "运行服务器",
+    description: "运行项目并提供访问地址",
+    empty: "还没有保存运行服务器",
+    icon: Server,
+    singleton: false,
+  },
+];
+
+function ConnectionsPanel({
+  connections,
+  loading,
+  onRefresh,
+}: {
+  connections: ConnectionResource[];
+  loading: boolean;
+  onRefresh: () => void;
+}) {
+  return (
+    <section aria-label="可复用连接">
+      <div className="mb-7 flex items-end justify-between gap-5 max-[760px]:flex-col max-[760px]:items-stretch">
+        <div>
+          <h1 className="m-0 text-2xl font-semibold">可复用连接</h1>
+          <p className="mb-0 mt-2 max-w-2xl text-sm leading-6 text-[var(--muted-foreground)]">
+            账号或服务器验证一次后，会保存为连接，其他项目可以直接选择，不需要重复填写凭据。
+          </p>
+        </div>
+        <Button
+          disabled={loading}
+          onClick={onRefresh}
+          size="sm"
+          variant="secondary"
+        >
+          <RefreshCw className={loading ? "animate-spin-slow" : undefined} />
+          刷新状态
+        </Button>
+      </div>
+
+      {loading ? (
+        <div className="flex min-h-48 items-center justify-center gap-2 text-sm text-[var(--muted-foreground)]">
+          <LoaderCircle className="animate-spin-slow" />
+          正在读取已保存连接
+        </div>
+      ) : (
+        <div className="grid grid-cols-3 gap-4 max-[900px]:grid-cols-1">
+          {connectionSections.map((section) => {
+            const sectionConnections = connections.filter(
+              (connection) => connection.kind === section.kind,
+            );
+            return (
+              <ConnectionSection
+                connections={sectionConnections}
+                key={section.kind}
+                section={section}
+              />
+            );
+          })}
+        </div>
+      )}
+
+      <div className="mt-5 rounded-lg border border-[var(--accent)]/20 bg-[var(--info-soft)] px-4 py-3 text-xs leading-5 text-[var(--muted-foreground)]">
+        新连接仍从项目的部署线路中完成验证并保存。当前版本分别维护一个 CNB
+        账号连接和一个 TCR
+        登录；这里展示当前真实保存状态，不提供虚假的多账号入口。
+      </div>
+    </section>
+  );
+}
+
+function ConnectionSection({
+  connections,
+  section,
+}: {
+  connections: ConnectionResource[];
+  section: (typeof connectionSections)[number];
+}) {
+  const Icon = section.icon;
+  return (
+    <section className="min-w-0 rounded-lg border border-[var(--border)] bg-[var(--surface)] p-4">
+      <header className="flex items-start gap-3 border-b border-[var(--border)] pb-4">
+        <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent)]">
+          <Icon className="size-4" />
+        </span>
+        <div className="min-w-0">
+          <h2 className="m-0 text-sm font-semibold">{section.title}</h2>
+          <p className="mb-0 mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
+            {section.description}
+          </p>
+        </div>
+      </header>
+
+      {connections.length ? (
+        <div className="divide-y divide-[var(--border)]">
+          {connections.map((connection) => (
+            <ConnectionCard
+              connection={connection}
+              key={connection.id}
+              label={section.singleton ? "当前已保存连接" : "已保存服务器"}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="flex min-h-36 flex-col justify-center py-4">
+          <strong className="text-sm font-medium">{section.empty}</strong>
+          <span className="mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
+            在项目部署线路中验证成功后，会自动出现在这里。
+          </span>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ConnectionCard({
+  connection,
+  label,
+}: {
+  connection: ConnectionResource;
+  label: string;
+}) {
+  const status = connectionStatus(connection);
+  const StatusIcon = status.icon;
+  const detail = connectionDetail(connection);
+  return (
+    <article className="py-4 first:pt-4 last:pb-1">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <span className="text-[10px] font-medium text-[var(--muted-foreground)]">
+          {label}
+        </span>
+        <span
+          className={`flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10px] ${status.className}`}
+        >
+          <StatusIcon className="size-3" />
+          {status.label}
+        </span>
+      </div>
+      <strong className="block truncate text-sm font-semibold">
+        {connection.name}
+      </strong>
+      <span className="mt-1 block truncate text-xs text-[var(--muted-foreground)]">
+        {providerName(connection.provider)}
+        {detail ? ` · ${detail}` : ""}
+      </span>
+      {connection.lastCheckedAt ? (
+        <span className="mt-2 block text-[10px] text-[var(--subtle-foreground)]">
+          最近验证 {formatCheckedAt(connection.lastCheckedAt)}
+        </span>
+      ) : null}
+    </article>
+  );
+}
+
+function connectionStatus(connection: ConnectionResource) {
+  switch (connection.status) {
+    case "ready":
+      return {
+        className: "bg-[var(--success-soft)] text-[var(--success)]",
+        icon: CheckCircle2,
+        label: "连接正常",
+      };
+    case "configured":
+      return {
+        className: "bg-[var(--muted)] text-[var(--muted-foreground)]",
+        icon: CircleDashed,
+        label: "已保存",
+      };
+    case "needs_authorization":
+      return {
+        className: "bg-[var(--warning-soft)] text-[var(--warning)]",
+        icon: AlertCircle,
+        label: "需要授权",
+      };
+    case "error":
+      return {
+        className: "bg-[var(--warning-soft)] text-[var(--warning)]",
+        icon: AlertCircle,
+        label: "连接异常",
+      };
+    default:
+      return {
+        className: "bg-[var(--muted)] text-[var(--muted-foreground)]",
+        icon: CircleDashed,
+        label: "等待验证",
+      };
+  }
+}
+
+function connectionDetail(connection: ConnectionResource) {
+  if (connection.kind === "server") {
+    const host = connection.metadata.host;
+    if (!host) return "";
+    const user = connection.metadata.user;
+    const port = connection.metadata.port;
+    return `${user ? `${user}@` : ""}${host}${port ? `:${port}` : ""}`;
+  }
+  if (connection.kind === "source") {
+    return connection.metadata.namespace || connection.metadata.username || "";
+  }
+  return connection.metadata.namespace || connection.metadata.endpoint || "";
+}
+
+function providerName(provider: string) {
+  switch (provider.toLocaleLowerCase()) {
+    case "cnb":
+      return "CNB";
+    case "tcr":
+      return "腾讯云 TCR";
+    case "ssh":
+      return "SSH";
+    default:
+      return provider.toUpperCase();
+  }
+}
+
+function formatCheckedAt(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
 }
 
 function isUserConfiguration(profile: ConfigProfile) {

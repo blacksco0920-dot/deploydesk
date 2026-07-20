@@ -7,6 +7,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as api from "../api";
+import type { ConfigProfile } from "../types";
 import {
   fillGeneratedInternalSecrets,
   fillDeploymentRuntimeDefaults,
@@ -143,6 +144,32 @@ describe("parseEnvFields", () => {
     });
 
     expect(load).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks saving when the existing runtime configuration cannot be read", async () => {
+    vi.spyOn(api, "loadRuntimeConfig").mockRejectedValue(
+      new Error("系统密钥库暂时不可用"),
+    );
+    const store = vi.spyOn(api, "storeRuntimeConfig");
+
+    render(
+      <RuntimeConfigFields
+        environment="production"
+        onError={() => undefined}
+        path="/demo/runtime-load-failure"
+      />,
+    );
+
+    expect(await screen.findByText("暂时无法读取正式配置")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "为避免覆盖原有配置，本页已停止保存。重新读取成功后才能继续修改。",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /保存|同步|使用当前配置/ }),
+    ).not.toBeInTheDocument();
+    expect(store).not.toHaveBeenCalled();
   });
 
   it("does not offer a redundant save when the configuration is already current", async () => {
@@ -299,6 +326,16 @@ describe("parseEnvFields", () => {
         updatedAt: "2026-07-15T00:00:00.000Z",
       },
     ]);
+    vi.spyOn(api, "listConfigProfileBindings").mockResolvedValue([]);
+    const bindProfiles = vi
+      .spyOn(api, "setEnvironmentConfigBindings")
+      .mockResolvedValue([
+        {
+          environment: "staging",
+          kind: "custom",
+          profileId: "shared-service-key",
+        },
+      ]);
     const recommend = vi
       .spyOn(api, "recommendRuntimeConfig")
       .mockResolvedValue({
@@ -331,12 +368,328 @@ describe("parseEnvFields", () => {
         "# 服务访问令牌\nSERVICE_ACCESS_KEY=\n",
       ),
     );
+    expect(bindProfiles).toHaveBeenCalledWith(
+      "/demo/reuse-config-center",
+      "staging",
+      ["shared-service-key"],
+    );
+    expect(screen.getByText("引用配置中心 1 项")).toBeInTheDocument();
     expect(screen.getByText("配置项已经齐全，等待保存")).toBeInTheDocument();
     expect(
       screen.getByText("没有缺失项，需要核对时可查看全部配置"),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "查看全部配置" }));
     expect(screen.getByLabelText("服务访问令牌")).toHaveValue("saved-value");
+  });
+
+  it("restores an environment's configuration-center references and lets the user detach them", async () => {
+    Object.defineProperty(Element.prototype, "scrollIntoView", {
+      configurable: true,
+      value: vi.fn(),
+    });
+    vi.spyOn(api, "loadRuntimeConfig").mockResolvedValue({
+      environment: "production",
+      filename: ".env.production",
+      sourceFiles: [".env.example"],
+      content: "# 服务访问令牌\nSERVICE_ACCESS_KEY=outdated-value\n",
+      templateContent: "# 服务访问令牌\nSERVICE_ACCESS_KEY=\n",
+      requiredVariables: ["SERVICE_ACCESS_KEY"],
+      stored: false,
+      authorizationRequired: false,
+    });
+    vi.spyOn(api, "listConfigProfiles").mockResolvedValue([
+      {
+        id: "production-service-key",
+        kind: "custom",
+        provider: "environment",
+        name: "正式服务令牌",
+        scope: "remote",
+        values: { env_name: "SERVICE_ACCESS_KEY" },
+        secretFields: ["SERVICE_ACCESS_KEY"],
+        configuredSecretFields: ["SERVICE_ACCESS_KEY"],
+        isDefault: true,
+        updatedAt: "2026-07-15T00:00:00.000Z",
+      },
+    ]);
+    vi.spyOn(api, "listConfigProfileBindings").mockResolvedValue([
+      {
+        environment: "production",
+        kind: "custom",
+        profileId: "production-service-key",
+      },
+    ]);
+    const recommend = vi
+      .spyOn(api, "recommendRuntimeConfig")
+      .mockResolvedValue({
+        content: "# 服务访问令牌\nSERVICE_ACCESS_KEY=restored-value\n",
+        appliedProfiles: ["正式服务令牌"],
+        filledVariables: ["SERVICE_ACCESS_KEY"],
+      });
+    const setBindings = vi
+      .spyOn(api, "setEnvironmentConfigBindings")
+      .mockResolvedValue([]);
+
+    render(
+      <RuntimeConfigFields
+        environment="production"
+        onError={() => undefined}
+        path="/demo/restore-config-center"
+      />,
+    );
+
+    expect(await screen.findByText("引用配置中心 1 项")).toBeInTheDocument();
+    expect(screen.getByText("配置中心有已引用的敏感值")).toBeInTheDocument();
+    expect(recommend).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "读取引用配置" }));
+    await waitFor(() => expect(recommend).toHaveBeenCalledTimes(1));
+    expect(recommend).toHaveBeenCalledWith(
+      "/demo/restore-config-center",
+      "production",
+      ["production-service-key"],
+      "# 服务访问令牌\nSERVICE_ACCESS_KEY=\n",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "查看全部配置" }));
+    expect(screen.getByLabelText("服务访问令牌")).toHaveValue("restored-value");
+    expect(screen.getByLabelText("服务访问令牌")).toHaveAttribute("readonly");
+
+    const selector = screen.getByRole("combobox", {
+      name: "SERVICE_ACCESS_KEY 使用配置中心已有值",
+    });
+    fireEvent.keyDown(selector, { key: "ArrowDown" });
+    fireEvent.click(await screen.findByRole("option", { name: "手动填写" }));
+
+    await waitFor(() =>
+      expect(setBindings).toHaveBeenCalledWith(
+        "/demo/restore-config-center",
+        "production",
+        [],
+      ),
+    );
+    expect(screen.queryByText("引用配置中心 1 项")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("服务访问令牌")).toHaveValue("restored-value");
+    expect(screen.getByLabelText("服务访问令牌")).not.toHaveAttribute(
+      "readonly",
+    );
+  });
+
+  it("creates a common configuration beside a missing field and binds it without leaving the deployment page", async () => {
+    vi.spyOn(api, "loadRuntimeConfig").mockResolvedValue({
+      environment: "staging",
+      filename: ".env.staging",
+      sourceFiles: [".env.example"],
+      content: "# 服务访问令牌\nSERVICE_ACCESS_KEY=\n",
+      templateContent: "# 服务访问令牌\nSERVICE_ACCESS_KEY=\n",
+      requiredVariables: ["SERVICE_ACCESS_KEY"],
+      stored: false,
+      authorizationRequired: false,
+    });
+    vi.spyOn(api, "listConfigProfiles").mockResolvedValue([]);
+    vi.spyOn(api, "listConfigProfileBindings").mockResolvedValue([]);
+    const savedProfile: ConfigProfile = {
+      id: "new-service-key",
+      kind: "custom",
+      provider: "environment",
+      name: "服务访问令牌",
+      scope: "any",
+      values: { env_name: "SERVICE_ACCESS_KEY" },
+      secretFields: ["SERVICE_ACCESS_KEY"],
+      configuredSecretFields: ["SERVICE_ACCESS_KEY"],
+      isDefault: true,
+      updatedAt: "2026-07-17T00:00:00.000Z",
+    };
+    const saveProfile = vi
+      .spyOn(api, "saveConfigProfile")
+      .mockResolvedValue(savedProfile);
+    const setBindings = vi
+      .spyOn(api, "setEnvironmentConfigBindings")
+      .mockResolvedValue([
+        {
+          environment: "staging",
+          kind: "custom",
+          profileId: savedProfile.id,
+        },
+      ]);
+
+    render(
+      <RuntimeConfigFields
+        environment="staging"
+        onError={() => undefined}
+        path="/demo/create-common-config"
+      />,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "添加常用配置" }),
+    );
+    expect(
+      screen.getByRole("heading", { name: "添加常用配置" }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("配置名称")).toHaveValue("SERVICE_ACCESS_KEY");
+    expect(screen.getByLabelText("说明")).toHaveValue("服务访问令牌");
+    fireEvent.change(screen.getByLabelText("值"), {
+      target: { value: "saved-secret" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存并使用" }));
+
+    await waitFor(() =>
+      expect(saveProfile).toHaveBeenCalledWith({
+        id: undefined,
+        kind: "custom",
+        provider: "environment",
+        name: "服务访问令牌",
+        scope: "any",
+        values: { env_name: "SERVICE_ACCESS_KEY" },
+        secretFields: ["SERVICE_ACCESS_KEY"],
+        secrets: { SERVICE_ACCESS_KEY: "saved-secret" },
+        isDefault: true,
+      }),
+    );
+    expect(setBindings).toHaveBeenCalledWith(
+      "/demo/create-common-config",
+      "staging",
+      ["new-service-key"],
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByText("引用配置中心 1 项")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "查看全部配置" }));
+    expect(screen.getByLabelText("服务访问令牌")).toHaveValue("saved-secret");
+    expect(screen.getByLabelText("服务访问令牌")).toHaveAttribute("readonly");
+  });
+
+  it("offers to save an existing manual value as a common configuration", async () => {
+    vi.spyOn(api, "loadRuntimeConfig").mockResolvedValue({
+      environment: "development",
+      filename: ".env",
+      sourceFiles: [".env.example"],
+      content: "# 公共接口地址\nPUBLIC_ENDPOINT=https://example.com\n",
+      templateContent: "# 公共接口地址\nPUBLIC_ENDPOINT=\n",
+      requiredVariables: ["PUBLIC_ENDPOINT"],
+      stored: true,
+      authorizationRequired: false,
+    });
+    vi.spyOn(api, "listConfigProfiles").mockResolvedValue([]);
+    vi.spyOn(api, "listConfigProfileBindings").mockResolvedValue([]);
+
+    render(
+      <RuntimeConfigFields
+        environment="development"
+        onError={() => undefined}
+        path="/demo/save-manual-common-config"
+      />,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "查看全部配置" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "保存为常用配置" }));
+    expect(
+      screen.getByRole("heading", { name: "保存为常用配置" }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("值")).toHaveValue("https://example.com");
+  });
+
+  it("keeps the current value and old bindings when a newly saved common configuration cannot be bound", async () => {
+    vi.spyOn(api, "loadRuntimeConfig").mockResolvedValue({
+      environment: "production",
+      filename: ".env.production",
+      sourceFiles: [".env.example"],
+      content: [
+        "# 旧令牌",
+        "OLD_TOKEN=kept-value",
+        "# 新令牌",
+        "NEW_TOKEN=typed-value",
+        "",
+      ].join("\n"),
+      templateContent: "OLD_TOKEN=\nNEW_TOKEN=\n",
+      requiredVariables: ["OLD_TOKEN", "NEW_TOKEN"],
+      stored: false,
+      authorizationRequired: false,
+    });
+    const oldProfile: ConfigProfile = {
+      id: "old-profile",
+      kind: "custom",
+      provider: "environment",
+      name: "旧令牌",
+      scope: "any",
+      values: { env_name: "OLD_TOKEN" },
+      secretFields: ["OLD_TOKEN"],
+      configuredSecretFields: ["OLD_TOKEN"],
+      isDefault: true,
+      updatedAt: "2026-07-16T00:00:00.000Z",
+    };
+    vi.spyOn(api, "listConfigProfiles").mockResolvedValue([oldProfile]);
+    vi.spyOn(api, "listConfigProfileBindings").mockResolvedValue([
+      {
+        environment: "production",
+        kind: "custom",
+        profileId: oldProfile.id,
+      },
+    ]);
+    const newProfile: ConfigProfile = {
+      id: "new-profile",
+      kind: "custom",
+      provider: "environment",
+      name: "新令牌",
+      scope: "any",
+      values: { env_name: "NEW_TOKEN" },
+      secretFields: ["NEW_TOKEN"],
+      configuredSecretFields: ["NEW_TOKEN"],
+      isDefault: false,
+      updatedAt: "2026-07-17T00:00:00.000Z",
+    };
+    const saveProfile = vi
+      .spyOn(api, "saveConfigProfile")
+      .mockResolvedValue(newProfile);
+    const setBindings = vi
+      .spyOn(api, "setEnvironmentConfigBindings")
+      .mockRejectedValueOnce(new Error("暂时无法更新引用"))
+      .mockResolvedValueOnce([
+        {
+          environment: "production",
+          kind: "custom",
+          profileId: oldProfile.id,
+        },
+        {
+          environment: "production",
+          kind: "custom",
+          profileId: newProfile.id,
+        },
+      ]);
+    const onError = vi.fn();
+
+    render(
+      <RuntimeConfigFields
+        environment="production"
+        onError={onError}
+        path="/demo/common-config-bind-failure"
+      />,
+    );
+
+    expect(await screen.findByText("引用配置中心 1 项")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "查看全部配置" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存为常用配置" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存并使用" }));
+
+    expect(
+      await screen.findByText("暂时无法更新引用。当前内容和原有引用均未改变。"),
+    ).toBeInTheDocument();
+    expect(onError).toHaveBeenCalledWith("暂时无法更新引用");
+    expect(setBindings).toHaveBeenLastCalledWith(
+      "/demo/common-config-bind-failure",
+      "production",
+      ["old-profile", "new-profile"],
+    );
+    expect(screen.getByText("引用配置中心 1 项")).toBeInTheDocument();
+    expect(screen.getByLabelText("新令牌", { selector: "input" })).toHaveValue(
+      "typed-value",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "保存并使用" }));
+    await waitFor(() => expect(setBindings).toHaveBeenCalledTimes(2));
+    expect(saveProfile).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: "new-profile" }),
+    );
+    expect(await screen.findByText("引用配置中心 2 项")).toBeInTheDocument();
   });
 
   it("hides managed infrastructure and fills the standard same-origin API path", async () => {

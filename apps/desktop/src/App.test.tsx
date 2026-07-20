@@ -9,7 +9,12 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseDocument } from "yaml";
 import * as api from "./api";
-import type { DeploymentRun, RecentProject, WorkspacePreview } from "./types";
+import type {
+  DeploymentRun,
+  RecentProject,
+  ServerForm,
+  WorkspacePreview,
+} from "./types";
 import App, {
   deploymentRefreshDelay,
   deploymentRepositoryReady,
@@ -25,6 +30,7 @@ import App, {
   shouldApplyProjectResult,
   shouldRefreshDeploymentStatus,
   shouldReuseProjectWorkspace,
+  workspaceAllowsExternalSync,
 } from "./App";
 import { deploymentVersionKey } from "./lib/projects";
 
@@ -104,6 +110,216 @@ describe("ABCDeploy 场景化主线", () => {
     expect(deploymentRepositoryReady("not: [valid")).toBe(false);
   });
 
+  it("只有接管完成或已保存的新项目才允许同步远程部署", () => {
+    const adoption = {
+      detected: true,
+      repository: "team/app",
+      pipelineExists: true,
+      historyImportAfter: null,
+      freshDraft: false,
+    };
+    expect(
+      workspaceAllowsExternalSync({
+        adoption: { ...adoption, mode: "pending" },
+      }),
+    ).toBe(false);
+    expect(
+      workspaceAllowsExternalSync({
+        adoption: { ...adoption, mode: "managed" },
+      }),
+    ).toBe(true);
+    expect(
+      workspaceAllowsExternalSync({
+        adoption: { ...adoption, mode: "fresh", freshDraft: true },
+      }),
+    ).toBe(false);
+    expect(
+      workspaceAllowsExternalSync({
+        adoption: { ...adoption, mode: "fresh", freshDraft: false },
+      }),
+    ).toBe(true);
+  });
+
+  it("发现已有上线时先让用户选择，继续管理后只同步一次再进入发布中心", async () => {
+    const path = "/demo/adopt-existing-deployment";
+    const workspace = await api.openProject(path);
+    const manifest = parseDocument(workspace.manifestYaml);
+    manifest.setIn(["providers", "build", "repository"], "team/existing");
+    const pending: WorkspacePreview = {
+      ...workspace,
+      manifestYaml: manifest.toString(),
+      adoption: {
+        mode: "pending",
+        detected: true,
+        repository: "team/existing",
+        pipelineExists: true,
+        historyImportAfter: null,
+        freshDraft: false,
+      },
+    };
+    const managed: WorkspacePreview = {
+      ...pending,
+      adoption: { ...pending.adoption, mode: "managed" },
+    };
+    vi.spyOn(api, "listRecentProjects").mockResolvedValue([
+      recentProject(path, "existing-deployment"),
+    ]);
+    vi.spyOn(api, "getAppSetting").mockImplementation(async (key) =>
+      key === "active-project" ? path : null,
+    );
+    vi.spyOn(api, "openProject").mockResolvedValue(pending);
+    vi.spyOn(api, "listDeploymentRuns").mockResolvedValue([]);
+    const getServer = vi.spyOn(api, "getProjectServer").mockResolvedValue(null);
+    const adopt = vi
+      .spyOn(api, "continueExistingDeployment")
+      .mockResolvedValue(managed);
+    const syncExternal = vi
+      .spyOn(api, "syncExternalDeployments")
+      .mockResolvedValue([]);
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "检测到已有上线配置" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "发布中心" }),
+    ).not.toBeInTheDocument();
+    expect(syncExternal).not.toHaveBeenCalled();
+    expect(getServer).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "继续管理已有部署" }));
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("heading", { name: "检测到已有上线配置" }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(
+      screen.getByText("发布中心", { selector: "h1" }),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(adopt).toHaveBeenCalledWith(path));
+    await waitFor(() => expect(syncExternal).toHaveBeenCalledTimes(1));
+    expect(syncExternal).toHaveBeenCalledWith(path);
+    expect(getServer).toHaveBeenCalledWith(path, "staging");
+    expect(getServer).toHaveBeenCalledWith(path, "production");
+    await act(async () => Promise.resolve());
+    expect(syncExternal).toHaveBeenCalledTimes(1);
+  });
+
+  it("历史同步失败也保留接管结果并给出错误", async () => {
+    const path = "/demo/adoption-sync-failure";
+    const workspace = await api.openProject(path);
+    const pending: WorkspacePreview = {
+      ...workspace,
+      adoption: {
+        mode: "pending",
+        detected: true,
+        repository: "team/sync-failure",
+        pipelineExists: true,
+        historyImportAfter: null,
+        freshDraft: false,
+      },
+    };
+    const managed: WorkspacePreview = {
+      ...pending,
+      adoption: { ...pending.adoption, mode: "managed" },
+    };
+    vi.spyOn(api, "listRecentProjects").mockResolvedValue([
+      recentProject(path, "sync-failure"),
+    ]);
+    vi.spyOn(api, "getAppSetting").mockImplementation(async (key) =>
+      key === "active-project" ? path : null,
+    );
+    vi.spyOn(api, "openProject").mockResolvedValue(pending);
+    vi.spyOn(api, "listDeploymentRuns").mockResolvedValue([]);
+    vi.spyOn(api, "getProjectServer").mockResolvedValue(null);
+    vi.spyOn(api, "continueExistingDeployment").mockResolvedValue(managed);
+    vi.spyOn(api, "syncExternalDeployments").mockRejectedValue(
+      new Error("CNB 暂时不可用"),
+    );
+
+    render(<App />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "继续管理已有部署" }),
+    );
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("heading", { name: "检测到已有上线配置" }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(
+      screen.getByText("发布中心", { selector: "h1" }),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByText(/历史部署暂时没有同步成功/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "检测到已有上线配置" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("重新设置会清空当前展示状态并从发布中心原地打开项目设置", async () => {
+    const path = "/demo/reset-existing-deployment";
+    const workspace = await api.openProject(path);
+    const pending: WorkspacePreview = {
+      ...workspace,
+      adoption: {
+        mode: "pending",
+        detected: true,
+        repository: "team/reset-existing",
+        pipelineExists: true,
+        historyImportAfter: null,
+        freshDraft: false,
+      },
+    };
+    const fresh: WorkspacePreview = {
+      ...pending,
+      adoption: {
+        ...pending.adoption,
+        mode: "fresh",
+        freshDraft: true,
+        historyImportAfter: "2026-07-17T10:00:00.000Z",
+      },
+    };
+    vi.spyOn(api, "listRecentProjects").mockResolvedValue([
+      recentProject(path, "reset-existing"),
+    ]);
+    vi.spyOn(api, "getAppSetting").mockImplementation(async (key) =>
+      key === "active-project" ? path : null,
+    );
+    vi.spyOn(api, "openProject").mockResolvedValue(pending);
+    vi.spyOn(api, "listDeploymentRuns").mockResolvedValue([]);
+    vi.spyOn(api, "getProjectServer").mockResolvedValue(null);
+    const reset = vi
+      .spyOn(api, "resetProjectDeployment")
+      .mockResolvedValue(fresh);
+    const syncExternal = vi
+      .spyOn(api, "syncExternalDeployments")
+      .mockResolvedValue([]);
+
+    render(<App />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "重新设置部署" }),
+    );
+    const confirmation = await screen.findByRole("dialog", {
+      name: "确定重新设置部署？",
+    });
+    fireEvent.click(
+      within(confirmation).getByRole("button", { name: "确认重新设置" }),
+    );
+
+    expect(
+      await screen.findByRole("dialog", { name: "完成当前上线设置" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("发布中心", { selector: "h1" }),
+    ).toBeInTheDocument();
+    expect(reset).toHaveBeenCalledWith(path);
+    expect(syncExternal).not.toHaveBeenCalled();
+  });
+
   it("应用进入后台后暂停轮询，回到前台立即补查一次", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const active = vi
@@ -147,14 +363,14 @@ describe("ABCDeploy 场景化主线", () => {
     render(<App />);
     await waitFor(() =>
       expect(
-        screen.getByRole("heading", { name: "在本机运行" }),
+        screen.getByRole("heading", { name: "发布中心" }),
       ).toBeInTheDocument(),
     );
     await act(async () => Promise.resolve());
     expect(syncExternal).not.toHaveBeenCalled();
   });
 
-  it("浏览版本管理不创建待办，明确开始后才记录上线任务", async () => {
+  it("浏览版本不创建待办，明确开始后才记录上线任务", async () => {
     const path = "/demo/read-only-version-browsing";
     const project = recentProject(path, "read-only-version-browsing");
     const workspace = await api.openProject(path);
@@ -164,26 +380,34 @@ describe("ABCDeploy 场景化主线", () => {
     vi.spyOn(api, "getProjectServer").mockResolvedValue(null);
 
     render(<App />);
-    await screen.findByRole("heading", { name: "在本机运行" });
+    await screen.findByRole("heading", { name: "发布中心" });
 
-    fireEvent.click(screen.getByRole("button", { name: /管理版本/ }));
+    fireEvent.click(screen.getByRole("button", { name: "版本" }));
     expect(
-      await screen.findByRole("heading", { name: "还没有可部署的版本" }),
+      await screen.findByRole("heading", { name: "版本" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "部署任务" }),
+      screen.getByRole("heading", { name: "版本记录" }),
     ).toBeInTheDocument();
+    expect(screen.getByText("正在等待第一个版本")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "待处理" })).toBeInTheDocument();
     expect(
       screen.getByRole("button", {
         name: /read-only-version-browsing.*尚未开始上线/,
       }),
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "准备自动生成版本" }));
-    await screen.findByRole("heading", { name: "完成一次上线设置" });
+    const projectNavigation = screen.getByLabelText("项目导航");
+    fireEvent.click(
+      within(projectNavigation).getByRole("button", { name: "项目设置" }),
+    );
+    await screen.findByRole("heading", { name: "项目设置" });
+    expect(
+      within(projectNavigation).getByRole("button", { name: "项目设置" }),
+    ).toHaveAttribute("aria-current", "page");
     await waitFor(() =>
       expect(
-        screen.getByRole("button", { name: /部署任务 1/ }),
+        screen.getByRole("button", { name: /待处理 1/ }),
       ).toBeInTheDocument(),
     );
     expect(
@@ -226,7 +450,7 @@ describe("ABCDeploy 场景化主线", () => {
     render(<App />);
     await waitFor(() =>
       expect(
-        screen.getByRole("heading", { name: "在本机运行" }),
+        screen.getByRole("heading", { name: "发布中心" }),
       ).toBeInTheDocument(),
     );
     await waitFor(() => expect(syncExternal).toHaveBeenCalledTimes(1));
@@ -238,6 +462,76 @@ describe("ABCDeploy 场景化主线", () => {
 
     act(() => finishSync?.([]));
     await act(async () => Promise.resolve());
+  });
+
+  it("后台发现新的部署任务时不改变用户正在看的项目页面", async () => {
+    const path = "/demo/background-run-keeps-current-page";
+    const workspace = await api.openProject(path);
+    const manifest = parseDocument(workspace.manifestYaml);
+    manifest.setIn(
+      ["providers", "build", "repository"],
+      "team/background-run-keeps-current-page",
+    );
+    const project = recentProject(path, "background-run-keeps-current-page");
+    const running = deploymentRun(path, {
+      id: "background-staging-run",
+      commitSha: "0123456789abcdef0123456789abcdef01234567",
+      candidateTag: "deploydesk-0123456789abcdef0123456789abcdef01234567",
+    });
+    running.status = "running";
+    running.currentStage = "build";
+
+    vi.spyOn(api, "listRecentProjects").mockResolvedValue([project]);
+    vi.spyOn(api, "getAppSetting").mockImplementation(async (key) =>
+      key === "active-project" ? path : null,
+    );
+    vi.spyOn(api, "openProject").mockResolvedValue({
+      ...workspace,
+      manifestYaml: manifest.toString(),
+    });
+    vi.spyOn(api, "getProjectServer").mockResolvedValue(null);
+    let externalSyncFinished = false;
+    const listRuns = vi
+      .spyOn(api, "listDeploymentRuns")
+      .mockImplementation(async () => (externalSyncFinished ? [running] : []));
+    let finishSync: (() => void) | undefined;
+    const syncExternal = vi
+      .spyOn(api, "syncExternalDeployments")
+      .mockImplementation(
+        () =>
+          new Promise<DeploymentRun[]>((resolve) => {
+            finishSync = () => resolve([]);
+          }),
+      );
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "发布中心" });
+    fireEvent.click(screen.getByRole("button", { name: "在本机运行" }));
+    await screen.findByRole("heading", { name: "在本机运行" });
+    await waitFor(() => expect(syncExternal).toHaveBeenCalledWith(path));
+
+    const listCallsBeforeSync = listRuns.mock.calls.length;
+    act(() => {
+      externalSyncFinished = true;
+      finishSync?.();
+    });
+    await waitFor(() =>
+      expect(listRuns.mock.calls.length).toBeGreaterThan(listCallsBeforeSync),
+    );
+    expect(
+      screen.getByRole("heading", { name: "在本机运行" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "在本机运行" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "发布中心" }));
+    const testEnvironment = await screen.findByRole("button", {
+      name: /测试环境：/,
+    });
+    await waitFor(() =>
+      expect(testEnvironment).toHaveAccessibleName(/测试环境：正在部署测试版/),
+    );
   });
 
   it("重新进入当前项目时直接复用已经加载的工作区", () => {
@@ -285,18 +579,18 @@ describe("ABCDeploy 场景化主线", () => {
 
     await waitFor(() => expect(relink).toHaveBeenCalledWith(oldPath, newPath));
     expect(
-      await screen.findByRole("heading", { name: "在本机运行" }),
+      await screen.findByRole("heading", { name: "发布中心" }),
     ).toBeInTheDocument();
   });
 
-  it("从部署任务直接回到对应的处理场景", () => {
+  it("从待处理只进入任务对应的处理场景", () => {
     expect(
       deploymentSceneForProject({
         latestActionKind: "cloud-setup",
         latestEnvironment: "staging",
         latestStatus: "needs_action",
       }),
-    ).toBe("versions");
+    ).toBe("settings");
     expect(
       deploymentSceneForProject({
         latestActionKind: "route-check",
@@ -336,7 +630,7 @@ describe("ABCDeploy 场景化主线", () => {
         environment: "staging",
         status: "needs_action",
       }),
-    ).toBe("versions");
+    ).toBe("settings");
     expect(
       deploymentVersionForRun({
         environment: "production",
@@ -349,7 +643,7 @@ describe("ABCDeploy 场景化主线", () => {
         projectPath: "/demo/app",
         stage: "save-page-opened",
       }),
-    ).toBe("versions");
+    ).toBe("settings");
     expect(
       setupSceneForTask({
         environment: "production",
@@ -366,11 +660,13 @@ describe("ABCDeploy 场景化主线", () => {
     ).toBe("test");
   });
 
-  it("只恢复产品支持的项目场景", () => {
+  it("恢复新项目场景并把旧环境页迁移到发布中心", () => {
+    expect(projectSceneFromSetting("overview")).toBe("overview");
     expect(projectSceneFromSetting("local")).toBe("local");
     expect(projectSceneFromSetting("versions")).toBe("versions");
-    expect(projectSceneFromSetting("test")).toBe("test");
-    expect(projectSceneFromSetting("production")).toBe("production");
+    expect(projectSceneFromSetting("settings")).toBe("settings");
+    expect(projectSceneFromSetting("test")).toBe("overview");
+    expect(projectSceneFromSetting("production")).toBe("overview");
     expect(projectSceneFromSetting("unknown")).toBeUndefined();
     expect(projectSceneFromSetting(null)).toBeUndefined();
   });
@@ -396,7 +692,7 @@ describe("ABCDeploy 场景化主线", () => {
     expect(sameProjectPath("/demo/project-a", "/demo/project-b")).toBe(false);
   });
 
-  it("把中断的首次上线步骤恢复成全局待办并直达管理版本", async () => {
+  it("把中断的首次上线步骤恢复成全局待办并由待办在发布中心原地展开", async () => {
     const path = "/demo/interrupted-version-setup";
     const project = recentProject(path, "interrupted-version-setup");
     const other = {
@@ -427,44 +723,41 @@ describe("ABCDeploy 场景化主线", () => {
         name: /interrupted-version-setup 还差保存项目版本/,
       }),
     );
-    expect(
-      await screen.findByRole(
-        "heading",
-        { name: "完成一次上线设置" },
-        { timeout: 3_000 },
-      ),
-    ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /管理版本/ })).toHaveAttribute(
-      "aria-current",
-      "page",
-    );
     await waitFor(() =>
       expect(
-        screen.getByRole("button", {
-          name: /interrupted-version-setup 还差连接代码平台/,
-        }),
+        screen.getByRole("heading", { name: "发布中心" }),
       ).toBeInTheDocument(),
     );
-    fireEvent.click(screen.getByRole("button", { name: /部署任务 1/ }));
-    const taskDialog = screen.getByRole("dialog", { name: "部署任务" });
+    expect(
+      within(screen.getByLabelText("项目导航")).getByRole("button", {
+        name: "发布中心",
+      }),
+    ).toHaveAttribute("aria-current", "page");
+    fireEvent.click(screen.getByRole("button", { name: /待处理 1/ }));
+    const taskDialog = screen.getByRole("dialog", {
+      name: "待处理与最近活动",
+    });
     const setupTaskCard = within(taskDialog)
-      .getByText("还差连接代码平台")
+      .getByText("还差保存项目版本")
       .closest("button") as HTMLElement;
-    expect(setupTaskCard).toHaveTextContent("连接代码平台");
-    expect(setupTaskCard).toHaveTextContent("连接代码平台 ›");
+    expect(setupTaskCard).toHaveTextContent("准备项目版本 ›");
     expect(setupTaskCard).toHaveTextContent("进度已保存，打开后会回到当前步骤");
     fireEvent.click(setupTaskCard);
-    expect(
-      await screen.findByRole(
-        "heading",
-        { name: "完成一次上线设置" },
-        { timeout: 3_000 },
-      ),
-    ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /管理版本/ })).toHaveAttribute(
-      "aria-current",
-      "page",
-    );
+    await waitFor(() => {
+      expect(
+        within(screen.getByLabelText("项目导航")).getByText("发布中心", {
+          selector: "button",
+        }),
+      ).toHaveAttribute("aria-current", "page");
+      expect(
+        screen.getByRole("dialog", { name: "完成当前上线设置" }),
+      ).toBeInTheDocument();
+      expect(
+        within(
+          screen.getByRole("dialog", { name: "完成当前上线设置" }),
+        ).getByRole("heading", { name: "先连接代码平台" }),
+      ).toBeInTheDocument();
+    });
   });
 
   it("上线设置完成后把第一次部署恢复成明确的全局下一步", async () => {
@@ -488,11 +781,17 @@ describe("ABCDeploy 场景化主线", () => {
         name: /ready-for-first-deployment 下一步：部署测试版/,
       }),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /部署任务 1/ }));
+    fireEvent.click(screen.getByRole("button", { name: /待处理 1/ }));
     expect(screen.getByText("首次上线设置已完成")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByText("首次上线设置已完成").closest("button") as HTMLElement,
+    );
+    await screen.findByRole("dialog", { name: "测试环境任务" });
     expect(
-      screen.getByText("上线设置已完成，打开后会进入测试版"),
-    ).toBeInTheDocument();
+      within(screen.getByLabelText("项目导航")).getByText("发布中心", {
+        selector: "button",
+      }),
+    ).toHaveAttribute("aria-current", "page");
   });
 
   it("测试地址正常但尚未人工确认时保留全局下一步", async () => {
@@ -513,7 +812,7 @@ describe("ABCDeploy 场景化主线", () => {
         name: /pending-test-verification 等待确认测试结果/,
       }),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /部署任务 1/ }));
+    fireEvent.click(screen.getByRole("button", { name: /待处理 1/ }));
     expect(screen.getByText("等待你确认")).toBeInTheDocument();
     expect(screen.getByText("确认测试结果")).toBeInTheDocument();
   });
@@ -544,7 +843,14 @@ describe("ABCDeploy 场景化主线", () => {
     );
     vi.spyOn(api, "listRecentProjects").mockResolvedValue([project]);
     vi.spyOn(api, "listDeploymentRuns").mockResolvedValue([current, older]);
-    const saveSetting = vi.spyOn(api, "setAppSetting");
+    const migrateValidation = vi
+      .spyOn(api, "setVersionValidation")
+      .mockResolvedValue({
+        versionKey: deploymentVersionKey(older),
+        state: "passed",
+        runId: older.id,
+        verifiedAt: "2026-07-17T00:00:00.000Z",
+      });
 
     render(<App />);
 
@@ -557,9 +863,10 @@ describe("ABCDeploy 场景化主线", () => {
       screen.queryByRole("button", { name: /等待确认测试结果/ }),
     ).not.toBeInTheDocument();
     await waitFor(() =>
-      expect(saveSetting).toHaveBeenCalledWith(
-        `${settingKey}.verified-version`,
-        JSON.stringify([deploymentVersionKey(older)]),
+      expect(migrateValidation).toHaveBeenCalledWith(
+        path,
+        current.id,
+        "passed",
       ),
     );
 
@@ -569,11 +876,31 @@ describe("ABCDeploy 场景化主线", () => {
       }),
     );
     await waitFor(() =>
-      expect(
-        screen.getByRole("button", { name: /发布正式版/ }),
-      ).toHaveAttribute("aria-current", "page"),
+      expect(screen.getByRole("button", { name: "发布中心" })).toHaveAttribute(
+        "aria-current",
+        "page",
+      ),
     );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "发布到正式环境",
+      }),
+    );
+    await screen.findByRole("heading", {
+      name: /正在确认正式发布条件|先完成正式配置/,
+    });
 
+    const productionTask = screen.getByRole("dialog", {
+      name: "正式环境任务",
+    });
+    fireEvent.click(
+      within(productionTask).getByRole("button", { name: "关闭" }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "正式环境任务" }),
+      ).not.toBeInTheDocument(),
+    );
     fireEvent.click(screen.getByRole("button", { name: "所有项目" }));
     const recentProjects = await screen.findByRole("region", {
       name: "按当前状态分组的项目",
@@ -593,7 +920,43 @@ describe("ABCDeploy 场景化主线", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("点击健康正式版项目时直达入口承诺的正式版场景", async () => {
+  it("项目摘要优先使用持久化版本验证记录", async () => {
+    const path = "/demo/durable-version-validation";
+    const project = {
+      ...recentProject(path, "durable-version-validation"),
+      latestStatus: "success" as const,
+      latestEnvironment: "staging" as const,
+      latestRunId: "current-attempt",
+      latestMessage: "测试地址可以访问",
+    };
+    const current = deploymentRun(path, {
+      id: "current-attempt",
+      commitSha: "0123456789abcdef0123456789abcdef01234567",
+      candidateTag: "deploydesk-0123456789abcdef0123456789abcdef01234567",
+    });
+    vi.spyOn(api, "listRecentProjects").mockResolvedValue([project]);
+    vi.spyOn(api, "listDeploymentRuns").mockResolvedValue([current]);
+    vi.spyOn(api, "listVersionValidations").mockResolvedValue([
+      {
+        versionKey: deploymentVersionKey(current),
+        state: "passed",
+        runId: current.id,
+        verifiedAt: "2026-07-17T00:00:00.000Z",
+      },
+    ]);
+    const migrate = vi.spyOn(api, "setVersionValidation");
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("button", {
+        name: /durable-version-validation 测试已通过，可发布/,
+      }),
+    ).toBeInTheDocument();
+    expect(migrate).not.toHaveBeenCalled();
+  });
+
+  it("点击健康正式版项目先到总览，再从总览查看正式环境", async () => {
     const path = "/demo/healthy-production";
     const workspace = await api.openProject(path);
     const project = {
@@ -642,8 +1005,16 @@ describe("ABCDeploy 场景化主线", () => {
       }),
     );
     expect(
-      await screen.findByRole("button", { name: /发布正式版/ }),
+      await screen.findByRole("button", { name: "发布中心" }),
     ).toHaveAttribute("aria-current", "page");
+    expect(
+      screen.getByRole("heading", { name: "发布中心" }),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "正式环境：运行正常，查看详情",
+      }),
+    );
     expect(
       await screen.findByRole("heading", { name: "正式版已上线" }),
     ).toBeInTheDocument();
@@ -736,7 +1107,7 @@ describe("ABCDeploy 场景化主线", () => {
         name: /rebuilt-unverified-version 等待确认测试结果/,
       }),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /部署任务 1/ }));
+    fireEvent.click(screen.getByRole("button", { name: /待处理 1/ }));
     expect(screen.getByText("确认测试结果")).toBeInTheDocument();
   });
 
@@ -802,25 +1173,37 @@ describe("ABCDeploy 场景化主线", () => {
       await screen.findByRole("button", { name: "选择整个项目文件夹" }),
     );
 
-    expect(await screen.findByText("项目识别完成")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("heading", { name: "发布中心" }),
+      ).toBeInTheDocument(),
+    );
     expect(
-      screen.getByRole("heading", { name: "在本机运行" }),
+      screen.getByLabelText(
+        `当前项目：${workspace.inspection.project_name}；项目路径：${path}；${workspace.inspection.services.length} 个项目服务`,
+      ),
     ).toBeInTheDocument();
+    expect(await screen.findByText("先连接代码平台")).toBeInTheDocument();
     expect(
       screen.getByText(
-        `发现 ${workspace.inspection.services.length} 个项目服务。准备上线只需完成一次设置；本机运行不是上线前置条件。`,
+        "选择一个可用的 CNB 连接和代码仓库，后续更新授权不需要重新添加项目。",
       ),
     ).toBeInTheDocument();
     expect(
-      screen.queryByText(
-        `已识别 ${workspace.inspection.services.length} 个项目服务`,
-      ),
+      await screen.findByRole("button", {
+        name: "测试环境：尚未准备，查看详情",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "在本机运行" }),
     ).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "准备上线" }));
-    expect(screen.queryByText("项目识别完成")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "连接代码平台" }));
     expect(
-      await screen.findByRole("heading", { name: "完成一次上线设置" }),
+      await screen.findByRole("heading", { name: "先连接代码平台" }),
     ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /连接镜像仓库/ }),
+    ).not.toBeInTheDocument();
   });
 
   it("已有项目列表可用时不让慢项目恢复锁死添加入口", async () => {
@@ -854,7 +1237,7 @@ describe("ABCDeploy 场景化主线", () => {
     });
     await waitFor(() =>
       expect(
-        screen.getByRole("heading", { name: "在本机运行" }),
+        screen.getByRole("heading", { name: "发布中心" }),
       ).toBeInTheDocument(),
     );
   });
@@ -935,7 +1318,7 @@ describe("ABCDeploy 场景化主线", () => {
       screen.getByText("已打开保存的部署进度，不会创建重复项目。"),
     ).toBeInTheDocument();
     expect(
-      await screen.findByRole("heading", { name: "在本机运行" }),
+      await screen.findByRole("heading", { name: "发布中心" }),
     ).toBeInTheDocument();
     expect(screen.queryByText("项目识别完成")).not.toBeInTheDocument();
     expect(open).toHaveBeenCalledTimes(1);
@@ -977,7 +1360,7 @@ describe("ABCDeploy 场景化主线", () => {
       finishOpen?.(workspace);
     });
     expect(
-      await screen.findByRole("heading", { name: "在本机运行" }),
+      await screen.findByRole("heading", { name: "发布中心" }),
     ).toBeInTheDocument();
   });
 
@@ -1025,7 +1408,7 @@ describe("ABCDeploy 场景化主线", () => {
     act(() => finishOpen?.(configuredWorkspace));
     await waitFor(() =>
       expect(
-        screen.getByRole("heading", { name: "在本机运行" }),
+        screen.getByRole("heading", { name: "发布中心" }),
       ).toBeInTheDocument(),
     );
     await waitFor(() => expect(syncExternal).toHaveBeenCalledWith(path));
@@ -1063,7 +1446,7 @@ describe("ABCDeploy 场景化主线", () => {
 
     act(() => finishOpen?.(workspace));
 
-    await screen.findByRole("heading", { name: "在本机运行" });
+    await screen.findByRole("heading", { name: "发布中心" });
     await waitFor(() =>
       expect(
         settings.mock.calls.some(([keys]) =>
@@ -1096,7 +1479,7 @@ describe("ABCDeploy 场景化主线", () => {
 
     await waitFor(() =>
       expect(
-        screen.getByRole("heading", { name: "在本机运行" }),
+        screen.getByRole("heading", { name: "发布中心" }),
       ).toBeInTheDocument(),
     );
     expect(
@@ -1127,26 +1510,21 @@ describe("ABCDeploy 场景化主线", () => {
 
     render(<App />);
 
-    await screen.findByRole("heading", { name: "在本机运行" });
+    await screen.findByRole("heading", { name: "发布中心" });
     expect(saveSetting).toHaveBeenCalledWith(
       "cnb.secret-repository",
       "demo/shared-deploy-secrets",
     );
   });
 
-  it("恢复项目时先等到上次场景，避免闪过错误页面", async () => {
+  it("恢复项目时直接回发布中心，不等待或恢复上次浏览页面", async () => {
     const path = "/demo/restore-production-scene";
     const workspace = await api.openProject(path);
     const project = recentProject(path, "restore-production-scene");
-    let finishScene: ((value: string | null) => void) | undefined;
     vi.spyOn(api, "listRecentProjects").mockResolvedValue([project]);
     vi.spyOn(api, "getAppSetting").mockImplementation(async (key) => {
       if (key === "active-project") return path;
-      if (key === `project.${encodeURIComponent(path)}.scene`) {
-        return new Promise((resolve) => {
-          finishScene = resolve;
-        });
-      }
+      if (key === `project.${encodeURIComponent(path)}.scene`) return "local";
       return null;
     });
     vi.spyOn(api, "openProject").mockResolvedValue(workspace);
@@ -1156,39 +1534,160 @@ describe("ABCDeploy 场景化主线", () => {
     render(<App />);
 
     expect(
-      await screen.findByRole("heading", { name: "正在恢复项目" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByRole("heading", { name: "在本机运行" }),
-    ).not.toBeInTheDocument();
-
-    await waitFor(() => expect(finishScene).toBeTypeOf("function"));
-    act(() => finishScene?.("production"));
-
-    expect(
-      await screen.findByRole("button", { name: /发布正式版/ }),
+      await screen.findByRole("button", { name: "发布中心" }),
     ).toHaveAttribute("aria-current", "page");
     expect(
-      screen.queryByRole("heading", { name: "在本机运行" }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("heading", { name: "发布中心" }),
+    ).toBeInTheDocument();
   });
 
-  it("从本机运行走到测试验证和正式发布", async () => {
+  it("先保存测试部署任务，失败时暂停同一任务，重试也复用原 task id", async () => {
+    const path = "/demo/durable-staging-task";
+    await seedReadyDeploymentProject(path);
+    const createTask = vi.spyOn(api, "createDeploymentTask");
+    const bootstrap = vi.spyOn(api, "bootstrapServerCaddy");
+    const pauseTask = vi.spyOn(api, "pauseDeploymentTask");
+    const syncSource = vi
+      .spyOn(api, "syncProjectToCnb")
+      .mockRejectedValueOnce(new Error("上传代码时网络中断"))
+      .mockResolvedValue({
+        repository: "demo/durable-task-project",
+        branch: "main",
+        commitSha: "0123456789abcdef0123456789abcdef01234567",
+        committed: true,
+      });
+    const startDeployment = vi.spyOn(api, "startStagingDeployment");
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "发布中心" });
+    fireEvent.click(
+      await screen.findByRole("button", { name: "生成第一个测试版" }),
+    );
+    await screen.findByRole("heading", { name: "部署测试版" });
+
+    await waitFor(() => expect(pauseTask).toHaveBeenCalledTimes(1));
+    const task = await createTask.mock.results[0].value;
+    expect(createTask).toHaveBeenCalledWith(path, "staging");
+    expect(createTask.mock.invocationCallOrder[0]).toBeLessThan(
+      bootstrap.mock.invocationCallOrder[0],
+    );
+    expect(createTask.mock.invocationCallOrder[0]).toBeLessThan(
+      syncSource.mock.invocationCallOrder[0],
+    );
+    expect(pauseTask).toHaveBeenCalledWith(
+      task.id,
+      "sync-source",
+      expect.any(String),
+      "上传代码时网络中断",
+      "retry-staging-preparation",
+    );
+    expect(startDeployment).not.toHaveBeenCalled();
+
+    fireEvent.click(await screen.findByRole("button", { name: "重新尝试" }));
+    await waitFor(() => expect(startDeployment).toHaveBeenCalledTimes(1));
+
+    expect(createTask).toHaveBeenCalledTimes(1);
+    expect(syncSource).toHaveBeenCalledTimes(2);
+    expect(syncSource.mock.calls[1]).toEqual([
+      path,
+      "demo/durable-task-project",
+      "main",
+      false,
+      task.id,
+    ]);
+    expect(startDeployment).toHaveBeenCalledWith(
+      path,
+      "0123456789abcdef0123456789abcdef01234567",
+      true,
+      task.id,
+    );
+  });
+
+  it("正式环境准备失败时保留任务，修复后继续同一个正式发布", async () => {
+    const path = "/demo/durable-production-task";
+    const { productionServer, stagingRun } = await seedReadyDeploymentProject(
+      path,
+      true,
+    );
+    if (!stagingRun) throw new Error("测试夹具没有生成测试版本");
+    const createTask = vi.spyOn(api, "createDeploymentTask");
+    const originalBindProjectServer = api.bindProjectServer;
+    const bindServer = vi
+      .spyOn(api, "bindProjectServer")
+      .mockRejectedValueOnce(new Error("正式服务器连接暂时中断"))
+      .mockImplementation(originalBindProjectServer);
+    const pauseTask = vi.spyOn(api, "pauseDeploymentTask");
+    const promoteDeployment = vi.spyOn(api, "promoteProductionDeployment");
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "发布中心" });
+    fireEvent.click(
+      await screen.findByRole("button", { name: "发布到正式环境" }),
+    );
+    const publish = await screen.findByRole("button", {
+      name: "发布正式版",
+    });
+    await waitFor(() => expect(publish).toBeEnabled());
+    fireEvent.click(publish);
+    await screen.findByRole("heading", { name: "发布这个正式版本？" });
+    fireEvent.click(screen.getByRole("button", { name: "确认发布" }));
+
+    await waitFor(() => expect(pauseTask).toHaveBeenCalledTimes(1));
+    const task = await createTask.mock.results[0].value;
+    expect(createTask).toHaveBeenCalledWith(path, "production", stagingRun.id);
+    expect(createTask.mock.invocationCallOrder[0]).toBeLessThan(
+      bindServer.mock.invocationCallOrder[0],
+    );
+    expect(pauseTask).toHaveBeenCalledWith(
+      task.id,
+      "prepare-server",
+      expect.any(String),
+      "正式服务器连接暂时中断",
+      "retry-production-preparation",
+    );
+    expect(promoteDeployment).not.toHaveBeenCalled();
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "重新发布同一版本" }),
+    );
+    await waitFor(() => expect(promoteDeployment).toHaveBeenCalledTimes(1));
+
+    expect(createTask).toHaveBeenCalledTimes(1);
+    expect(bindServer).toHaveBeenLastCalledWith(
+      path,
+      "production",
+      productionServer,
+    );
+    expect(promoteDeployment).toHaveBeenCalledWith(stagingRun.id, task.id);
+  });
+
+  it("从发布中心进入环境详情并完成本机、测试和正式发布", async () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "部署第一个项目" });
     fireEvent.click(screen.getByRole("button", { name: "查看示例" }));
 
+    await screen.findByRole("heading", { name: "发布中心" });
+    expect(screen.getByRole("button", { name: "发布中心" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    expect(
+      screen.getByRole("button", { name: "在本机运行" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "版本" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "项目设置" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "部署测试版" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "发布正式版" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "在本机运行" }));
     await screen.findByRole("heading", { name: "在本机运行" });
-    expect(
-      screen.getByRole("button", { name: /在本机运行/ }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: /部署测试版/ }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: /发布正式版/ }),
-    ).toBeInTheDocument();
     await waitFor(() =>
       expect(
         screen.queryByRole("button", { name: "全部停止" }),
@@ -1233,16 +1732,11 @@ describe("ABCDeploy 场景化主线", () => {
       screen.queryByRole("button", { name: "一键启动全部" }),
     ).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /部署测试版/ }));
-    await screen.findByRole("heading", { name: "部署测试版" });
-    expect(screen.getByText("上线设置还没有完成")).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "系统会直接打开当前还没完成的一项；全部完成后会自动进入测试版。",
-      ),
-    ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "继续完成设置" }));
-    await screen.findByRole("heading", { name: "完成一次上线设置" });
+    fireEvent.click(screen.getByRole("button", { name: "发布中心" }));
+    await screen.findByRole("heading", { name: "发布中心" });
+    expect(screen.getByText("先连接代码平台")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "连接代码平台" }));
+    await screen.findByRole("heading", { name: "先连接代码平台" });
     fireEvent.click(await screen.findByRole("button", { name: "连接 CNB" }));
     expect(
       screen.getByRole("button", { name: "前往 CNB 创建令牌" }),
@@ -1251,7 +1745,9 @@ describe("ABCDeploy 场景化主线", () => {
       target: { value: "demo-token" },
     });
     expect(
-      screen.getByText(/令牌只保存在系统密钥库，并供所有项目复用/),
+      screen.getByText(
+        /令牌统一保存在本机系统密钥库，符合使用范围的项目可以复用/,
+      ),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "验证账号并连接" }));
     await screen.findByText("CNB 账号：示例用户");
@@ -1274,30 +1770,17 @@ describe("ABCDeploy 场景化主线", () => {
     await screen.findByText("测试域名已设置");
     fireEvent.click(screen.getByRole("button", { name: /^4 开启自动部署/ }));
     await saveCloudConfig();
-    await screen.findByRole("heading", { name: "部署测试版" });
-    expect(await screen.findByText("上线设置已准备")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "立即部署测试版" }));
-
+    await screen.findByRole("heading", { name: "发布中心" });
+    fireEvent.click(screen.getByRole("button", { name: "生成第一个测试版" }));
     await screen.findByRole("heading", { name: "正在部署测试版" });
     fireEvent.click(screen.getByRole("button", { name: "刷新进度" }));
     await screen.findByRole("heading", { name: "验证测试版" });
     expect(screen.getByLabelText("当前测试版本")).toBeInTheDocument();
-    await waitFor(() =>
-      expect(
-        within(screen.getByTestId("project-sidebar")).getByRole("button", {
-          name: /等待确认测试结果/,
-        }),
-      ).toBeInTheDocument(),
+    fireEvent.click(screen.getByRole("button", { name: "打开测试版" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "确认测试通过" }),
     );
-    fireEvent.click(screen.getByRole("button", { name: "测试通过" }));
     await screen.findByText("下一步：准备正式版");
-    await waitFor(() =>
-      expect(
-        within(screen.getByTestId("project-sidebar")).queryByRole("button", {
-          name: /等待确认测试结果/,
-        }),
-      ).not.toBeInTheDocument(),
-    );
     expect(screen.getByText("测试版正在服务器运行")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "手动部署测试版" }),
@@ -1306,12 +1789,17 @@ describe("ABCDeploy 场景化主线", () => {
       screen.queryByRole("button", { name: "部署新版本" }),
     ).not.toBeInTheDocument();
 
-    fireEvent.click(
-      within(screen.getByRole("navigation", { name: "项目场景" })).getByRole(
-        "button",
-        { name: /发布正式版/ },
-      ),
+    const testTask = screen.getByRole("dialog", { name: "测试环境任务" });
+    fireEvent.click(within(testTask).getByRole("button", { name: "关闭" }));
+    await screen.findByRole("heading", { name: "发布中心" });
+    await waitFor(() =>
+      expect(
+        within(screen.getByTestId("project-sidebar")).queryByRole("button", {
+          name: /等待确认测试结果/,
+        }),
+      ).not.toBeInTheDocument(),
     );
+    fireEvent.click(screen.getByRole("button", { name: "发布到正式环境" }));
     await screen.findByRole("heading", {
       name: /正在确认正式发布条件|先完成正式配置/,
     });
@@ -1346,6 +1834,106 @@ describe("ABCDeploy 场景化主线", () => {
     await screen.findByRole("heading", { name: "正式版已上线" });
   }, 10_000);
 });
+
+async function seedReadyDeploymentProject(
+  path: string,
+  includeVerifiedProductionCandidate = false,
+): Promise<{
+  productionServer: ServerForm;
+  stagingRun?: DeploymentRun;
+}> {
+  const workspace = await api.openProject(path);
+  const manifest = parseDocument(workspace.manifestYaml);
+  manifest.setIn(
+    ["providers", "build", "repository"],
+    "demo/durable-task-project",
+  );
+  manifest.setIn(
+    ["providers", "registry", "repository"],
+    "demo/durable-task-project",
+  );
+  manifest.setIn(
+    ["environments", "staging", "domains"],
+    [{ service: "api", host: "staging.example.com", path: "/" }],
+  );
+  manifest.setIn(
+    ["environments", "staging", "secrets_ref"],
+    "https://cnb.cool/demo/deploy-secrets/-/blob/main/env.staging.yml",
+  );
+  manifest.setIn(
+    ["environments", "production", "domains"],
+    [
+      { service: "api", host: "api.example.com", path: "/" },
+      { service: "admin", host: "admin.example.com", path: "/" },
+      { service: "miniapp", host: "app.example.com", path: "/" },
+    ],
+  );
+  manifest.setIn(
+    ["environments", "production", "secrets_ref"],
+    "https://cnb.cool/demo/deploy-secrets/-/blob/main/env.production.yml",
+  );
+  await api.saveManifestDraft(path, manifest.toString({ lineWidth: 0 }));
+
+  const runtimeConfig = [
+    "DEPLOYDESK_ENV=staging",
+    "DATABASE_URL=postgresql://database/example",
+    "APP_SECRET=durable-task-secret",
+    "PUBLIC_SITE_URL=https://staging.example.com",
+    "",
+  ].join("\n");
+  await api.storeRuntimeConfig(path, "staging", runtimeConfig);
+  await api.storeRuntimeConfig(
+    path,
+    "production",
+    runtimeConfig.replace(/staging/g, "production"),
+  );
+
+  const stagingServer: ServerForm = {
+    name: "测试服务器",
+    host: "203.0.113.10",
+    user: "ubuntu",
+    port: 22,
+    keyPath: "/Users/demo/.ssh/abcdeploy_ed25519",
+    hostFingerprint: "SHA256:DurableStagingServer",
+  };
+  const productionServer: ServerForm = {
+    name: "正式服务器",
+    host: "203.0.113.11",
+    user: "ubuntu",
+    port: 22,
+    keyPath: "/Users/demo/.ssh/abcdeploy_ed25519",
+    hostFingerprint: "SHA256:DurableProductionServer",
+  };
+  await api.bindProjectServer(path, "staging", stagingServer);
+  await api.bindProjectServer(path, "production", productionServer);
+
+  const settingKey = `project.${encodeURIComponent(path)}`;
+  await api.setAppSetting("active-project", path);
+  await api.setAppSetting(`${settingKey}.version-setup-complete`, "true");
+  await api.setAppSetting(`${settingKey}.scene`, "overview");
+
+  let stagingRun: DeploymentRun | undefined;
+  if (includeVerifiedProductionCandidate) {
+    const task = await api.createDeploymentTask(path, "staging");
+    const running = await api.startStagingDeployment(
+      path,
+      "0123456789abcdef0123456789abcdef01234567",
+      true,
+      task.id,
+    );
+    stagingRun = await api.refreshDeployment(running.id);
+    await api.setAppSetting(
+      `${settingKey}.verified-run`,
+      JSON.stringify([stagingRun.id]),
+    );
+    await api.setAppSetting(
+      `${settingKey}.verified-version`,
+      JSON.stringify([deploymentVersionKey(stagingRun)]),
+    );
+  }
+
+  return { productionServer, stagingRun };
+}
 
 function recentProject(path: string, name: string): RecentProject {
   return {

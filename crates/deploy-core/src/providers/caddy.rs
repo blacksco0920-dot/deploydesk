@@ -85,10 +85,14 @@ pub async fn bootstrap_server(profile: &SshProfile, confirmed: bool) -> Result<P
         profile,
         "bash -s",
         Some(SERVER_BOOTSTRAP.as_bytes()),
-        Duration::from_mins(5),
+        Duration::from_mins(10),
     )
     .await?;
     if output.exit_status == Some(0) {
+        let docker_installed = output
+            .stdout
+            .lines()
+            .any(|line| line.trim() == "ABCDEPLOY_DOCKER_SETUP=installed");
         let reused = output
             .stdout
             .lines()
@@ -100,14 +104,23 @@ pub async fn bootstrap_server(profile: &SshProfile, confirmed: bool) -> Result<P
             ok: true,
             summary: if reused {
                 format!("已复用服务器现有的统一 Caddy：{container}")
+            } else if docker_installed {
+                format!("已自动初始化服务器 {} 并启动统一 Caddy", profile.name)
             } else {
                 format!("服务器 {} 的 ABCDeploy Caddy 已就绪", profile.name)
             },
-            details: vec![if reused {
-                "只使用独立路由目录，不改写现有主 Caddyfile".to_string()
-            } else {
-                "已准备统一运行目录，未修改其他反向代理配置".to_string()
-            }],
+            details: vec![
+                if docker_installed {
+                    "已安装并启动 Docker Engine 与 Compose 插件".to_string()
+                } else {
+                    "已复用服务器现有 Docker 运行环境".to_string()
+                },
+                if reused {
+                    "只使用独立路由目录，不改写现有主 Caddyfile".to_string()
+                } else {
+                    "已准备统一运行目录，未修改其他反向代理配置".to_string()
+                },
+            ],
             code: None,
             next_steps: Vec::new(),
             retryable: false,
@@ -160,7 +173,7 @@ fn command_exists(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::marker_value;
+    use super::{SERVER_BOOTSTRAP, marker_value};
 
     #[test]
     fn extracts_stable_bootstrap_error_markers() {
@@ -173,5 +186,19 @@ mod tests {
             marker_value(output, "ABCDEPLOY_ERROR_NEXT_STEP"),
             Some("挂载路由目录")
         );
+    }
+
+    #[test]
+    fn empty_ubuntu_servers_are_initialized_without_user_commands() {
+        assert!(SERVER_BOOTSTRAP.contains("download.docker.com/linux/$distribution"));
+        assert!(SERVER_BOOTSTRAP.contains("docker-compose-plugin"));
+        assert!(SERVER_BOOTSTRAP.contains("systemctl enable --now docker"));
+        assert!(SERVER_BOOTSTRAP.contains("ABCDEPLOY_DOCKER_SETUP=installed"));
+        assert!(SERVER_BOOTSTRAP.contains("AD-SRV-104"));
+        assert!(SERVER_BOOTSTRAP.contains("mirror.ccs.tencentyun.com/library/caddy@"));
+        assert!(SERVER_BOOTSTRAP.contains("m.daocloud.io/docker.io/library/caddy@"));
+        assert!(SERVER_BOOTSTRAP.contains("http://127.0.0.1"));
+        assert!(SERVER_BOOTSTRAP.contains("systemctl disable --now caddy"));
+        assert!(SERVER_BOOTSTRAP.contains("AD-SRV-212"));
     }
 }

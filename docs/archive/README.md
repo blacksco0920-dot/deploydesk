@@ -2,6 +2,23 @@
 
 这里保存已经不再代表当前产品定义、但仍有工程参考价值的历史文档。
 
+## 2026-07 四场景模型
+
+这一组文档是“在本机运行 / 管理版本 / 部署测试版 / 发布正式版”作为四个顶层页签时的完整规范快照。该模型已被“发布中心 / 在本机运行 / 版本 / 项目设置”以及“版本与环境解耦”的新模型替代。
+
+- `2026-07-consolidated-guidance/`：已分别并入当前产品工作流、配置模型和架构决策的用户旅程与推荐策略，保留原文只用于追溯。
+
+- [归档说明](2026-07-four-scene-model/ARCHIVE-NOTE.md)
+- [当时的文档入口](2026-07-four-scene-model/README.md)
+
+## 2026-07 产品验证记录
+
+这一组材料记录四场景模型封板前的文档审计、用户旅程和 HTML 原型，仅用于追溯。
+
+- [归档说明](2026-07-product-validation/README.md)
+- [文档审计](2026-07-product-validation/document-audit-2026-07-16.md)
+- [历史原型](2026-07-product-validation/product-prototype/index.html)
+
 ## V1 工程基线
 
 - [架构设计](v1/architecture.md)

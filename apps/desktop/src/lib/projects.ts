@@ -171,6 +171,25 @@ export function deploymentNeedsActionStatus(
   environment: DeploymentRun["environment"],
   actionKind?: string | null,
 ) {
+  if (environment === "deployment") {
+    if (
+      actionKind === "route-check" ||
+      actionKind === "route-repair" ||
+      actionKind === "deployment-path-route-check" ||
+      actionKind === "deployment-path-route-repair"
+    ) {
+      return "应用已部署，访问地址待处理";
+    }
+    if (
+      actionKind === "route-takeover" ||
+      actionKind === "deployment-path-route-takeover"
+    ) {
+      return "访问地址等待确认";
+    }
+    if (actionKind === "cnb-builds") return "还差代码平台授权";
+    if (actionKind === "verify-release") return "部署结果还需要核对";
+    return "上线需要处理";
+  }
   if (actionKind === "route-check") {
     return environment === "production"
       ? "正式版已部署，还差地址"
@@ -204,17 +223,21 @@ export function recentProjectStatus(
 ) {
   if (!project.pathExists) return "需要重新找到项目";
   if (task?.status === "queued" || task?.status === "running") {
-    return task.environment === "production"
-      ? "正在发布正式版"
-      : "正在部署测试版";
+    return task.environment === "deployment"
+      ? "正在上线"
+      : task.environment === "production"
+        ? "正在发布正式版"
+        : "正在部署测试版";
   }
   if (task?.status === "needs_action") {
     return deploymentNeedsActionStatus(task.environment, task.actionKind);
   }
   if (task?.status === "failed") {
-    return task.environment === "production"
-      ? "正式发布没有完成"
-      : "测试部署没有完成";
+    return task.environment === "deployment"
+      ? "上次上线没有完成"
+      : task.environment === "production"
+        ? "正式发布没有完成"
+        : "测试部署没有完成";
   }
   if (project.activeRunCount) return "正在部署";
   if (verificationTask) return "等待确认测试结果";
@@ -235,16 +258,20 @@ export function recentProjectStatus(
       : "上线设置需要处理";
   }
   if (project.latestStatus === "failed") {
-    return project.latestEnvironment === "production"
-      ? "正式发布没有完成"
-      : project.latestEnvironment === "staging"
-        ? "测试部署没有完成"
-        : "上次上线没有完成";
+    return project.latestEnvironment === "deployment"
+      ? "上次上线没有完成"
+      : project.latestEnvironment === "production"
+        ? "正式发布没有完成"
+        : project.latestEnvironment === "staging"
+          ? "测试部署没有完成"
+          : "上次上线没有完成";
   }
   if (project.latestStatus === "success") {
-    return project.latestEnvironment === "production"
-      ? "正式版可以访问"
-      : "测试版正在运行";
+    return project.latestEnvironment === "deployment"
+      ? "已经上线"
+      : project.latestEnvironment === "production"
+        ? "正式版可以访问"
+        : "测试版正在运行";
   }
   return project.currentStep === "workspace"
     ? "尚未开始上线"

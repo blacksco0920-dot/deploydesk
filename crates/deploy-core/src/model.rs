@@ -646,6 +646,20 @@ pub struct PublicRouteCheck {
     pub message: String,
 }
 
+/// One user-facing public address check. Unlike `PublicRouteCheck`, this keeps
+/// the host as a first-class value and uses an explicit HTTP status field so a
+/// desktop client can render each configured address independently.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicRouteStatus {
+    pub host: String,
+    pub url: String,
+    pub phase: String,
+    pub reachable: bool,
+    pub http_status: Option<u16>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DnsProviderHint {

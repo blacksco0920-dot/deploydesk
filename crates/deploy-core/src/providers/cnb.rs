@@ -444,12 +444,44 @@ fn valid_revision(value: &str) -> bool {
     (7..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+#[must_use]
+pub fn missing_permission_scopes(message: &str) -> Vec<&'static str> {
+    const KNOWN_SCOPES: [&str; 8] = [
+        "repo-code:r",
+        "repo-code:rw",
+        "repo-cnb-history:r",
+        "repo-cnb-detail:r",
+        "repo-manage:r",
+        "repo-manage:rw",
+        "repo-cnb-trigger:rw",
+        "group-resource:rw",
+    ];
+
+    KNOWN_SCOPES
+        .into_iter()
+        .filter(|scope| {
+            message.match_indices(scope).any(|(start, matched)| {
+                let before = message[..start].chars().next_back();
+                let after = message[start + matched.len()..].chars().next();
+                !before.is_some_and(is_scope_character) && !after.is_some_and(is_scope_character)
+            })
+        })
+        .collect()
+}
+
+fn is_scope_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | ':')
+}
+
 fn permission_hint(status: u16, message: &str) -> String {
     if status != 403 {
         return message.to_string();
     }
-    "权限不足。读取构建历史需要 repo-cnb-history:r，读取设置需要 repo-manage:r，修改设置需要 repo-manage:rw，触发构建需要 repo-cnb-trigger:rw，创建仓库需要 group-resource:rw。"
-        .to_string()
+    let scopes = missing_permission_scopes(message);
+    if scopes.is_empty() {
+        return "权限不足。请检查令牌的授权范围与使用范围是否适用于当前仓库。".to_string();
+    }
+    format!("权限不足。缺少授权范围：{}。", scopes.join("、"))
 }
 
 #[cfg(test)]
@@ -476,6 +508,35 @@ mod tests {
         assert!(message.contains("repo-cnb-history:r"));
         assert!(!message.contains("errmsg"));
         assert!(!message.contains("Missing required scopes"));
+    }
+
+    #[test]
+    fn permission_errors_only_name_scopes_reported_by_cnb() {
+        let message = permission_hint(
+            403,
+            r#"{"errmsg":"Missing required scopes: repo-code:rw, repo-cnb-history:r, repo-cnb-detail:r, repo-manage:rw, repo-cnb-trigger:rw","request":"private"}"#,
+        );
+        assert!(message.contains("repo-code:rw"));
+        assert!(message.contains("repo-cnb-history:r"));
+        assert!(message.contains("repo-cnb-detail:r"));
+        assert!(message.contains("repo-manage:rw"));
+        assert!(message.contains("repo-cnb-trigger:rw"));
+        assert!(!message.contains("repo-code:r、"));
+        assert!(!message.contains("repo-manage:r、"));
+        assert!(!message.contains("private"));
+    }
+
+    #[test]
+    fn unknown_permission_errors_do_not_echo_the_remote_response() {
+        let message = permission_hint(
+            403,
+            r#"{"errmsg":"token is not valid for private-repository-name"}"#,
+        );
+        assert_eq!(
+            message,
+            "权限不足。请检查令牌的授权范围与使用范围是否适用于当前仓库。"
+        );
+        assert!(!message.contains("private-repository-name"));
     }
 
     #[test]

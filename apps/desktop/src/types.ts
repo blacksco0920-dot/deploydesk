@@ -129,6 +129,16 @@ export interface WorkspacePreview {
   validation: ManifestValidation;
   plan: DeploymentPlan;
   manifestExists: boolean;
+  adoption: WorkspaceAdoption;
+}
+
+export interface WorkspaceAdoption {
+  mode: "pending" | "managed" | "fresh";
+  detected: boolean;
+  repository: string | null;
+  pipelineExists: boolean;
+  historyImportAfter: string | null;
+  freshDraft: boolean;
 }
 
 export interface ToolStatus {
@@ -211,6 +221,93 @@ export interface SecretStatus {
   stored: boolean;
 }
 
+export type ConnectionKind = "source" | "registry" | "server";
+export type ConnectionStatus =
+  "unknown" | "configured" | "ready" | "needs_authorization" | "error";
+
+export interface ConnectionResource {
+  id: string;
+  kind: ConnectionKind;
+  provider: string;
+  name: string;
+  status: ConnectionStatus;
+  lastCheckedAt: string | null;
+  capabilities: string[];
+  metadata: Record<string, string>;
+}
+
+export interface EnvironmentConnectionBindings {
+  targetConnectionId: string | null;
+  registryConnectionId: string | null;
+}
+
+export interface ProjectConnectionBindings {
+  sourceConnectionId: string | null;
+  staging: EnvironmentConnectionBindings;
+  production: EnvironmentConnectionBindings;
+}
+
+export type DeploymentPathState =
+  "draft" | "ready" | "deploying" | "online" | "needs_action";
+
+export interface DeploymentPathRoute {
+  service: string;
+  host: string;
+  path: string;
+}
+
+/**
+ * One user-defined route from the current local project to one runtime target.
+ *
+ * Connections are reusable application resources. Runtime configuration and
+ * the public address remain scoped to this path and are never inferred from a
+ * provider-specific staging/production slot.
+ */
+export interface DeploymentPath {
+  id: string;
+  projectPath: string;
+  name: string;
+  sourceConnectionId: string | null;
+  registryConnectionId: string | null;
+  serverId: string | null;
+  configProfileIds: string[];
+  address: string;
+  routes: DeploymentPathRoute[];
+  state: DeploymentPathState;
+  lastRunId: string | null;
+  lastSuccessfulRevision: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DeploymentPathInput {
+  id?: string;
+  projectPath: string;
+  name: string;
+  sourceConnectionId: string | null;
+  registryConnectionId: string | null;
+  serverId: string | null;
+  configProfileIds: string[];
+  address: string;
+  routes: DeploymentPathRoute[];
+  state?: DeploymentPathState;
+  lastRunId?: string | null;
+  lastSuccessfulRevision?: string | null;
+}
+
+export interface DeploymentAttempt {
+  id: string;
+  taskId: string;
+  ordinal: number;
+  status: DeploymentRunStatus;
+  currentStage: string;
+  inputSnapshot: Record<string, unknown>;
+  output: Record<string, unknown>;
+  startedAt: string;
+  finishedAt: string | null;
+  updatedAt: string;
+}
+
 export type ConfigProfileKind =
   "ai" | "database" | "redis" | "dns" | "registry" | "custom";
 export type ConfigProfileScope = "any" | "local" | "remote";
@@ -245,6 +342,8 @@ export interface ProjectProfileBinding {
   kind: ConfigProfileKind;
   profileId: string;
 }
+
+export type EnvironmentConfigBindings = ProjectProfileBinding[];
 
 export interface RuntimeConfigRecommendation {
   content: string;
@@ -304,7 +403,8 @@ export interface PipelineIdentityResult {
   fingerprint: string;
 }
 
-export type RuntimeEnvironment = "development" | "staging" | "production";
+export type RuntimeEnvironment =
+  "development" | "staging" | "production" | `path-${string}`;
 
 export interface RuntimeSecretStatus {
   environment: RuntimeEnvironment;
@@ -368,7 +468,7 @@ export interface RecentProject {
   lastOpenedAt: string;
   pathExists: boolean;
   latestStatus: DeploymentRunStatus | null;
-  latestEnvironment: "staging" | "production" | null;
+  latestEnvironment: "staging" | "production" | "deployment" | null;
   latestMessage: string | null;
   latestRunId?: string | null;
   latestSourceRunId?: string | null;
@@ -432,6 +532,28 @@ export interface DnsProviderHint {
   nameServers: string[];
 }
 
+export type PublicRoutePhase =
+  | "dns"
+  | "domain-policy"
+  | "http"
+  | "https"
+  | "tcp"
+  | "route-conflict"
+  | "route-missing"
+  | "application"
+  | "check"
+  | "ready";
+
+/** One independent public-address check returned by the desktop runtime. */
+export interface PublicRouteStatus {
+  host: string;
+  url: string;
+  phase: PublicRoutePhase;
+  reachable: boolean;
+  httpStatus: number | null;
+  message: string;
+}
+
 export type DeploymentRunStatus =
   "queued" | "running" | "needs_action" | "success" | "failed" | "cancelled";
 
@@ -445,7 +567,7 @@ export interface DeploymentRun {
   id: string;
   projectPath: string;
   projectName: string;
-  environment: "staging" | "production";
+  environment: "staging" | "production" | "deployment";
   status: DeploymentRunStatus;
   currentStage: string;
   buildSerial: string | null;
@@ -461,6 +583,68 @@ export interface DeploymentRun {
   branch: string;
   message: string;
   completedSteps: string[];
+  /**
+   * Persisted per-address results. Optional for deployment records created by
+   * older app builds; the route-check command fills them on the next check.
+   */
+  routeChecks?: PublicRouteStatus[];
   startedAt: string;
+  updatedAt: string;
+}
+
+/**
+ * The durable state of one project environment.
+ *
+ * Deployment runs are attempts. This record is the authoritative pointer to
+ * what is actually online, so a failed newer attempt must not replace
+ * `currentVersionKey` or `currentRunId`.
+ */
+export interface ProjectEnvironment {
+  environment: EnvironmentName;
+  displayName: string;
+  status: string;
+  currentVersionKey: string | null;
+  currentRunId: string | null;
+}
+
+export type VersionValidationState = "passed" | "rejected";
+
+/**
+ * The durable business decision for one immutable staging version.
+ *
+ * `versionKey` is derived from image digests whenever they are available, so
+ * redeploying the same image keeps the same test conclusion even when the
+ * deployment run id changes.
+ */
+export interface VersionValidation {
+  versionKey: string;
+  state: VersionValidationState;
+  runId: string;
+  verifiedAt: string;
+}
+
+/**
+ * One immutable version produced by a successful staging deployment.
+ *
+ * Unlike `DeploymentRun`, this object is an asset that can be validated once
+ * and deployed to more than one environment. Failed deployment attempts never
+ * appear in this collection.
+ */
+export interface ProjectVersion {
+  id: string;
+  versionKey: string;
+  status: string;
+  commitSha: string | null;
+  sourceTitle: string | null;
+  sourceConnectionId: string | null;
+  sourceBuildId: string | null;
+  repository: string | null;
+  branch: string | null;
+  candidateTag: string | null;
+  stagingRunId: string | null;
+  artifacts: DeploymentArtifact[];
+  validation: VersionValidation | null;
+  currentEnvironments: Array<"staging" | "production">;
+  createdAt: string;
   updatedAt: string;
 }

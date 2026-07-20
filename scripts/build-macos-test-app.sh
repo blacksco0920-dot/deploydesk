@@ -19,7 +19,17 @@ CI=true APPLE_SIGNING_IDENTITY="$identity" \
   pnpm --filter @abcdeploy/desktop tauri build --bundles app --ci
 
 app_path="$root_dir/target/release/bundle/macos/ABCDeploy.app"
+binary_path="$app_path/Contents/MacOS/abcdeploy-desktop"
+entitlements_path="$root_dir/scripts/macos-development-entitlements.plist"
 xattr -cr "$app_path"
-codesign --force --deep --options runtime --sign "$identity" "$app_path"
+# Refresh the main executable before sealing the bundle. Re-signing only the
+# outer app can leave macOS with a stale local policy record for the executable;
+# AppleSystemPolicy then terminates an otherwise valid bundle before startup.
+codesign --force --options runtime --entitlements "$entitlements_path" --sign "$identity" "$binary_path"
+codesign --force --options runtime --entitlements "$entitlements_path" --sign "$identity" "$app_path"
+# Clear ordinary inherited attributes after signing. macOS may keep its own
+# protected provenance record, but the refreshed executable signature remains
+# launchable and stable across rebuilds.
+xattr -cr "$app_path"
 codesign --verify --deep --strict --verbose=2 "$app_path"
 codesign -d -r- "$app_path" 2>&1

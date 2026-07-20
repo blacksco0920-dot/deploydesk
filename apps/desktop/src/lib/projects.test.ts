@@ -168,6 +168,28 @@ describe("project guidance", () => {
         latestEnvironment: "staging",
       }),
     ).toBe("测试部署没有完成");
+    expect(
+      recentProjectStatus({
+        ...project,
+        latestStatus: "success",
+        latestEnvironment: "deployment",
+      }),
+    ).toBe("已经上线");
+    expect(
+      recentProjectStatus(project, {
+        actionKind: null,
+        environment: "deployment",
+        status: "running",
+      }),
+    ).toBe("正在上线");
+    expect(
+      recentProjectStatus({
+        ...project,
+        latestStatus: "needs_action",
+        latestEnvironment: "deployment",
+        latestActionKind: "deployment-path-route-check",
+      }),
+    ).toBe("应用已部署，访问地址待处理");
     const verifiedStagingProject = {
       ...project,
       latestStatus: "success" as const,

@@ -235,7 +235,7 @@ export function ProjectHome({
                 <LoaderCircle className="size-6 animate-spin-slow text-[var(--accent)]" />
                 <strong className="mt-4 text-sm">正在读取最近项目</strong>
                 <span className="mt-1 text-xs text-[var(--muted-foreground)]">
-                  如果有上次打开的项目，会直接恢复到原来的页面。
+                  如果有上次打开的项目，会直接回到它的发布中心。
                 </span>
               </section>
             ) : projects.length ? (
@@ -304,7 +304,7 @@ export function ProjectHome({
                             <Tooltip>
                               <TooltipTrigger asChild>
                                 <Button
-                                  aria-label={`移除 ${project.name} 的本机项目记录`}
+                                  aria-label={`从列表隐藏 ${project.name}`}
                                   className="opacity-0 group-hover:opacity-100 focus:opacity-100"
                                   onClick={() => setPendingRemoval(project)}
                                   size="icon"
@@ -313,7 +313,7 @@ export function ProjectHome({
                                   <MoreHorizontal />
                                 </Button>
                               </TooltipTrigger>
-                              <TooltipContent>移除本机项目记录</TooltipContent>
+                              <TooltipContent>从列表隐藏</TooltipContent>
                             </Tooltip>
                           </div>
                         );
@@ -377,11 +377,11 @@ export function ProjectHome({
         <DialogContent>
           <DialogHeader>
             <DialogTitle>
-              移除 {pendingRemoval?.name ?? "这个项目"} 的本机记录？
+              从列表隐藏 {pendingRemoval?.name ?? "这个项目"}？
             </DialogTitle>
             <DialogDescription>
-              只会从 ABCDeploy
-              的项目列表中移除，不会删除项目代码、部署文件或服务器数据。
+              只会从 ABCDeploy 的项目列表中隐藏。项目代码、连接、项目设置、
+              配置引用、版本和部署历史都会保留；以后重新添加同一路径时会自动恢复。
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -389,7 +389,7 @@ export function ProjectHome({
               取消
             </Button>
             <Button
-              aria-label={`确认移除 ${pendingRemoval?.name ?? "这个项目"} 的本机记录`}
+              aria-label={`确认从列表隐藏 ${pendingRemoval?.name ?? "这个项目"}`}
               onClick={() => {
                 if (pendingRemoval) onForget(pendingRemoval);
                 setPendingRemoval(null);
@@ -397,7 +397,7 @@ export function ProjectHome({
               variant="destructive"
             >
               <Trash2 />
-              移除记录
+              从列表隐藏
             </Button>
           </DialogFooter>
         </DialogContent>

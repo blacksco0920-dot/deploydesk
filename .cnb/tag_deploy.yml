@@ -1,17 +1,27 @@
-# ABCDeploy 试点：候选 Tag 只在测试部署成功并核对镜像摘要后创建。
+# 由 ABCDeploy 生成。候选 Tag 只会在测试环境健康后创建。
 environments:
-  - name: production
-    description: 把测试通过的同一镜像摘要发布到正式环境
-    title: 发布 ABCDeploy 正式官网
-    env:
-      DEPLOYDESK_ENV: production
-    permissions:
+- description: 重新部署这次已经验证的测试版本
+  env:
+    DEPLOYDESK_ENV: staging
+  name: staging
+  permissions:
+    roles:
+    - owner
+    - master
+    - developer
+  title: 重新部署测试环境
+- description: 把测试通过的同一镜像摘要发布到正式环境
+  env:
+    DEPLOYDESK_ENV: production
+  name: production
+  permissions:
+    roles:
+    - owner
+    - master
+  require:
+  - approver:
       roles:
-        - owner
-        - master
-    require:
-      - approver:
-          roles:
-            - owner
-            - master
-        title: 确认本次正式发布
+      - owner
+      - master
+    title: 确认本次正式发布
+  title: 发布正式环境

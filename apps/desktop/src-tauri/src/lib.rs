@@ -1,3 +1,5 @@
+#![allow(clippy::needless_pass_by_value)] // Tauri IPC commands intentionally deserialize owned arguments and managed state.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -13,8 +15,8 @@ use chrono::Utc;
 use deploy_core::error::DeployError;
 use deploy_core::manifest::{ManifestValidation, validate_manifest};
 use deploy_core::model::{
-    DeploymentPlan, DnsProviderHint, EnvironmentConfig, EnvironmentName, Framework,
-    InspectionReport, PackageManager, ProjectManifest, ProviderCheck, PublicRouteCheck,
+    DeploymentPlan, DnsProviderHint, DomainRoute, EnvironmentConfig, EnvironmentName, Framework,
+    InspectionReport, PackageManager, ProjectManifest, ProviderCheck, PublicRouteStatus,
     RegistryConfig, ServiceKind, SystemPreflight,
 };
 use deploy_core::plan::serialize_manifest;
@@ -23,14 +25,16 @@ use deploy_core::providers::{
     caddy,
     cnb::{
         CnbBuildRecord, CnbClient, build_records, build_revision, build_serial,
-        summarize_build_status,
+        missing_permission_scopes, summarize_build_status,
     },
     docker,
     registry::RegistryProvider,
     ssh,
 };
 use deploy_core::redact::redact_text;
-use deploy_core::render::render_project_files;
+use deploy_core::render::{
+    caddy_partial_route_activation_script, render_deployment_path_bundle, render_project_files,
+};
 use deploy_core::{
     MANIFEST_FILE, apply_local_plan, apply_plan, apply_setup_plan, build_plan,
     create_default_manifest, inspect_project, load_manifest, parse_manifest,
@@ -49,14 +53,20 @@ use zeroize::{Zeroize, Zeroizing};
 mod workspace;
 
 use workspace::{
-    ConfigProfile, DeploymentArtifact, DeploymentRun, ProjectProfileBinding, ProjectRelinkIdentity,
-    RecentProject, ServerResource, WorkspaceState, project_storage_id,
+    CNB_SOURCE_CONNECTION_ID, ConfigProfile, ConnectionResource, DeploymentArtifact,
+    DeploymentAttempt, DeploymentPath, DeploymentPathInput, DeploymentRun, ProjectAdoptionRecord,
+    ProjectConnectionBindings, ProjectEnvironment, ProjectProfileBinding, ProjectRelinkIdentity,
+    ProjectVersion, RecentProject, ServerResource, TCR_REGISTRY_CONNECTION_ID, VersionValidation,
+    WorkspaceState, project_storage_id,
 };
 
 const KEYRING_SERVICE: &str = "cloud.finagent.abcdeploy";
 const LEGACY_KEYRING_SERVICE: &str = "com.deploydesk.desktop";
 const TCR_SECRET_PREFIX: &str = "registry.tcr.v2";
 const CNB_ACCOUNT_CACHE_KEY: &str = "cnb.account.summary";
+const CNB_KEYCHAIN_UNAVAILABLE_ERROR: &str =
+    "AD-CNB-108：无法读取系统密钥库中的 CNB 授权，请重新打开应用；仍未恢复时更新 CNB 授权";
+const CNB_LOGIN_MISSING_ERROR: &str = "CNB 登录已失效，请重新连接后继续";
 const LOCAL_POSTGRES_PROFILE_ID: &str = "profile-local-postgres";
 const LOCAL_REDIS_PROFILE_ID: &str = "profile-local-redis";
 const REMOTE_INFRA_NETWORK: &str = "abcdeploy-infra";
@@ -122,6 +132,18 @@ struct WorkspacePreview {
     validation: ManifestValidation,
     plan: DeploymentPlan,
     manifest_exists: bool,
+    adoption: ProjectAdoptionPreview,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProjectAdoptionPreview {
+    mode: String,
+    detected: bool,
+    repository: Option<String>,
+    pipeline_exists: bool,
+    history_import_after: Option<String>,
+    fresh_draft: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -217,9 +239,17 @@ struct RouteConflictCheck {
     takeover_available: bool,
 }
 
-enum ServerRouteProblem {
-    Takeover(String),
-    Repair(String),
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServerRouteProblemKind {
+    Takeover,
+    Repair,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerRouteProblem {
+    kind: ServerRouteProblemKind,
+    host: String,
+    message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -412,26 +442,29 @@ fn open_project(
     path: String,
     state: State<'_, WorkspaceState>,
 ) -> Result<WorkspacePreview, String> {
-    let root = PathBuf::from(path);
+    open_project_preview(PathBuf::from(path), state.inner())
+}
+
+fn open_project_preview(root: PathBuf, state: &WorkspaceState) -> Result<WorkspacePreview, String> {
     let inspection = inspect_project(&root).map_err(public_error)?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest_exists = manifest_path.is_file();
-    let mut manifest = if manifest_exists {
+    let pipeline_exists = root.join(".cnb.yml").is_file();
+    let detected = manifest_exists || pipeline_exists;
+    let mut recorded_manifest = if manifest_exists {
         load_manifest(&manifest_path).map_err(public_error)?
     } else {
         create_default_manifest(&inspection)
     };
     if manifest_exists {
-        reconcile_detected_services(&inspection, &mut manifest);
+        reconcile_detected_services(&inspection, &mut recorded_manifest);
     }
-    let validation = validate_manifest(&manifest);
-    let manifest_yaml = serialize_manifest(&manifest).map_err(public_error)?;
-    let plan = build_plan(&root, &inspection, &manifest).map_err(public_error)?;
-    let repository_hint = repository_identity(&manifest.providers.build.repository).or_else(|| {
-        git_stdout(&root, &["remote", "get-url", "origin"])
-            .ok()
-            .and_then(|origin| repository_identity(&origin))
-    });
+    let repository_hint = repository_identity(&recorded_manifest.providers.build.repository)
+        .or_else(|| {
+            git_stdout(&root, &["remote", "get-url", "origin"])
+                .ok()
+                .and_then(|origin| repository_identity(&origin))
+        });
     let identity_fingerprint = inspection_identity_fingerprint(&inspection);
     state.remember_project_with_identity(
         &root,
@@ -441,13 +474,76 @@ fn open_project(
         repository_hint.as_deref(),
         Some(&identity_fingerprint),
     )?;
+    let adoption = state.initialize_project_adoption(&root, detected)?;
+    let fresh_draft = adoption.fresh_draft;
+    let manifest = if fresh_draft {
+        // A reset is a local workflow reset, not permission to overwrite or
+        // delete the checked-in deployment manifest. Present a new in-memory
+        // draft and keep the recorded manifest solely as adoption evidence.
+        create_default_manifest(&inspection)
+    } else {
+        recorded_manifest
+    };
+    let validation = validate_manifest(&manifest);
+    let manifest_yaml = serialize_manifest(&manifest).map_err(public_error)?;
+    let plan = build_plan(&root, &inspection, &manifest).map_err(public_error)?;
     Ok(WorkspacePreview {
         inspection,
         manifest_yaml,
         validation,
         plan,
-        manifest_exists,
+        // During a reset the checked-in file remains untouched as adoption
+        // evidence, but it is not the active ABCDeploy setup. Expose that
+        // distinction through `freshDraft` + `detected` instead of making the
+        // frontend treat the old file as an already completed setup.
+        manifest_exists: manifest_exists && !fresh_draft,
+        adoption: adoption_preview(
+            adoption,
+            detected,
+            repository_hint,
+            pipeline_exists,
+            fresh_draft,
+        ),
     })
+}
+
+fn adoption_preview(
+    adoption: ProjectAdoptionRecord,
+    detected: bool,
+    repository: Option<String>,
+    pipeline_exists: bool,
+    fresh_draft: bool,
+) -> ProjectAdoptionPreview {
+    ProjectAdoptionPreview {
+        mode: adoption.mode,
+        detected,
+        repository,
+        pipeline_exists,
+        history_import_after: adoption.history_import_after,
+        fresh_draft,
+    }
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn continue_existing_deployment(
+    path: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<WorkspacePreview, String> {
+    let root = PathBuf::from(path);
+    state.continue_existing_deployment(&root)?;
+    open_project_preview(root, state.inner())
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn reset_project_deployment(
+    path: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<WorkspacePreview, String> {
+    let root = PathBuf::from(path);
+    state.reset_project_deployment(&root)?;
+    open_project_preview(root, state.inner())
 }
 
 #[tauri::command]
@@ -562,7 +658,11 @@ fn inspection_identity_fingerprint(inspection: &InspectionReport) -> String {
 }
 
 #[tauri::command]
-fn preview_manifest(path: String, manifest_yaml: String) -> Result<WorkspacePreview, String> {
+fn preview_manifest(
+    path: String,
+    manifest_yaml: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<WorkspacePreview, String> {
     let root = PathBuf::from(path);
     let inspection = inspect_project(&root).map_err(public_error)?;
     let manifest =
@@ -572,12 +672,19 @@ fn preview_manifest(path: String, manifest_yaml: String) -> Result<WorkspacePrev
         return Err("部署配置仍有必填项或隔离问题，请先处理校验结果".to_string());
     }
     let plan = build_plan(&root, &inspection, &manifest).map_err(public_error)?;
+    let manifest_exists = root.join(MANIFEST_FILE).is_file();
+    let pipeline_exists = root.join(".cnb.yml").is_file();
+    let detected = manifest_exists || pipeline_exists;
+    let adoption = state.project_adoption(&root)?;
+    let fresh_draft = adoption.fresh_draft;
+    let repository = repository_identity(&manifest.providers.build.repository);
     Ok(WorkspacePreview {
         inspection,
         manifest_yaml,
         validation,
         plan,
-        manifest_exists: root.join(MANIFEST_FILE).is_file(),
+        manifest_exists: manifest_exists && !fresh_draft,
+        adoption: adoption_preview(adoption, detected, repository, pipeline_exists, fresh_draft),
     })
 }
 
@@ -598,6 +705,7 @@ fn apply_manifest(
         parse_manifest(&manifest_yaml, Path::new(MANIFEST_FILE)).map_err(public_error)?;
     let plan = build_plan(&root, &inspection, &manifest).map_err(public_error)?;
     let written_files = apply_plan(&root, &plan).map_err(public_error)?;
+    state.mark_project_fresh_draft_saved(&root)?;
     state.set_project_step(&root, "workspace")?;
     Ok(ApplyResult {
         plan_id: plan.id.clone(),
@@ -627,6 +735,7 @@ fn save_manifest_draft(
     // working pipeline before the user explicitly starts the first test deployment.
     // The full apply path still writes `.cnb.yml` immediately before source sync.
     let written_files = apply_setup_plan(&root, &plan).map_err(public_error)?;
+    state.mark_project_fresh_draft_saved(&root)?;
     state.set_project_step(&root, "workspace")?;
     Ok(ApplyResult {
         plan_id: plan.id.clone(),
@@ -726,6 +835,379 @@ fn set_app_setting(
     state: State<'_, WorkspaceState>,
 ) -> Result<(), String> {
     state.set_setting(&key, &value)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StoredCredentialPresence {
+    Present,
+    Missing,
+    Unavailable,
+}
+
+fn stored_credential_presence(key: &str) -> StoredCredentialPresence {
+    match read_keyring_secret_without_prompt(key) {
+        Ok(mut value) => {
+            let presence = if value.is_empty() {
+                StoredCredentialPresence::Missing
+            } else {
+                StoredCredentialPresence::Present
+            };
+            value.zeroize();
+            presence
+        }
+        Err(error) if error == "missing" => StoredCredentialPresence::Missing,
+        Err(_) => StoredCredentialPresence::Unavailable,
+    }
+}
+
+fn reconcile_compat_connections(state: &WorkspaceState) -> Result<(), String> {
+    let account = cached_cnb_account(state);
+    let cnb_present = stored_credential_presence("cnb-token");
+    let existing_cnb = state
+        .list_connections(Some("source"))?
+        .into_iter()
+        .find(|connection| connection.id == CNB_SOURCE_CONNECTION_ID);
+    let cnb_exists = existing_cnb.is_some();
+    if account.is_some() || cnb_present == StoredCredentialPresence::Present || cnb_exists {
+        let mut metadata =
+            BTreeMap::from([("endpoint".to_string(), "https://cnb.cool".to_string())]);
+        let name = if let Some(account) = account.as_ref() {
+            if !account.username.is_empty() {
+                metadata.insert("username".to_string(), account.username.clone());
+            }
+            if !account.default_namespace.is_empty() {
+                metadata.insert("namespace".to_string(), account.default_namespace.clone());
+            }
+            format!(
+                "CNB · {}",
+                account.display_name.chars().take(60).collect::<String>()
+            )
+        } else {
+            existing_cnb
+                .as_ref()
+                .map_or_else(|| "CNB".to_string(), |connection| connection.name.clone())
+        };
+        let status = match cnb_present {
+            StoredCredentialPresence::Present
+                if existing_cnb
+                    .as_ref()
+                    .is_some_and(|connection| connection.status == "ready") =>
+            {
+                "ready"
+            }
+            StoredCredentialPresence::Present => "configured",
+            StoredCredentialPresence::Missing => "needs_authorization",
+            StoredCredentialPresence::Unavailable => existing_cnb
+                .as_ref()
+                .map_or("unknown", |connection| connection.status.as_str()),
+        };
+        state.upsert_compat_connection(
+            CNB_SOURCE_CONNECTION_ID,
+            "source",
+            "cnb",
+            &name,
+            Some("cnb-token"),
+            &metadata,
+            &[
+                "repositories".to_string(),
+                "builds".to_string(),
+                "automation".to_string(),
+            ],
+            status,
+            None,
+        )?;
+    }
+
+    let settings = state.settings(&[
+        "registry.mode".to_string(),
+        "registry.tcr.namespace".to_string(),
+        "registry.tcr.v2.verified-endpoint".to_string(),
+    ])?;
+    let username_present = stored_credential_presence("registry.tcr.v2.username");
+    let password_present = stored_credential_presence("registry.tcr.v2.password");
+    let existing_tcr = state
+        .list_connections(Some("registry"))?
+        .into_iter()
+        .find(|connection| connection.id == TCR_REGISTRY_CONNECTION_ID);
+    let tcr_exists = existing_tcr.is_some();
+    let has_tcr_fact = settings
+        .get("registry.mode")
+        .is_some_and(|value| value == "tcr")
+        || settings
+            .get("registry.tcr.namespace")
+            .is_some_and(|value| !value.trim().is_empty())
+        || settings
+            .get("registry.tcr.v2.verified-endpoint")
+            .is_some_and(|value| valid_registry_host(value))
+        || username_present == StoredCredentialPresence::Present
+        || password_present == StoredCredentialPresence::Present
+        || tcr_exists;
+    if has_tcr_fact {
+        let endpoint = settings
+            .get("registry.tcr.v2.verified-endpoint")
+            .map(String::as_str)
+            .filter(|value| valid_registry_host(value))
+            .unwrap_or("ccr.ccs.tencentyun.com");
+        let mut metadata = BTreeMap::from([("endpoint".to_string(), endpoint.to_string())]);
+        if let Some(namespace) = settings
+            .get("registry.tcr.namespace")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty() && value.len() <= 240)
+        {
+            metadata.insert("namespace".to_string(), namespace.to_string());
+        }
+        let status = match (username_present, password_present) {
+            (StoredCredentialPresence::Present, StoredCredentialPresence::Present)
+                if existing_tcr
+                    .as_ref()
+                    .is_some_and(|connection| connection.status == "ready") =>
+            {
+                "ready"
+            }
+            (StoredCredentialPresence::Present, StoredCredentialPresence::Present) => "configured",
+            (StoredCredentialPresence::Unavailable, _)
+            | (_, StoredCredentialPresence::Unavailable) => existing_tcr
+                .as_ref()
+                .map_or("unknown", |connection| connection.status.as_str()),
+            _ => "needs_authorization",
+        };
+        state.upsert_compat_connection(
+            TCR_REGISTRY_CONNECTION_ID,
+            "registry",
+            "tcr",
+            "腾讯云 TCR",
+            Some("registry.tcr.v2.password"),
+            &metadata,
+            &["push".to_string(), "pull".to_string()],
+            status,
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+fn mark_cnb_connection_ready(state: &WorkspaceState, account: &CnbAccount) -> Result<(), String> {
+    let mut metadata = BTreeMap::from([("endpoint".to_string(), "https://cnb.cool".to_string())]);
+    if !account.username.trim().is_empty() {
+        metadata.insert("username".to_string(), account.username.trim().to_string());
+    }
+    if !account.default_namespace.trim().is_empty() {
+        metadata.insert(
+            "namespace".to_string(),
+            account.default_namespace.trim().to_string(),
+        );
+    }
+    let display_name = account
+        .display_name
+        .trim()
+        .chars()
+        .take(60)
+        .collect::<String>();
+    let name = if display_name.is_empty() {
+        "CNB".to_string()
+    } else {
+        format!("CNB · {display_name}")
+    };
+    let checked_at = Utc::now().to_rfc3339();
+    state.upsert_compat_connection(
+        CNB_SOURCE_CONNECTION_ID,
+        "source",
+        "cnb",
+        &name,
+        Some("cnb-token"),
+        &metadata,
+        &[
+            "repositories".to_string(),
+            "builds".to_string(),
+            "automation".to_string(),
+        ],
+        "ready",
+        Some(&checked_at),
+    )
+}
+
+fn reconcile_project_connection_bindings(
+    path: &Path,
+    state: &WorkspaceState,
+) -> Result<(), String> {
+    let manifest_path = path.join(MANIFEST_FILE);
+    if !manifest_path.is_file() {
+        return Ok(());
+    }
+    let manifest = load_manifest(&manifest_path).map_err(public_error)?;
+    if !state.connection_exists(CNB_SOURCE_CONNECTION_ID)? {
+        let metadata = BTreeMap::from([
+            ("endpoint".to_string(), "https://cnb.cool".to_string()),
+            (
+                "repository".to_string(),
+                manifest.providers.build.repository.clone(),
+            ),
+        ]);
+        state.upsert_compat_connection(
+            CNB_SOURCE_CONNECTION_ID,
+            "source",
+            "cnb",
+            "CNB",
+            Some("cnb-token"),
+            &metadata,
+            &[
+                "repositories".to_string(),
+                "builds".to_string(),
+                "automation".to_string(),
+            ],
+            "needs_authorization",
+            None,
+        )?;
+    }
+    state.bind_project_source_connection(path, Some(CNB_SOURCE_CONNECTION_ID))?;
+
+    if let RegistryConfig::Tcr {
+        registry,
+        namespace,
+    } = &manifest.providers.registry
+    {
+        let existing = state
+            .list_connections(Some("registry"))?
+            .into_iter()
+            .find(|connection| connection.id == TCR_REGISTRY_CONNECTION_ID);
+        let mut metadata = existing
+            .as_ref()
+            .map(|connection| connection.metadata.clone())
+            .unwrap_or_default();
+        metadata.insert("endpoint".to_string(), registry.clone());
+        metadata.insert("namespace".to_string(), namespace.clone());
+        state.upsert_compat_connection(
+            TCR_REGISTRY_CONNECTION_ID,
+            "registry",
+            "tcr",
+            "腾讯云 TCR",
+            Some("registry.tcr.v2.password"),
+            &metadata,
+            &["push".to_string(), "pull".to_string()],
+            existing
+                .as_ref()
+                .map_or("needs_authorization", |connection| {
+                    connection.status.as_str()
+                }),
+            existing
+                .as_ref()
+                .and_then(|connection| connection.last_checked_at.as_deref()),
+        )?;
+        for environment in ["staging", "production"] {
+            state.bind_project_registry_connection(
+                path,
+                environment,
+                Some(TCR_REGISTRY_CONNECTION_ID),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn list_connections(
+    kind: Option<String>,
+    state: State<'_, WorkspaceState>,
+) -> Result<Vec<ConnectionResource>, String> {
+    reconcile_compat_connections(state.inner())?;
+    let kind = kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    state.list_connections(kind)
+}
+
+#[tauri::command]
+fn get_project_connection_bindings(
+    path: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<ProjectConnectionBindings, String> {
+    let path = PathBuf::from(path);
+    reconcile_compat_connections(state.inner())?;
+    if state.project_adoption(&path)?.mode == "managed" {
+        reconcile_project_connection_bindings(&path, state.inner())?;
+    }
+    state.project_connection_bindings(&path)
+}
+
+#[tauri::command]
+fn list_deployment_paths(
+    path: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<Vec<DeploymentPath>, String> {
+    state.list_deployment_paths(Path::new(&path))
+}
+
+#[tauri::command]
+fn list_deployment_path_runs(
+    path_id: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<Vec<DeploymentRun>, String> {
+    state.list_deployment_path_runs(&path_id)
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
+fn save_deployment_path(
+    input: DeploymentPathInput,
+    state: State<'_, WorkspaceState>,
+) -> Result<DeploymentPath, String> {
+    reconcile_compat_connections(state.inner())?;
+    state.save_deployment_path(input)
+}
+
+#[tauri::command]
+fn delete_deployment_path(
+    project_path: String,
+    path_id: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<bool, String> {
+    state.delete_deployment_path(Path::new(&project_path), &path_id)
+}
+
+#[tauri::command]
+async fn redeploy_deployment_path_version(
+    path_id: String,
+    source_run_id: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<DeploymentRun, String> {
+    let path = state.deployment_path_by_id(&path_id)?;
+    let source = state
+        .list_deployment_path_runs(&path_id)?
+        .into_iter()
+        .find(|run| run.id == source_run_id)
+        .ok_or_else(|| "所选版本不属于当前部署线路".to_string())?;
+    if source.status != "success" || source.artifacts.is_empty() || source.commit_sha.is_none() {
+        return Err("只有已经上线并验证通过的完整版本才能重新部署".to_string());
+    }
+    let mut run = state.create_deployment_run(
+        Path::new(&path.project_path),
+        &source.project_name,
+        "deployment",
+        &source.repository,
+        &source.branch,
+    )?;
+    run.commit_sha.clone_from(&source.commit_sha);
+    run.source_title.clone_from(&source.source_title);
+    run.source_run_id = Some(source.id);
+    run.candidate_tag.clone_from(&source.candidate_tag);
+    run.artifacts.clone_from(&source.artifacts);
+    run.status = "running".to_string();
+    run.current_stage = "deploy".to_string();
+    run.message = "正在把所选历史版本重新部署到运行服务器".to_string();
+    run.completed_steps = vec!["build".to_string(), "registry".to_string()];
+    state.save_deployment_run(&run)?;
+    state.bind_deployment_path_run(&path_id, &run.id)?;
+    state.begin_deployment_attempt(&run.id)?;
+    if let Err(message) = deploy_deployment_path_to_server(&run, &path, state.inner()).await {
+        pause_deployment_path_after_deploy_error(&mut run, &message);
+        state.save_deployment_run(&run)?;
+        return Ok(run);
+    }
+    verify_deployment_path(&mut run, &path, state.inner()).await?;
+    run.updated_at = Utc::now().to_rfc3339();
+    state.save_deployment_run(&run)?;
+    Ok(run)
 }
 
 #[tauri::command]
@@ -881,6 +1363,17 @@ fn list_config_profile_bindings(
     state: State<'_, WorkspaceState>,
 ) -> Result<Vec<ProjectProfileBinding>, String> {
     state.config_profile_bindings(Path::new(&path), &environment)
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned command arguments.
+fn set_environment_config_bindings(
+    path: String,
+    environment: String,
+    profile_ids: Vec<String>,
+    state: State<'_, WorkspaceState>,
+) -> Result<Vec<ProjectProfileBinding>, String> {
+    state.set_environment_config_bindings(Path::new(&path), &environment, &profile_ids)
 }
 
 #[tauri::command]
@@ -1484,10 +1977,201 @@ async fn set_local_infrastructure_service(
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
+fn create_deployment_task(
+    path: String,
+    environment: String,
+    source_run_id: Option<String>,
+    deployment_path_id: Option<String>,
+    state: State<'_, WorkspaceState>,
+) -> Result<DeploymentRun, String> {
+    create_deployment_task_inner(
+        path,
+        environment,
+        source_run_id,
+        deployment_path_id,
+        state.inner(),
+    )
+}
+
+fn create_deployment_task_inner(
+    path: String,
+    environment: String,
+    source_run_id: Option<String>,
+    deployment_path_id: Option<String>,
+    state: &WorkspaceState,
+) -> Result<DeploymentRun, String> {
+    if !matches!(
+        environment.as_str(),
+        "staging" | "production" | "deployment"
+    ) {
+        return Err("部署任务类型不正确".to_string());
+    }
+    let root = PathBuf::from(&path);
+    if environment == "deployment"
+        && let Some(active) = state
+            .list_active_deployment_runs()?
+            .into_iter()
+            .find(|run| run.environment == "deployment" && run.project_path == path)
+    {
+        if let Some(expected_path_id) = deployment_path_id.as_deref()
+            && state
+                .deployment_path_for_run(&active.id)
+                .is_ok_and(|bound| bound.id == expected_path_id)
+        {
+            return Ok(active);
+        }
+        return Err("这个项目的另一条线路正在上线，请等待完成后再开始新的线路".to_string());
+    }
+    let manifest = load_manifest(&root.join(MANIFEST_FILE)).map_err(public_error)?;
+    let mut run = state.create_deployment_run(
+        &root,
+        &manifest.project.name,
+        &environment,
+        &manifest.providers.build.repository,
+        &manifest.source.release_branch,
+    )?;
+    run.source_run_id = source_run_id;
+    run.completed_steps.clear();
+    run.current_stage = "prepare".to_string();
+    run.message = if environment == "production" {
+        "正式发布任务已保存，正在核对目标环境".to_string()
+    } else if environment == "deployment" {
+        "上线任务已保存，正在准备当前本地项目".to_string()
+    } else {
+        "测试部署任务已保存，正在准备代码和运行环境".to_string()
+    };
+    state.save_deployment_run(&run)?;
+    if let Some(path_id) = deployment_path_id.as_deref() {
+        state.bind_deployment_path_run(path_id, &run.id)?;
+    }
+    Ok(run)
+}
+
+#[tauri::command]
+fn begin_deployment_attempt(
+    task_id: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<DeploymentAttempt, String> {
+    state.begin_deployment_attempt(&task_id)
+}
+
+#[tauri::command]
+fn list_deployment_attempts(
+    task_id: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<Vec<DeploymentAttempt>, String> {
+    state.list_deployment_attempts(&task_id)
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
+fn pause_deployment_task(
+    run_id: String,
+    current_stage: String,
+    issue_code: String,
+    message: String,
+    action_kind: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<DeploymentRun, String> {
+    let allowed_stage = matches!(
+        current_stage.as_str(),
+        "prepare" | "prepare-server" | "write-config" | "sync-source" | "trigger-build"
+    );
+    let allowed_action = matches!(
+        action_kind.as_str(),
+        "retry-staging-preparation"
+            | "retry-production-preparation"
+            | "deployment-path-preparation-retry"
+    );
+    if !allowed_stage || !allowed_action {
+        return Err("部署任务恢复位置不正确".to_string());
+    }
+    let mut run = state.deployment_run(&run_id)?;
+    if matches!(run.status.as_str(), "success" | "cancelled") {
+        return Err("已经结束的部署任务不能改成等待处理".to_string());
+    }
+    run.status = "needs_action".to_string();
+    run.current_stage = current_stage;
+    run.issue_code = Some(if issue_code.starts_with("AD-") {
+        issue_code
+    } else {
+        "AD-APP-001".to_string()
+    });
+    run.action_kind = Some(action_kind);
+    run.action_url = None;
+    run.message = public_error(message);
+    run.updated_at = Utc::now().to_rfc3339();
+    state.save_deployment_run(&run)?;
+    Ok(run)
+}
+
+#[tauri::command]
+fn prepare_deployment_path_retry(
+    run_id: String,
+    repaired_node: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<DeploymentRun, String> {
+    prepare_deployment_path_retry_inner(run_id, repaired_node, state.inner())
+}
+
+fn prepare_deployment_path_retry_inner(
+    run_id: String,
+    repaired_node: String,
+    state: &WorkspaceState,
+) -> Result<DeploymentRun, String> {
+    let mut run = state.deployment_run(&run_id)?;
+    if run.environment != "deployment" || run.status != "needs_action" {
+        return Err("当前上线任务不在等待修复状态".to_string());
+    }
+    let label = match repaired_node.as_str() {
+        "local" => {
+            run.current_stage = "local".to_string();
+            "本地项目"
+        }
+        "build" => {
+            run.current_stage = "build".to_string();
+            "构建服务"
+        }
+        "registry" => {
+            run.current_stage = "registry".to_string();
+            "版本仓库"
+        }
+        "server" => {
+            // Existing artifacts must be copied to a newly selected server;
+            // a repaired address/server therefore resumes at deploy, not at a
+            // passive public check.
+            run.current_stage = if run.artifacts.is_empty() {
+                "server".to_string()
+            } else {
+                "deploy".to_string()
+            };
+            "运行服务器"
+        }
+        "routes" => {
+            // Public routing is an independent reconciliation step. When only
+            // the address changes, keep the already-running immutable images
+            // and resume at verification instead of recreating containers.
+            run.current_stage = "server".to_string();
+            "访问地址"
+        }
+        _ => return Err("要继续的线路节点不正确".to_string()),
+    };
+    run.issue_code = None;
+    run.action_kind = Some("deployment-path-retry".to_string());
+    run.action_url = None;
+    run.message = format!("{label}的新配置已经验证，点击“继续上线”后从这里继续");
+    run.updated_at = Utc::now().to_rfc3339();
+    state.save_deployment_run(&run)?;
+    Ok(run)
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
 async fn start_staging_deployment(
     path: String,
     expected_revision: Option<String>,
     prefer_push_build: bool,
+    task_id: Option<String>,
     state: State<'_, WorkspaceState>,
 ) -> Result<DeploymentRun, String> {
     let root = PathBuf::from(&path);
@@ -1496,18 +2180,40 @@ async fn start_staging_deployment(
     if !validation.valid {
         return Err("部署配置仍有必填项或隔离问题，请先处理校验结果".to_string());
     }
-    let mut run = state.create_deployment_run(
-        &root,
-        &manifest.project.name,
-        "staging",
-        &manifest.providers.build.repository,
-        &manifest.source.release_branch,
-    )?;
+    let mut run = if let Some(task_id) = task_id {
+        let run = state.deployment_run(&task_id)?;
+        if run.environment != "staging" || run.project_path != path {
+            return Err("保存的部署任务与当前项目不一致".to_string());
+        }
+        run
+    } else {
+        state.create_deployment_run(
+            &root,
+            &manifest.project.name,
+            "staging",
+            &manifest.providers.build.repository,
+            &manifest.source.release_branch,
+        )?
+    };
+    run.repository
+        .clone_from(&manifest.providers.build.repository);
+    run.branch.clone_from(&manifest.source.release_branch);
     run.commit_sha = checked_git_revision(expected_revision.as_deref())?;
     run.source_title = run
         .commit_sha
         .as_deref()
         .and_then(|revision| local_git_title(&root, revision));
+    run.status = "queued".to_string();
+    run.current_stage = "trigger-build".to_string();
+    run.action_kind = None;
+    run.action_url = None;
+    run.issue_code = None;
+    run.message = "代码版本已保存，正在请求 CNB 开始构建".to_string();
+    run.updated_at = Utc::now().to_rfc3339();
+    // 完整 SHA 必须在任何远程构建触发前落库。即使进程在 CNB 接受
+    // 请求后退出，重启时仍能按同一 SHA 找回同一个任务。
+    state.save_deployment_run(&run)?;
+    state.begin_deployment_attempt(&run.id)?;
     state.set_project_step(&root, "deploying")?;
     if cloud_setup_required(&manifest) {
         run.status = "needs_action".to_string();
@@ -1520,7 +2226,61 @@ async fn start_staging_deployment(
         state.save_deployment_run(&run)?;
         return Ok(run);
     }
-    Ok(trigger_cnb_run(run, "api_trigger_staging", None, prefer_push_build, &state).await)
+    trigger_cnb_run(run, "api_trigger_staging", None, prefer_push_build, &state).await
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
+async fn start_deployment_path(
+    path: String,
+    expected_revision: String,
+    task_id: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<DeploymentRun, String> {
+    start_deployment_path_inner(path, expected_revision, task_id, state.inner()).await
+}
+
+async fn start_deployment_path_inner(
+    path: String,
+    expected_revision: String,
+    task_id: String,
+    state: &WorkspaceState,
+) -> Result<DeploymentRun, String> {
+    let root = PathBuf::from(&path);
+    let manifest = load_manifest(&root.join(MANIFEST_FILE)).map_err(public_error)?;
+    let validation = validate_manifest(&manifest);
+    if !validation.valid {
+        return Err("项目设置还有必填项，请先完成本地项目节点".to_string());
+    }
+    let mut run = state.deployment_run(&task_id)?;
+    if run.environment != "deployment" || run.project_path != path {
+        return Err("保存的上线任务与当前部署线路不一致".to_string());
+    }
+    let revision = checked_git_revision(Some(&expected_revision))?
+        .ok_or_else(|| "无法确认本次本地项目快照".to_string())?;
+    run.repository
+        .clone_from(&manifest.providers.build.repository);
+    run.branch.clone_from(&manifest.source.release_branch);
+    run.commit_sha = Some(revision.clone());
+    run.source_title = local_git_title(&root, &revision);
+    run.status = "queued".to_string();
+    run.current_stage = "build".to_string();
+    run.action_kind = Some("deployment-path-build".to_string());
+    run.action_url = None;
+    run.issue_code = None;
+    run.message = "当前本地项目已经同步，构建服务正在生成可运行版本".to_string();
+    run.completed_steps = vec!["snapshot-source".to_string(), "sync-source".to_string()];
+    run.updated_at = Utc::now().to_rfc3339();
+    state.save_deployment_run(&run)?;
+    state.begin_deployment_attempt(&run.id)?;
+    trigger_cnb_run(
+        run,
+        "api_trigger_deployment_path_build",
+        Some(&revision),
+        true,
+        state,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1554,7 +2314,8 @@ async fn resume_staging_deployment(
     run.message = "持续部署连接已完成，正在请求 CNB 构建".to_string();
     run.updated_at = Utc::now().to_rfc3339();
     state.save_deployment_run(&run)?;
-    Ok(trigger_cnb_run(run, "api_trigger_staging", None, true, &state).await)
+    state.begin_deployment_attempt(&run.id)?;
+    trigger_cnb_run(run, "api_trigger_staging", None, true, &state).await
 }
 
 fn cloud_setup_required(manifest: &deploy_core::model::ProjectManifest) -> bool {
@@ -1575,6 +2336,7 @@ fn cloud_setup_required(manifest: &deploy_core::model::ProjectManifest) -> bool 
 #[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
 async fn promote_production_deployment(
     source_run_id: String,
+    task_id: Option<String>,
     state: State<'_, WorkspaceState>,
 ) -> Result<DeploymentRun, String> {
     let source = state.deployment_run(&source_run_id)?;
@@ -1587,26 +2349,37 @@ async fn promote_production_deployment(
     if source.artifacts.is_empty() {
         return Err("AD-REL-201: 尚未读取到测试环境的实际版本，请重新检查服务器连接".to_string());
     }
-    let mut run = state.create_deployment_run(
-        Path::new(&source.project_path),
-        &source.project_name,
-        "production",
-        &source.repository,
-        &source.branch,
-    )?;
+    let mut run = if let Some(task_id) = task_id {
+        let run = state.deployment_run(&task_id)?;
+        if run.environment != "production" || run.project_path != source.project_path {
+            return Err("保存的正式发布任务与当前版本不一致".to_string());
+        }
+        run
+    } else {
+        state.create_deployment_run(
+            Path::new(&source.project_path),
+            &source.project_name,
+            "production",
+            &source.repository,
+            &source.branch,
+        )?
+    };
+    run.repository.clone_from(&source.repository);
+    run.branch.clone_from(&source.branch);
     run.commit_sha = Some(revision.clone());
     run.source_title.clone_from(&source.source_title);
     run.source_run_id = Some(source.id);
     run.candidate_tag = source.candidate_tag;
     state.save_deployment_run(&run)?;
-    Ok(trigger_cnb_run(
+    state.begin_deployment_attempt(&run.id)?;
+    trigger_cnb_run(
         run,
         "api_trigger_production",
         Some(&revision),
         false,
         &state,
     )
-    .await)
+    .await
 }
 
 #[tauri::command]
@@ -1615,7 +2388,11 @@ async fn refresh_deployment(
     run_id: String,
     state: State<'_, WorkspaceState>,
 ) -> Result<DeploymentRun, String> {
-    let mut run = state.deployment_run(&run_id)?;
+    let run = state.deployment_run(&run_id)?;
+    if run.environment == "deployment" {
+        return refresh_deployment_path(run, state.inner()).await;
+    }
+    let mut run = run;
     if matches!(run.status.as_str(), "success" | "failed" | "cancelled") {
         if run.status == "success" {
             if run.artifacts.is_empty() {
@@ -1628,7 +2405,7 @@ async fn refresh_deployment(
                 {
                     // 正式地址可能在部署后被共享 Caddy 的旧配置重新占用。
                     // 即使 HTTPS 仍能打开，也必须重新确认它仍指向本次发布。
-                    verify_public_routes(&mut run, &state).await;
+                    verify_public_routes(&mut run, &state).await?;
                 }
             }
             run.updated_at = Utc::now().to_rfc3339();
@@ -1636,11 +2413,8 @@ async fn refresh_deployment(
         }
         return Ok(run);
     }
-    if matches!(
-        run.action_kind.as_deref(),
-        Some("route-check" | "route-repair")
-    ) {
-        verify_public_routes(&mut run, &state).await;
+    if deployment_needs_public_route_recheck(run.action_kind.as_deref()) {
+        verify_public_routes(&mut run, &state).await?;
         run.updated_at = Utc::now().to_rfc3339();
         state.save_deployment_run(&run)?;
         return Ok(run);
@@ -1654,7 +2428,7 @@ async fn refresh_deployment(
             && (run.environment == "production"
                 || run.action_kind.as_deref() != Some("local-preview"))
         {
-            verify_public_routes(&mut run, &state).await;
+            verify_public_routes(&mut run, &state).await?;
         }
         run.updated_at = Utc::now().to_rfc3339();
         state.save_deployment_run(&run)?;
@@ -1663,13 +2437,10 @@ async fn refresh_deployment(
     let token = match read_keyring_secret("cnb-token") {
         Ok(value) => Zeroizing::new(value),
         Err(error) => {
+            let (issue_code, message) = cnb_keyring_issue(&error);
             run.status = "needs_action".to_string();
-            run.issue_code = Some("AD-CNB-101".to_string());
-            run.message = if error == "missing" {
-                "CNB 登录已失效，请重新连接后继续".to_string()
-            } else {
-                public_error(error)
-            };
+            run.issue_code = Some(issue_code.to_string());
+            run.message = message.to_string();
             run.updated_at = Utc::now().to_rfc3339();
             state.save_deployment_run(&run)?;
             return Ok(run);
@@ -1761,6 +2532,982 @@ async fn refresh_deployment(
         state.set_project_step(Path::new(&run.project_path), "workspace")?;
     }
     Ok(run)
+}
+
+/// Continues one user-visible deployment path. CNB only builds an immutable
+/// candidate; the desktop owns registry promotion, server mutation and the
+/// final public check so a build service can never silently choose a runtime
+/// target.
+async fn refresh_deployment_path(
+    mut run: DeploymentRun,
+    state: &WorkspaceState,
+) -> Result<DeploymentRun, String> {
+    let path = state.deployment_path_for_run(&run.id)?;
+    if path.project_path != run.project_path {
+        return Err("上线任务与部署线路不属于同一个项目".to_string());
+    }
+    if matches!(run.status.as_str(), "failed" | "cancelled") {
+        return Ok(run);
+    }
+    if run.status == "needs_action" {
+        // A user-initiated continuation is a new real attempt. The task and
+        // immutable build stay the same, while the repaired node bindings are
+        // frozen into a fresh append-only attempt before external work resumes.
+        state.begin_deployment_attempt(&run.id)?;
+    }
+
+    // Once the immutable artifacts exist, refresh means “continue from the
+    // server”, never “build another version”. This is what makes a repaired
+    // domain or server connection resume the same task.
+    if !run.artifacts.is_empty() {
+        if run.status != "success" && run.current_stage == "deploy" {
+            match deploy_deployment_path_to_server(&run, &path, state).await {
+                Ok(()) => {}
+                Err(message) => {
+                    pause_deployment_path_after_deploy_error(&mut run, &message);
+                    state.save_deployment_run(&run)?;
+                    return Ok(run);
+                }
+            }
+        }
+        verify_deployment_path(&mut run, &path, state).await?;
+        run.updated_at = Utc::now().to_rfc3339();
+        state.save_deployment_run(&run)?;
+        return Ok(run);
+    }
+
+    let token = match read_keyring_secret("cnb-token") {
+        Ok(value) => Zeroizing::new(value),
+        Err(error) => {
+            let (issue_code, message) = cnb_keyring_issue(&error);
+            pause_deployment_path(
+                &mut run,
+                "build",
+                issue_code,
+                "deployment-path-build-connection",
+                message,
+            );
+            state.save_deployment_run(&run)?;
+            return Ok(run);
+        }
+    };
+    let client = CnbClient::new(token.as_str()).map_err(public_error)?;
+    let serial = if let Some(serial) = run.build_serial.clone() {
+        serial
+    } else if let Some(revision) = run.commit_sha.as_deref() {
+        match recover_triggered_build(&client, &run.repository, revision, "deployment", 4).await {
+            Ok(Some(serial)) => {
+                run.build_serial = Some(serial.clone());
+                serial
+            }
+            Ok(None) => {
+                pause_deployment_path(
+                    &mut run,
+                    "build",
+                    "AD-CNB-202",
+                    "deployment-path-build-retry",
+                    "构建服务还没有找到这次本地项目快照，请重新开始上线",
+                );
+                state.save_deployment_run(&run)?;
+                return Ok(run);
+            }
+            Err(message) if message.contains("repo-cnb-history:r") => {
+                pause_deployment_path(
+                    &mut run,
+                    "build",
+                    "AD-CNB-103",
+                    "deployment-path-build-connection",
+                    "构建已开始，但当前授权无法读取结果；更新构建服务授权后可以继续同一次上线",
+                );
+                state.save_deployment_run(&run)?;
+                return Ok(run);
+            }
+            Err(message) => return Err(message),
+        }
+    } else {
+        pause_deployment_path(
+            &mut run,
+            "local",
+            "AD-GIT-102",
+            "deployment-path-source-retry",
+            "这次上线缺少本地项目快照，请重新开始上线",
+        );
+        state.save_deployment_run(&run)?;
+        return Ok(run);
+    };
+
+    match client.build_status(&run.repository, &serial).await {
+        Ok(payload) => {
+            if let Some(revision) = build_revision(&payload) {
+                run.commit_sha = Some(revision);
+            }
+            update_run_from_cnb(&mut run, &payload);
+            if run.status == "failed" {
+                if let Some(pipeline_id) = summarize_build_status(&payload).pipeline_ids.first()
+                    && let Ok(log) = client.runner_log(&run.repository, pipeline_id).await
+                {
+                    apply_runner_log_diagnostic(&mut run, &log);
+                }
+                run.updated_at = Utc::now().to_rfc3339();
+                state.save_deployment_run(&run)?;
+                return Ok(run);
+            }
+            if run.status != "success" {
+                run.current_stage = "build".to_string();
+                run.message = "构建服务正在生成可运行版本".to_string();
+                run.updated_at = Utc::now().to_rfc3339();
+                state.save_deployment_run(&run)?;
+                return Ok(run);
+            }
+        }
+        Err(error) => {
+            let message = cnb_public_error(error);
+            let issue = if message.contains("repo-cnb-history:r") {
+                "AD-CNB-103"
+            } else {
+                "AD-CNB-204"
+            };
+            pause_deployment_path(
+                &mut run,
+                "build",
+                issue,
+                "deployment-path-build-connection",
+                &message,
+            );
+            state.save_deployment_run(&run)?;
+            return Ok(run);
+        }
+    }
+
+    run.status = "running".to_string();
+    run.current_stage = "registry".to_string();
+    run.issue_code = None;
+    run.action_kind = None;
+    run.action_url = None;
+    run.message = "可运行版本已经生成，正在保存到版本仓库".to_string();
+    run.completed_steps = vec![
+        "snapshot-source".to_string(),
+        "sync-source".to_string(),
+        "build".to_string(),
+    ];
+    run.updated_at = Utc::now().to_rfc3339();
+    state.save_deployment_run(&run)?;
+
+    match transfer_deployment_path_artifacts(&run, &path, state).await {
+        Ok(artifacts) => run.artifacts = artifacts,
+        Err(message) => {
+            pause_deployment_path(
+                &mut run,
+                "registry",
+                "AD-REG-201",
+                "deployment-path-registry-retry",
+                &message,
+            );
+            state.save_deployment_run(&run)?;
+            return Ok(run);
+        }
+    }
+    run.current_stage = "deploy".to_string();
+    run.message = "版本已经安全保存，正在更新运行服务器".to_string();
+    run.completed_steps.push("registry".to_string());
+    run.updated_at = Utc::now().to_rfc3339();
+    state.save_deployment_run(&run)?;
+
+    if let Err(message) = deploy_deployment_path_to_server(&run, &path, state).await {
+        pause_deployment_path_after_deploy_error(&mut run, &message);
+        state.save_deployment_run(&run)?;
+        return Ok(run);
+    }
+    verify_deployment_path(&mut run, &path, state).await?;
+    run.updated_at = Utc::now().to_rfc3339();
+    state.save_deployment_run(&run)?;
+    Ok(run)
+}
+
+fn pause_deployment_path(
+    run: &mut DeploymentRun,
+    stage: &str,
+    issue_code: &str,
+    action_kind: &str,
+    message: &str,
+) {
+    run.status = "needs_action".to_string();
+    run.current_stage = stage.to_string();
+    run.issue_code = Some(issue_code.to_string());
+    run.action_kind = Some(action_kind.to_string());
+    run.action_url = None;
+    run.message = redact_text(message);
+    run.updated_at = Utc::now().to_rfc3339();
+}
+
+fn pause_deployment_path_after_deploy_error(run: &mut DeploymentRun, message: &str) {
+    let (coded_issue, detail) = split_deployment_error(message)
+        .map_or((None, message.trim()), |(code, detail)| {
+            (Some(code), detail)
+        });
+    if coded_issue == Some("AD-SRV-206") {
+        pause_deployment_path(
+            run,
+            "server",
+            "AD-SRV-206",
+            "deployment-path-route-takeover",
+            detail,
+        );
+        return;
+    }
+    if message.contains("container ") && message.contains(" is unhealthy") {
+        pause_deployment_path(
+            run,
+            "deploy",
+            "AD-CTR-201",
+            "deployment-path-image-update",
+            "项目服务没有正常启动，需要检查当前版本的运行方式",
+        );
+        return;
+    }
+    let server_issue = [
+        "AD-SRV-205",
+        "AD-SRV-207",
+        "AD-SRV-209",
+        "AD-SRV-210",
+        "AD-SRV-211",
+    ]
+    .into_iter()
+    .find(|code| coded_issue == Some(*code));
+    let issue_code = coded_issue.unwrap_or("AD-DEP-201");
+    let visible_message = if coded_issue.is_some() {
+        detail
+    } else {
+        "服务器没有完成本次更新，已经完成的步骤仍然保留"
+    };
+    pause_deployment_path(
+        run,
+        server_issue.map_or("deploy", |_| "server"),
+        issue_code,
+        "deployment-path-retry",
+        visible_message,
+    );
+}
+
+fn split_deployment_error(message: &str) -> Option<(&str, &str)> {
+    let message = message.trim();
+    let (code, detail) = message
+        .split_once('：')
+        .or_else(|| message.split_once(':'))?;
+    let mut parts = code.split('-');
+    let valid = parts.next() == Some("AD")
+        && parts.next().is_some_and(|group| {
+            !group.is_empty() && group.bytes().all(|byte| byte.is_ascii_uppercase())
+        })
+        && parts.next().is_some_and(|number| {
+            number.len() == 3 && number.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && parts.next().is_none();
+    valid.then(|| (code, detail.trim()))
+}
+
+fn deployment_path_profile(
+    path: &DeploymentPath,
+    state: &WorkspaceState,
+) -> Result<ssh::SshProfile, String> {
+    let server_id = path
+        .server_id
+        .as_deref()
+        .ok_or_else(|| "请先在线路中选择运行服务器".to_string())?;
+    let server = state.server_by_id(server_id)?;
+    if !server.key_path_exists {
+        return Err("运行服务器的 SSH 私钥已移动，请重新选择".to_string());
+    }
+    Ok(ssh::SshProfile {
+        name: server.name,
+        host: server.host,
+        user: server.user,
+        port: server.port,
+        key_path: PathBuf::from(server.key_path),
+        host_fingerprint: server.host_fingerprint,
+    })
+}
+
+async fn verified_deployment_path_profile(
+    path: &DeploymentPath,
+    state: &WorkspaceState,
+) -> Result<ssh::SshProfile, String> {
+    let profile = deployment_path_profile(path, state)?;
+    let expected = profile
+        .host_fingerprint
+        .as_deref()
+        .ok_or_else(|| "请重新验证运行服务器的身份指纹".to_string())?;
+    let identity = ssh::probe_host_identity(&profile)
+        .await
+        .map_err(public_error)?;
+    if identity.fingerprint != expected {
+        return Err("运行服务器身份指纹已变化，已停止上线".to_string());
+    }
+    Ok(profile)
+}
+
+fn deployment_path_routes(path: &DeploymentPath) -> Vec<DomainRoute> {
+    path.routes
+        .iter()
+        .map(|route| DomainRoute {
+            service: route.service.clone(),
+            host: route.host.clone(),
+            path: route.path.clone(),
+        })
+        .collect()
+}
+
+fn scoped_postgres_identifier(value: &str, path_id: &str) -> String {
+    let suffix = path_id
+        .strip_prefix("path-")
+        .unwrap_or(path_id)
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(8)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let suffix = if suffix.is_empty() { "line" } else { &suffix };
+    let keep = 63_usize.saturating_sub(suffix.len() + 1);
+    let base = value.chars().take(keep).collect::<String>();
+    format!("{base}_{suffix}")
+}
+
+fn deployment_path_manifest(
+    run: &DeploymentRun,
+    path: &DeploymentPath,
+    state: &WorkspaceState,
+) -> Result<ProjectManifest, String> {
+    let mut manifest = deployment_manifest(run)?;
+    let registry_connection_id = path
+        .registry_connection_id
+        .as_deref()
+        .ok_or_else(|| "请先在线路中选择版本仓库".to_string())?;
+    let registry_connection = state.connection_by_id(registry_connection_id)?;
+    if registry_connection.kind != "registry" {
+        return Err("所选连接不是版本仓库，请重新选择".to_string());
+    }
+    if registry_connection.status != "ready" {
+        return Err("版本仓库连接尚未验证，请重新连接后继续".to_string());
+    }
+    manifest.providers.registry = match registry_connection.provider.as_str() {
+        "tcr" => {
+            let registry = registry_connection
+                .metadata
+                .get("endpoint")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| valid_registry_host(value))
+                .ok_or_else(|| "版本仓库连接缺少有效地址，请重新连接".to_string())?;
+            let namespace = registry_connection
+                .metadata
+                .get("namespace")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| valid_registry_namespace(value))
+                .ok_or_else(|| "版本仓库连接缺少有效命名空间，请重新连接".to_string())?;
+            RegistryConfig::Tcr {
+                registry: registry.to_string(),
+                namespace: namespace.to_string(),
+            }
+        }
+        "cnb" => {
+            let repository = registry_connection
+                .metadata
+                .get("repository")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| validate_repository_slug(value).is_ok())
+                .unwrap_or(&manifest.providers.build.repository);
+            RegistryConfig::Cnb {
+                repository: repository.to_string(),
+            }
+        }
+        _ => return Err("当前版本仓库类型暂不支持这条部署线路".to_string()),
+    };
+    let environment = &mut manifest.environments.production;
+    if let Some(database) = environment.database.as_mut() {
+        database.name = scoped_postgres_identifier(&database.name, &path.id);
+        database.user = scoped_postgres_identifier(&database.user, &path.id);
+    }
+    if let Some(namespace) = environment.redis_namespace.as_mut() {
+        *namespace = format!("{}:{}", namespace.trim_end_matches(':'), path.id);
+    }
+    environment.domains = deployment_path_routes(path);
+    environment.secrets_ref = None;
+    Ok(manifest)
+}
+
+async fn deployment_path_runtime_content(
+    run: &DeploymentRun,
+    path: &DeploymentPath,
+    manifest: &ProjectManifest,
+    profile: &ssh::SshProfile,
+) -> Result<Zeroizing<String>, String> {
+    let root = Path::new(&run.project_path);
+    let key = runtime_config_key(root, &path.id)?;
+    let mut stored_runtime = false;
+    let template = runtime_config_template(root, EnvironmentName::Production)?.0;
+    let mut content = match read_keyring_secret(&key) {
+        Ok(value) if !value.trim().is_empty() => {
+            stored_runtime = true;
+            value
+        }
+        Ok(mut value) => {
+            value.zeroize();
+            template.clone()
+        }
+        Err(error) if error == "missing" => template.clone(),
+        Err(error) => return Err(error),
+    };
+    let original = Zeroizing::new(content.clone());
+    let path_managed_variables = deployment_path_managed_runtime_variables(manifest);
+    let required_variables = required_runtime_variables(manifest, EnvironmentName::Production)
+        .into_iter()
+        .filter(|variable| !path_managed_variables.contains(variable))
+        .collect::<Vec<_>>();
+    content = ensure_runtime_template_variables(content, &required_variables);
+    // A persisted deployment line may predate newly discovered non-secret
+    // defaults in .env.example. Reuse those safe project defaults without
+    // making the user re-enter them, while never importing secret values or
+    // local-only addresses into a server runtime.
+    let secret_variables = manifest
+        .services
+        .iter()
+        .flat_map(|service| &service.runtime_env)
+        .filter(|variable| variable.secret)
+        .map(|variable| variable.name.clone())
+        .collect::<BTreeSet<_>>();
+    let safe_defaults = runtime_defaults(&template, &secret_variables);
+    let (merged, _) = fill_managed_runtime_dependencies(&content, &safe_defaults);
+    content.zeroize();
+    content = merged;
+    // Internal signing/session secrets do not represent an external account
+    // and should never become a setup chore for a beginner. Generate them once
+    // per deployment line, keep them in the system keychain, and reuse the
+    // same value on subsequent releases. Provider credentials remain explicit
+    // and are never synthesized here.
+    let mut generated_secrets = BTreeMap::new();
+    for variable in empty_runtime_variables(&content) {
+        if internal_runtime_secret(&variable) {
+            let value = load_or_generate_runtime_secret(root, &path.id, &variable)?;
+            generated_secrets.insert(variable, value.to_string());
+        }
+    }
+    if !generated_secrets.is_empty() {
+        let (filled, _) = fill_empty_runtime_values(&content, &generated_secrets);
+        for value in generated_secrets.values_mut() {
+            value.zeroize();
+        }
+        content.zeroize();
+        content = filled;
+    }
+    let mut managed_variables = Vec::new();
+    if manifest.environments.production.database.is_some() {
+        managed_variables.push("DATABASE_URL".to_string());
+        for variable in ["POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"] {
+            if required_variables
+                .iter()
+                .any(|required| required == variable)
+            {
+                managed_variables.push(variable.to_string());
+            }
+        }
+    }
+    if manifest.environments.production.redis_namespace.is_some() {
+        managed_variables.push("REDIS_URL".to_string());
+    }
+    // A saved URL proves only what this line used last time; it does not prove
+    // that a newly selected or rebuilt server still has the corresponding
+    // database and cache containers. Reconcile the target server on every
+    // deployment. The operation is idempotent and reuses healthy services.
+    let managed = ensure_remote_runtime_dependencies_scoped(
+        root,
+        &path.id,
+        &manifest.environments.production,
+        profile,
+    )
+    .await?;
+    let (filled, _) = replace_managed_runtime_dependencies(
+        &content,
+        &managed,
+        &managed_variables.into_iter().collect(),
+    );
+    content.zeroize();
+    content = filled;
+    let missing =
+        missing_runtime_variables(&content, &required_variables, EnvironmentName::Production);
+    if !missing.is_empty() {
+        content.zeroize();
+        return Err(format!(
+            "运行服务器还缺少 {} 项必要配置：{}",
+            missing.len(),
+            missing.join("、")
+        ));
+    }
+    if !stored_runtime || content != original.as_str() {
+        write_keyring_secret(&key, &content)?;
+    }
+    Ok(Zeroizing::new(content))
+}
+
+fn deployment_path_registry_credentials(
+    registry: &RegistryConfig,
+) -> Result<(Zeroizing<String>, Zeroizing<String>), String> {
+    match registry {
+        RegistryConfig::Cnb { .. } => Ok((
+            Zeroizing::new("cnb".to_string()),
+            Zeroizing::new(resolve_cnb_token(String::new())?),
+        )),
+        RegistryConfig::Tcr { .. } => Ok((
+            Zeroizing::new(read_keyring_secret("registry.tcr.v2.username")?),
+            Zeroizing::new(read_keyring_secret("registry.tcr.v2.password")?),
+        )),
+        RegistryConfig::Oci { .. } => Ok((
+            Zeroizing::new(read_keyring_secret("registry.oci.username")?),
+            Zeroizing::new(read_keyring_secret("registry.oci.password")?),
+        )),
+    }
+}
+
+async fn transfer_deployment_path_artifacts(
+    run: &DeploymentRun,
+    path: &DeploymentPath,
+    state: &WorkspaceState,
+) -> Result<Vec<DeploymentArtifact>, String> {
+    let manifest = deployment_path_manifest(run, path, state)?;
+    let profile = verified_deployment_path_profile(path, state).await?;
+    let revision = checked_git_revision(run.commit_sha.as_deref())?
+        .ok_or_else(|| "无法确认要保存的构建版本".to_string())?;
+    let immutable_tag = manifest
+        .release
+        .image_tag_template
+        .replace("{commit}", &revision);
+    if immutable_tag.is_empty()
+        || immutable_tag.len() > 128
+        || !immutable_tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err("项目生成的版本标识格式不正确".to_string());
+    }
+    let source_token = Zeroizing::new(resolve_cnb_token(String::new())?);
+    let (registry_user, registry_password) =
+        deployment_path_registry_credentials(&manifest.providers.registry)?;
+    let registry = RegistryProvider::new(&manifest.providers.registry);
+    let persistent_config = format!(".deploydesk/registry/{}", path.id);
+    let mut script = format!(
+        r#"set -eu
+umask 077
+SOURCE_CONFIG="$(mktemp -d "$HOME/.deploydesk-source-registry.XXXXXX")"
+PERSISTENT_CONFIG="$HOME/{persistent_config}"
+mkdir -p "$PERSISTENT_CONFIG"
+chmod 700 "$PERSISTENT_CONFIG"
+trap 'rm -rf "$SOURCE_CONFIG"' EXIT
+printf '%s' {source_token} | base64 -d | docker --config "$SOURCE_CONFIG" login docker.cnb.cool --username cnb --password-stdin >/dev/null 2>&1
+printf '%s' {registry_password} | base64 -d | docker --config "$PERSISTENT_CONFIG" login {push_registry} --username {registry_user} --password-stdin >/dev/null 2>&1
+"#,
+        persistent_config = persistent_config,
+        source_token = shell_quote(&BASE64.encode(source_token.as_bytes())),
+        registry_password = shell_quote(&BASE64.encode(registry_password.as_bytes())),
+        push_registry = shell_quote(registry.push_registry()),
+        registry_user = shell_quote(registry_user.as_str()),
+    );
+    if registry.pull_registry() != registry.push_registry() {
+        writeln!(
+            &mut script,
+            "printf '%s' {} | base64 -d | docker --config \"$PERSISTENT_CONFIG\" login {} --username {} --password-stdin >/dev/null 2>&1",
+            shell_quote(&BASE64.encode(registry_password.as_bytes())),
+            shell_quote(registry.pull_registry()),
+            shell_quote(registry_user.as_str()),
+        )
+        .expect("writing to a String is infallible");
+    }
+    for service in &manifest.services {
+        let source = format!(
+            "docker.cnb.cool/{}/{}:{immutable_tag}",
+            manifest.providers.build.repository.to_ascii_lowercase(),
+            service.image.to_ascii_lowercase(),
+        );
+        let push = registry.image_push_reference(&service.image, &immutable_tag);
+        let pull_repository = registry.pull_repository(&service.image);
+        if source == push {
+            writeln!(
+                &mut script,
+                r#"docker --config "$SOURCE_CONFIG" pull {source} >/dev/null
+DIGEST="$(docker image inspect {source} --format '{{{{range .RepoDigests}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null | sed -n 's/.*@\(sha256:[0-9a-f]\{{64\}}\)$/\1/p' | tail -n 1)"
+case "$DIGEST" in sha256:????????????????????????????????????????????????????????????????) ;; *) echo '版本仓库没有返回不可变镜像摘要' >&2; exit 1 ;; esac
+printf 'ABCDEPLOY_ARTIFACT\t%s\t%s\t%s\n' {service} {pull_repository} "$DIGEST""#,
+                source = shell_quote(&source),
+                service = shell_quote(&service.id),
+                pull_repository = shell_quote(&pull_repository),
+            )
+            .expect("writing to a String is infallible");
+        } else {
+            writeln!(
+                &mut script,
+                r#"docker --config "$SOURCE_CONFIG" pull {source} >/dev/null
+docker tag {source} {push}
+PUSH_OUTPUT="$(docker --config "$PERSISTENT_CONFIG" push {push} 2>&1)" || {{ printf '%s\n' "$PUSH_OUTPUT" >&2; exit 1; }}
+DIGEST="$(printf '%s\n' "$PUSH_OUTPUT" | sed -n 's/.*digest: \(sha256:[0-9a-f]\{{64\}}\).*/\1/p' | tail -n 1)"
+if [ -z "$DIGEST" ]; then
+  DIGEST="$(docker image inspect {push} --format '{{{{range .RepoDigests}}}}{{{{println .}}}}{{{{end}}}}' 2>/dev/null | sed -n 's/.*@\(sha256:[0-9a-f]\{{64\}}\)$/\1/p' | tail -n 1)"
+fi
+case "$DIGEST" in sha256:????????????????????????????????????????????????????????????????) ;; *) echo '版本仓库没有返回不可变镜像摘要' >&2; exit 1 ;; esac
+printf 'ABCDEPLOY_ARTIFACT\t%s\t%s\t%s\n' {service} {pull_repository} "$DIGEST""#,
+            source = shell_quote(&source),
+            push = shell_quote(&push),
+            service = shell_quote(&service.id),
+            pull_repository = shell_quote(&pull_repository),
+            )
+            .expect("writing to a String is infallible");
+        }
+    }
+    let output = ssh::execute(
+        &profile,
+        "bash -s",
+        Some(script.as_bytes()),
+        Duration::from_mins(30),
+    )
+    .await
+    .map_err(public_error);
+    script.zeroize();
+    let output = output?;
+    if output.exit_status != Some(0) {
+        return Err(redact_text(&output.stderr)
+            .lines()
+            .rfind(|line| !line.trim().is_empty())
+            .unwrap_or("版本没有保存到版本仓库")
+            .to_string());
+    }
+    let mut artifacts = output
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            (fields.next()? == "ABCDEPLOY_ARTIFACT").then(|| DeploymentArtifact {
+                service: fields.next().unwrap_or_default().to_string(),
+                image: fields.next().unwrap_or_default().to_string(),
+                digest: fields.next().unwrap_or_default().to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    artifacts.sort_by(|left, right| left.service.cmp(&right.service));
+    if artifacts.len() != manifest.services.len()
+        || artifacts.iter().any(|artifact| {
+            artifact.service.is_empty()
+                || artifact.image.is_empty()
+                || artifact.digest.len() != 71
+                || !artifact.digest.starts_with("sha256:")
+                || !artifact.digest[7..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return Err("版本仓库返回的镜像摘要不完整，已停止更新服务器".to_string());
+    }
+    Ok(artifacts)
+}
+
+async fn deploy_deployment_path_to_server(
+    run: &DeploymentRun,
+    path: &DeploymentPath,
+    state: &WorkspaceState,
+) -> Result<(), String> {
+    let manifest = deployment_path_manifest(run, path, state)?;
+    let profile = verified_deployment_path_profile(path, state).await?;
+    let caddy_check = caddy::bootstrap_server(&profile, true)
+        .await
+        .map_err(public_error)?;
+    if !caddy_check.ok {
+        return Err(provider_check_failure(&caddy_check));
+    }
+    state.remember_checked_server(&profile)?;
+    let runtime = deployment_path_runtime_content(run, path, &manifest, &profile).await?;
+    let routes = deployment_path_routes(path);
+    let bundle =
+        render_deployment_path_bundle(&manifest, &path.id, &routes).map_err(public_error)?;
+    let revision = checked_git_revision(run.commit_sha.as_deref())?
+        .ok_or_else(|| "无法确认要部署的项目版本".to_string())?;
+    let release_id = manifest
+        .release
+        .image_tag_template
+        .replace("{commit}", &revision);
+    let mut release = format!("DEPLOYDESK_RELEASE_ID={release_id}\n");
+    for service in &manifest.services {
+        let artifact = run
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.service == service.id)
+            .ok_or_else(|| format!("版本仓库缺少服务 {} 的镜像", service.id))?;
+        writeln!(
+            &mut release,
+            "DEPLOYDESK_{}_IMAGE={}@{}",
+            service.id.replace('-', "_").to_ascii_uppercase(),
+            artifact.image,
+            artifact.digest,
+        )
+        .expect("writing to a String is infallible");
+    }
+    let registry_directory = format!(".deploydesk/registry/{}", path.id);
+    let mut script = format!(
+        r#"set -eu
+umask 077
+export DOCKER_CONFIG="$HOME/{registry_directory}"
+test -d "$DOCKER_CONFIG" || {{ echo '版本仓库登录信息尚未同步到运行服务器' >&2; exit 1; }}
+REMOTE_DIRECTORY="$HOME/{remote_directory}"
+RUNTIME_FILE="$HOME/{runtime_path}"
+mkdir -p "$REMOTE_DIRECTORY" "$(dirname "$RUNTIME_FILE")"
+docker network inspect {network} >/dev/null 2>&1 || docker network create {network} >/dev/null
+printf '%s' {compose} | base64 -d >"$REMOTE_DIRECTORY/docker-compose.yml.next"
+printf '%s' {caddy} | base64 -d >"$REMOTE_DIRECTORY/Caddyfile.next"
+printf '%s' {runtime} | base64 -d >"$RUNTIME_FILE.next"
+chmod 600 "$RUNTIME_FILE.next"
+mv -f "$RUNTIME_FILE.next" "$RUNTIME_FILE"
+cp "$RUNTIME_FILE" "$REMOTE_DIRECTORY/.runtime.env.next"
+printf '%s' {release} | base64 -d >"$REMOTE_DIRECTORY/.release.env.next"
+chmod 600 "$REMOTE_DIRECTORY/.runtime.env.next" "$REMOTE_DIRECTORY/.release.env.next"
+{deploy_script}
+"#,
+        registry_directory = registry_directory,
+        remote_directory = bundle.remote_directory,
+        runtime_path = bundle.runtime_config_path,
+        network = shell_quote(&bundle.network),
+        compose = shell_quote(&BASE64.encode(bundle.compose.as_bytes())),
+        caddy = shell_quote(&BASE64.encode(bundle.caddy.as_bytes())),
+        runtime = shell_quote(&BASE64.encode(runtime.as_bytes())),
+        release = shell_quote(&BASE64.encode(release.as_bytes())),
+        deploy_script = bundle.deploy_script,
+    );
+    let output = ssh::execute(
+        &profile,
+        "bash -s",
+        Some(script.as_bytes()),
+        Duration::from_mins(25),
+    )
+    .await
+    .map_err(public_error);
+    script.zeroize();
+    release.zeroize();
+    let output = output?;
+    if output.exit_status != Some(0) {
+        let message = redact_text(&output.stderr)
+            .lines()
+            .rfind(|line| !line.trim().is_empty())
+            .unwrap_or("运行服务器没有完成更新")
+            .to_string();
+        return Err(message);
+    }
+    if let Some(host) = output.stdout.lines().find_map(|line| {
+        line.strip_prefix("ROUTE_TAKEOVER_REQUIRED\t")
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+    }) {
+        return Err(deployment_path_route_takeover_error(host));
+    }
+    if let Some(host) =
+        activate_deployment_path_routes(&profile, &bundle.route_activation_script).await?
+    {
+        return Err(deployment_path_route_takeover_error(&host));
+    }
+    Ok(())
+}
+
+fn provider_check_failure(check: &ProviderCheck) -> String {
+    let code = check.code.as_deref().unwrap_or("AD-SRV-299");
+    format!("{code}：{}", check.summary)
+}
+
+async fn activate_deployment_path_routes(
+    profile: &ssh::SshProfile,
+    script: &str,
+) -> Result<Option<String>, String> {
+    if script.trim().is_empty() {
+        return Ok(None);
+    }
+    let output = ssh::execute(
+        profile,
+        "bash -s",
+        Some(script.as_bytes()),
+        Duration::from_mins(5),
+    )
+    .await
+    .map_err(public_error)?;
+    if output.exit_status != Some(0) {
+        return Err(redact_text(&output.stderr)
+            .lines()
+            .rfind(|line| !line.trim().is_empty())
+            .unwrap_or("AD-SRV-209：访问地址没有安全加载到统一 Caddy")
+            .to_string());
+    }
+    Ok(output.stdout.lines().find_map(|line| {
+        line.strip_prefix("ROUTE_TAKEOVER_REQUIRED\t")
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(ToString::to_string)
+    }))
+}
+
+fn deployment_path_route_takeover_error(host: &str) -> String {
+    format!(
+        "AD-SRV-206：{}",
+        deployment_path_route_takeover_message(host)
+    )
+}
+
+fn deployment_path_route_takeover_message(host: &str) -> String {
+    format!(
+        "{host} 仍由服务器原有 Caddy 配置占用；应用已更新，但需要在运行服务器节点确认接管该地址"
+    )
+}
+
+async fn verify_deployment_path(
+    run: &mut DeploymentRun,
+    path: &DeploymentPath,
+    state: &WorkspaceState,
+) -> Result<(), String> {
+    let manifest = deployment_path_manifest(run, path, state)?;
+    let profile = verified_deployment_path_profile(path, state).await?;
+    let namespace = format!("{}-{}", manifest.project.name, path.id);
+    let expected = manifest
+        .services
+        .iter()
+        .map(|service| {
+            let container = format!("{namespace}-{}-1", service.id);
+            if !safe_runtime_identifier(&service.id) || !safe_runtime_identifier(&container) {
+                return Err("项目服务名称不安全，已停止检查运行服务器".to_string());
+            }
+            Ok((service.id.clone(), container))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let command = expected
+        .iter()
+        .map(|(service, container)| {
+            format!(
+                "if status=$(docker inspect --format '{{{{.State.Status}}}}' {} 2>/dev/null); then health=$(docker inspect --format '{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{else}}}}none{{{{end}}}}' {} 2>/dev/null || printf 'missing'); image=$(docker inspect --format '{{{{.Config.Image}}}}' {} 2>/dev/null || printf 'missing'); printf '%s\\t%s\\t%s\\t%s\\n' {} \"$status\" \"$health\" \"$image\"; else printf '%s\\tmissing\\tmissing\\tmissing\\n' {}; fi",
+                shell_quote(container),
+                shell_quote(container),
+                shell_quote(container),
+                shell_quote(service),
+                shell_quote(service),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let output = ssh::execute(&profile, &command, None, Duration::from_secs(30))
+        .await
+        .map_err(public_error)?;
+    if output.exit_status != Some(0) {
+        pause_deployment_path(
+            run,
+            "deploy",
+            "AD-CTR-201",
+            "deployment-path-retry",
+            "没有完成运行服务检查，请重新验证服务器连接后继续",
+        );
+        return Ok(());
+    }
+    let states = parse_deployed_service_states(&output.stdout, &expected);
+    if let Some(problem) = states.iter().find(|state| {
+        state.status != "running" || !matches!(state.health.as_str(), "healthy" | "none")
+    }) {
+        pause_deployment_path(
+            run,
+            "deploy",
+            "AD-CTR-201",
+            "deployment-path-retry",
+            &format!("运行服务 {} 启动后还没有通过健康检查", problem.service),
+        );
+        return Ok(());
+    }
+    if let Some(problem) = states.iter().find(|state| {
+        let expected_image = run
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.service == state.service)
+            .map(|artifact| format!("{}@{}", artifact.image, artifact.digest));
+        state.image.as_deref() != expected_image.as_deref()
+    }) {
+        pause_deployment_path(
+            run,
+            "deploy",
+            "AD-REL-101",
+            "deployment-path-retry",
+            &format!(
+                "运行服务 {} 还不是本次上线的版本，系统将继续更新服务器",
+                problem.service
+            ),
+        );
+        return Ok(());
+    }
+
+    let routes = deployment_path_routes(path);
+    if routes.is_empty() {
+        pause_deployment_path(
+            run,
+            "server",
+            "AD-NET-201",
+            "deployment-path-route-check",
+            "运行服务已经启动，还需要填写一个项目访问地址",
+        );
+        return Ok(());
+    }
+    let bundle =
+        render_deployment_path_bundle(&manifest, &path.id, &routes).map_err(public_error)?;
+    match activate_deployment_path_routes(&profile, &bundle.route_activation_script).await {
+        Ok(Some(host)) => {
+            pause_deployment_path(
+                run,
+                "server",
+                "AD-SRV-206",
+                "deployment-path-route-takeover",
+                &deployment_path_route_takeover_message(&host),
+            );
+            return Ok(());
+        }
+        Ok(None) => {}
+        Err(message) => {
+            pause_deployment_path_after_deploy_error(run, &message);
+            return Ok(());
+        }
+    }
+    let checks = collect_public_route_statuses(&routes, Some(&profile.host)).await;
+    run.route_checks.clone_from(&checks);
+    if let Some(failure) = checks.iter().find(|check| !check.reachable) {
+        pause_deployment_path(
+            run,
+            "server",
+            "AD-NET-201",
+            "deployment-path-route-check",
+            &format!("运行服务已经启动，访问地址还未就绪：{}", failure.message),
+        );
+        return Ok(());
+    }
+    run.status = "success".to_string();
+    run.current_stage = "complete".to_string();
+    run.issue_code = None;
+    run.action_kind = None;
+    run.action_url = checks.first().map(|check| check.url.clone());
+    run.message = format!(
+        "上线完成，{} 个运行服务和 {} 个访问地址均已验证",
+        expected.len(),
+        checks.len()
+    );
+    run.completed_steps = vec![
+        "snapshot-source".to_string(),
+        "sync-source".to_string(),
+        "build".to_string(),
+        "registry".to_string(),
+        "server".to_string(),
+        "public".to_string(),
+    ];
+    Ok(())
+}
+
+fn deployment_needs_public_route_recheck(action_kind: Option<&str>) -> bool {
+    matches!(
+        action_kind,
+        Some("route-check" | "route-repair" | "route-takeover")
+    )
 }
 
 #[tauri::command]
@@ -1973,6 +3720,7 @@ fn apply_cnb_history_permission_fallback(run: &mut DeploymentRun) {
 }
 
 async fn finalize_successful_deployment(run: &mut DeploymentRun, state: &WorkspaceState) {
+    let verifying_existing = run.action_kind.as_deref() == Some("verify-existing-deployment");
     let manifest = match deployment_manifest(run) {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -1996,9 +3744,17 @@ async fn finalize_successful_deployment(run: &mut DeploymentRun, state: &Workspa
         Err(message) => {
             run.status = "needs_action".to_string();
             run.current_stage = "verify-release".to_string();
-            run.action_kind = Some("verify-release".to_string());
+            run.action_kind = Some(if verifying_existing {
+                "verify-existing-deployment".to_string()
+            } else {
+                "verify-release".to_string()
+            });
             run.issue_code = Some("AD-REL-201".to_string());
-            run.message = message;
+            run.message = if verifying_existing {
+                "已发现已有部署；请重新验证这个环境的服务器连接，核对当前运行版本".to_string()
+            } else {
+                message
+            };
             return;
         }
     }
@@ -2033,7 +3789,22 @@ async fn finalize_successful_deployment(run: &mut DeploymentRun, state: &Workspa
         }
     }
     run.issue_code = None;
-    verify_public_routes(run, state).await;
+    if let Err(message) = verify_public_routes(run, state).await {
+        pause_public_route_inspection(run, &message);
+    }
+}
+
+fn pause_public_route_inspection(run: &mut DeploymentRun, message: &str) {
+    run.status = "needs_action".to_string();
+    run.current_stage = "healthcheck".to_string();
+    run.action_kind = Some("route-check".to_string());
+    run.action_url = None;
+    run.issue_code = Some("AD-NET-202".to_string());
+    run.message = format!(
+        "服务已经部署；这次地址检查没有完成：{}。网络恢复后会自动继续",
+        redact_text(message)
+    );
+    run.completed_steps.retain(|step| step != "healthcheck");
 }
 
 async fn capture_deployment_artifacts(
@@ -2123,6 +3894,7 @@ struct DeployedServiceState {
     container: String,
     status: String,
     health: String,
+    image: Option<String>,
 }
 
 fn parse_deployed_service_states(
@@ -2136,27 +3908,33 @@ fn parse_deployed_service_states(
             let service = fields.next()?.trim();
             let status = fields.next()?.trim();
             let health = fields.next()?.trim();
+            let image = fields
+                .next()
+                .map(str::trim)
+                .filter(|image| !image.is_empty() && *image != "missing")
+                .map(ToString::to_string);
             if service.is_empty() || status.is_empty() || health.is_empty() {
                 return None;
             }
             Some((
                 service.to_string(),
-                (status.to_string(), health.to_string()),
+                (status.to_string(), health.to_string(), image),
             ))
         })
         .collect::<BTreeMap<_, _>>();
     expected
         .iter()
         .map(|(service, container)| {
-            let (status, health) = reported
+            let (status, health, image) = reported
                 .get(service)
                 .cloned()
-                .unwrap_or_else(|| ("missing".to_string(), "missing".to_string()));
+                .unwrap_or_else(|| ("missing".to_string(), "missing".to_string(), None));
             DeployedServiceState {
                 service: service.clone(),
                 container: container.clone(),
                 status,
                 health,
+                image,
             }
         })
         .collect()
@@ -2233,7 +4011,10 @@ async fn verify_deployed_services(
     Ok(())
 }
 
-async fn verify_public_routes(run: &mut DeploymentRun, state: &WorkspaceState) {
+async fn verify_public_routes(
+    run: &mut DeploymentRun,
+    state: &WorkspaceState,
+) -> Result<(), String> {
     let manifest = match deployment_routing_manifest(run) {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -2254,78 +4035,325 @@ async fn verify_public_routes(run: &mut DeploymentRun, state: &WorkspaceState) {
                     public_error(error)
                 );
             }
-            return;
+            return Ok(());
         }
     };
     let Ok(environment) = parse_deploy_environment(&run.environment) else {
-        return;
+        return Ok(());
     };
     let routes = &manifest.environments.get(environment).domains;
     if routes.is_empty() {
+        // An empty, validated routing manifest is an authoritative result,
+        // unlike an inspection failure. Remove stale address rows only here.
+        run.route_checks.clear();
         mark_public_routes_ready(run);
-        return;
+        return Ok(());
     }
-    match check_server_route_activation(run, &manifest, state).await {
-        Ok(Some(ServerRouteProblem::Takeover(message))) => {
-            apply_server_route_takeover_problem(run, &message);
-            return;
-        }
-        Ok(Some(ServerRouteProblem::Repair(_))) => {
-            // A route generated from the current project settings can safely be
-            // repaired after the immutable containers are already running. This
-            // commonly happens on the first production release because users add
-            // the final domains after approving the test image. Do the deterministic
-            // Caddy update here instead of asking them to click a second repair step.
-            if let Err(message) = apply_deployment_routes(run, state).await {
-                apply_server_route_problem(run, &message);
-                return;
-            }
-            match check_server_route_activation(run, &manifest, state).await {
-                Ok(None) => {}
-                Ok(Some(ServerRouteProblem::Takeover(message))) => {
-                    apply_server_route_takeover_problem(run, &message);
-                    return;
-                }
-                Ok(Some(ServerRouteProblem::Repair(message))) | Err(message) => {
-                    apply_server_route_problem(run, &message);
-                    return;
-                }
-            }
-        }
+    let route_problems = match check_server_route_activation(run, &manifest, state).await {
+        Ok(problems) => problems,
         Err(message) => {
-            apply_server_route_problem(run, &message);
-            return;
+            return Err(message);
         }
-        Ok(None) => {}
-    }
+    };
     let expected_target = state
         .server_for_project(Path::new(&run.project_path), &run.environment)
         .ok()
         .flatten()
         .map(|server| server.host);
-    let mut checks = Vec::with_capacity(routes.len());
-    for route in routes {
-        checks.push(
-            deploy_core::health::check_public_route_for_target(
-                &route.host,
-                &route.path,
-                expected_target.as_deref(),
-            )
-            .await,
-        );
+    let mut checks = collect_public_route_statuses(routes, expected_target.as_deref()).await;
+    if route_problems.is_empty()
+        && let Some(message) = interrupted_route_check_message(&checks)
+    {
+        return Err(message);
+    }
+    overlay_server_route_problems(&mut checks, &route_problems);
+    run.route_checks.clone_from(&checks);
+    if apply_server_route_problems(run, &route_problems) {
+        // Status refreshes are strictly read-only. Opening a project or
+        // polling a healthy deployment must never rewrite shared Caddy
+        // configuration. The explicit repair/takeover actions own mutations.
+        return Ok(());
     }
     apply_public_route_checks(run, &checks);
+    Ok(())
+}
+
+#[tauri::command]
+async fn check_deployment_routes(
+    run_id: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<Vec<PublicRouteStatus>, String> {
+    let mut run = state.deployment_run(&run_id)?;
+    verify_public_routes(&mut run, state.inner()).await?;
+    run.updated_at = Utc::now().to_rfc3339();
+    state.save_deployment_run(&run)?;
+    Ok(run.route_checks)
+}
+
+#[tauri::command]
+async fn retry_deployment_certificates(
+    run_id: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<Vec<PublicRouteStatus>, String> {
+    let mut run = state.deployment_run(&run_id)?;
+    if run.environment != "production"
+        || run.action_kind.as_deref() != Some("route-check")
+        || run.artifacts.is_empty()
+    {
+        return Err("当前任务不需要重新申请正式地址证书".to_string());
+    }
+    let manifest = deployment_routing_manifest(&run)?;
+    let environment = parse_deploy_environment(&run.environment)?;
+    let routes = &manifest.environments.get(environment).domains;
+    if routes.is_empty() {
+        return Err("当前正式版本没有配置访问地址".to_string());
+    }
+    let expected_target = state
+        .server_for_project(Path::new(&run.project_path), &run.environment)?
+        .map(|server| server.host);
+    let mut initial = collect_public_route_statuses(routes, expected_target.as_deref()).await;
+    let route_problems = match check_server_route_activation(&run, &manifest, state.inner()).await {
+        Ok(problems) => problems,
+        Err(message) => return Err(message),
+    };
+    if route_problems.is_empty()
+        && let Some(message) = interrupted_route_check_message(&initial)
+    {
+        return Err(message);
+    }
+    overlay_server_route_problems(&mut initial, &route_problems);
+    run.route_checks.clone_from(&initial);
+    if !apply_server_route_problems(&mut run, &route_problems) {
+        apply_public_route_checks(&mut run, &initial);
+    }
+    run.updated_at = Utc::now().to_rfc3339();
+    state.save_deployment_run(&run)?;
+
+    if !route_problems.is_empty() {
+        return Ok(initial);
+    }
+    if initial.iter().all(|check| check.reachable) {
+        return Ok(initial);
+    }
+    if !certificate_retry_allowed(&initial) {
+        // DNS、域名策略或应用错误不能通过重载 Caddy 证书解决。返回逐地址
+        // 结果供页面展示，但严格不触碰服务器配置。
+        return Ok(initial);
+    }
+
+    force_reload_caddy_for_certificates(&run, &manifest, state.inner()).await?;
+
+    // Certificate authorities normally finish within seconds after DNS becomes
+    // visible. Keep the explicit user action alive for at most 45 seconds, but
+    // stop immediately if every route is ready or the failure changes layer.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let final_checks = loop {
+        let checks = collect_public_route_statuses(routes, expected_target.as_deref()).await;
+        let waiting_only_for_certificate = checks
+            .iter()
+            .filter(|check| !check.reachable)
+            .all(|check| check.phase == "https");
+        if checks.iter().all(|check| check.reachable)
+            || !waiting_only_for_certificate
+            || Instant::now() >= deadline
+        {
+            break checks;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    };
+    run.route_checks.clone_from(&final_checks);
+    apply_public_route_checks(&mut run, &final_checks);
+    run.updated_at = Utc::now().to_rfc3339();
+    state.save_deployment_run(&run)?;
+    Ok(final_checks)
+}
+
+fn certificate_retry_allowed(checks: &[PublicRouteStatus]) -> bool {
+    checks.iter().any(|check| !check.reachable)
+        && checks
+            .iter()
+            .filter(|check| !check.reachable)
+            .all(|check| check.phase == "https")
+}
+
+async fn force_reload_caddy_for_certificates(
+    run: &DeploymentRun,
+    manifest: &deploy_core::model::ProjectManifest,
+    state: &WorkspaceState,
+) -> Result<(), String> {
+    let environment = parse_deploy_environment(&run.environment)?;
+    let hosts = manifest
+        .environments
+        .get(environment)
+        .domains
+        .iter()
+        .map(|route| route.host.clone())
+        .collect::<Vec<_>>();
+    let site_name = format!("{}-{}.caddy", manifest.project.name, run.environment);
+    let profile = deployment_server_profile(run, state)?;
+    let host_payload = format!("{}\n", hosts.join("\n"));
+    let encoded_hosts = BASE64.encode(host_payload.as_bytes());
+    let script = caddy_certificate_reload_script(&site_name, &encoded_hosts, &profile.host);
+    let output = ssh::execute(
+        &profile,
+        "bash -s",
+        Some(script.as_bytes()),
+        Duration::from_secs(75),
+    )
+    .await
+    .map_err(public_error)?;
+    if output.exit_status != Some(0) {
+        return Err(format!(
+            "没有完成证书重试：{}",
+            redact_text(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("统一 Caddy 没有返回检查结果")
+        ));
+    }
+    Ok(())
+}
+
+fn caddy_certificate_reload_script(
+    site_name: &str,
+    encoded_hosts: &str,
+    expected_target: &str,
+) -> String {
+    format!(
+        r#"set -eu
+mkdir -p "$HOME/.deploydesk/locks"
+exec 9>"$HOME/.deploydesk/locks/server-deploy.lock"
+flock -w 60 9 || {{ echo '同一服务器正在执行其他部署操作' >&2; exit 75; }}
+HOSTS_FILE="$(mktemp)"
+EXPECTED_IPS_FILE="$(mktemp)"
+HOST_IPS_FILE="$(mktemp)"
+trap 'rm -f "$HOSTS_FILE" "$EXPECTED_IPS_FILE" "$HOST_IPS_FILE" "${{ACTIVE_CONFIG:-}}" "${{VALIDATE_LOG:-}}"' EXIT
+printf '%s' {encoded_hosts} | base64 --decode >"$HOSTS_FILE"
+EXPECTED_TARGET={expected_target}
+getent ahosts "$EXPECTED_TARGET" | awk '{{print $1}}' | sort -u >"$EXPECTED_IPS_FILE"
+test -s "$EXPECTED_IPS_FILE" || {{ echo '无法重新确认绑定服务器的地址，已停止证书重试' >&2; exit 1; }}
+while IFS= read -r host; do
+  [ -n "$host" ] || continue
+  getent ahosts "$host" | awk '{{print $1}}' | sort -u >"$HOST_IPS_FILE"
+  test -s "$HOST_IPS_FILE" || {{ echo "$host 当前没有可用的 DNS 解析，已停止证书重试" >&2; exit 1; }}
+  awk 'NR==FNR {{ expected[$1]=1; next }} expected[$1] {{ matched=1 }} END {{ exit matched ? 0 : 1 }}' "$EXPECTED_IPS_FILE" "$HOST_IPS_FILE" || {{ echo "$host 不再指向绑定服务器，已停止证书重试" >&2; exit 1; }}
+done <"$HOSTS_FILE"
+CADDY_CONTAINER="$(cat "$HOME/.deploydesk/caddy/container-name" 2>/dev/null || true)"
+CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || true)"
+test -n "$CADDY_CONTAINER" || {{ echo '统一 Caddy 尚未完成连接' >&2; exit 1; }}
+case "$CADDY_SITE_DIRECTORY" in /*) ;; *) echo '统一 Caddy 路由目录无效' >&2; exit 1 ;; esac
+docker inspect "$CADDY_CONTAINER" >/dev/null 2>&1 || {{ echo '统一 Caddy 当前没有运行' >&2; exit 1; }}
+SITE_NAME={site_name}
+SITE_FILE="$CADDY_SITE_DIRECTORY/$SITE_NAME"
+test -f "$SITE_FILE" || {{ echo '当前项目的 Caddy 路由文件不存在' >&2; exit 1; }}
+ACTIVE_CONFIG="$(mktemp)"
+VALIDATE_LOG="$(mktemp)"
+docker exec "$CADDY_CONTAINER" caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile >"$ACTIVE_CONFIG" 2>/dev/null || {{ echo '无法读取统一 Caddy 当前配置' >&2; exit 1; }}
+while IFS= read -r host; do
+  [ -n "$host" ] || continue
+  grep -Fq -- "$host" "$ACTIVE_CONFIG" || {{ echo "$host 还没有加载到统一 Caddy" >&2; exit 1; }}
+done <"$HOSTS_FILE"
+if ! docker exec "$CADDY_CONTAINER" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >"$VALIDATE_LOG" 2>&1; then
+  tail -n 1 "$VALIDATE_LOG" >&2
+  exit 1
+fi
+docker exec "$CADDY_CONTAINER" caddy reload --force --config /etc/caddy/Caddyfile --adapter caddyfile
+"#,
+        encoded_hosts = shell_quote(encoded_hosts),
+        expected_target = shell_quote(expected_target),
+        site_name = shell_quote(site_name),
+    )
+}
+
+async fn collect_public_route_statuses(
+    routes: &[deploy_core::model::DomainRoute],
+    expected_target: Option<&str>,
+) -> Vec<PublicRouteStatus> {
+    let expected_target = expected_target.map(str::to_string);
+    let route_inputs = routes
+        .iter()
+        .map(|route| (route.host.clone(), route.path.clone()))
+        .collect::<Vec<_>>();
+    let mut tasks = tokio::task::JoinSet::new();
+    for (position, (host, path)) in route_inputs.iter().cloned().enumerate() {
+        let target = expected_target.clone();
+        tasks.spawn(async move {
+            let status = deploy_core::health::check_public_route_status_for_target(
+                &host,
+                &path,
+                target.as_deref(),
+            )
+            .await;
+            (position, status)
+        });
+    }
+    let mut checks = vec![None; route_inputs.len()];
+    while let Some(result) = tasks.join_next().await {
+        if let Ok((position, status)) = result
+            && let Some(slot) = checks.get_mut(position)
+        {
+            *slot = Some(status);
+        }
+    }
+    checks
+        .into_iter()
+        .enumerate()
+        .map(|(position, status)| {
+            status.unwrap_or_else(|| {
+                let host = route_inputs[position].0.clone();
+                let path = route_inputs[position].1.clone();
+                interrupted_public_route_status(&host, &path)
+            })
+        })
+        .collect()
+}
+
+fn interrupted_route_check_message(checks: &[PublicRouteStatus]) -> Option<String> {
+    let interrupted = checks
+        .iter()
+        .filter(|check| !check.reachable && check.phase == "check")
+        .map(|check| check.message.trim())
+        .filter(|message| !message.is_empty())
+        .collect::<Vec<_>>();
+    if interrupted.is_empty() {
+        None
+    } else if interrupted.len() == 1 {
+        Some(interrupted[0].to_string())
+    } else {
+        Some(format!(
+            "{} 个地址检查没有完成：{}",
+            interrupted.len(),
+            interrupted.join("；")
+        ))
+    }
+}
+
+fn interrupted_public_route_status(host: &str, path: &str) -> PublicRouteStatus {
+    let scheme = if host.to_ascii_lowercase().ends_with(".sslip.io") {
+        "http"
+    } else {
+        "https"
+    };
+    let route_path = if path.starts_with('/') { path } else { "/" };
+    PublicRouteStatus {
+        host: host.to_string(),
+        url: format!("{scheme}://{host}{route_path}"),
+        phase: "check".to_string(),
+        reachable: false,
+        http_status: None,
+        message: format!("{host} 的地址检查被中断，请重新检查"),
+    }
 }
 
 async fn check_server_route_activation(
     run: &DeploymentRun,
     manifest: &deploy_core::model::ProjectManifest,
     state: &WorkspaceState,
-) -> Result<Option<ServerRouteProblem>, String> {
+) -> Result<Vec<ServerRouteProblem>, String> {
     let environment = parse_deploy_environment(&run.environment)?;
     let routes = &manifest.environments.get(environment).domains;
     if routes.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let route_targets = routes
         .iter()
@@ -2347,57 +4375,7 @@ async fn check_server_route_activation(
         .collect::<Result<Vec<_>, String>>()?;
     let profile = deployment_server_profile(run, state)?;
     let site_name = format!("{}-{}.caddy", manifest.project.name, run.environment);
-    let route_lines = route_targets.join("\n");
-    let script = format!(
-        r#"set -eu
-CADDY_CONTAINER="$(cat "$HOME/.deploydesk/caddy/container-name" 2>/dev/null || true)"
-CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || true)"
-test -n "$CADDY_CONTAINER" || {{ echo '统一 Caddy 尚未完成连接' >&2; exit 1; }}
-case "$CADDY_SITE_DIRECTORY" in /*) ;; *) echo '统一 Caddy 路由目录无效' >&2; exit 1 ;; esac
-docker inspect "$CADDY_CONTAINER" >/dev/null 2>&1 || {{ echo '统一 Caddy 当前没有运行' >&2; exit 1; }}
-SITE_FILE="$CADDY_SITE_DIRECTORY/{site_name}"
-MAIN_FILE="$(mktemp)"
-ACTIVE_CONFIG="$(mktemp)"
-trap 'rm -f "$MAIN_FILE" "$ACTIVE_CONFIG"' EXIT
-docker exec "$CADDY_CONTAINER" cat /etc/caddy/Caddyfile >"$MAIN_FILE" || {{ echo '无法读取统一 Caddy 主配置' >&2; exit 1; }}
-docker exec "$CADDY_CONTAINER" caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile >"$ACTIVE_CONFIG" 2>/dev/null || {{ echo '无法读取统一 Caddy 当前配置' >&2; exit 1; }}
-block_target() {{
-  awk -v target_host="$1" '
-    {{
-      open_line=$0; close_line=$0;
-      opens=gsub(/\{{/, "{{", open_line); closes=gsub(/\}}/, "}}", close_line);
-      site_host=$1; sub(/^https?:\/\//, "", site_host);
-      if (!inside && depth == 0 && site_host == target_host && $2 == "{{") inside=1;
-      if (inside && $1 == "reverse_proxy") {{ print $2; exit }}
-      depth += opens - closes;
-      if (inside && depth == 0) exit;
-    }}
-  ' "$2"
-}}
-while IFS="$(printf '\t')" read -r host expected; do
-  [ -n "$host" ] || continue
-  main_target="$(block_target "$host" "$MAIN_FILE")"
-  if [ -n "$main_target" ]; then
-    printf 'ABCDEPLOY_ROUTE_CONFLICT\t%s\t%s\t%s\n' "$host" "$main_target" "$expected"
-    continue
-  fi
-  if [ ! -f "$SITE_FILE" ]; then
-    printf 'ABCDEPLOY_ROUTE_MISSING\t%s\tfile\t%s\n' "$host" "$expected"
-    continue
-  fi
-  site_target="$(block_target "$host" "$SITE_FILE")"
-  if [ -z "$site_target" ]; then
-    printf 'ABCDEPLOY_ROUTE_MISSING\t%s\tfile\t%s\n' "$host" "$expected"
-  elif [ "$site_target" != "$expected" ]; then
-    printf 'ABCDEPLOY_ROUTE_MISMATCH\t%s\t%s\t%s\n' "$host" "$site_target" "$expected"
-  elif ! grep -Fq -- "$host" "$ACTIVE_CONFIG" || ! grep -Fq -- "$expected" "$ACTIVE_CONFIG"; then
-    printf 'ABCDEPLOY_ROUTE_MISSING\t%s\tactive\t%s\n' "$host" "$expected"
-  fi
-done <<'ABCDEPLOY_ROUTES'
-{route_lines}
-ABCDEPLOY_ROUTES
-"#,
-    );
+    let script = server_route_activation_script(&site_name, &route_targets);
     let output = ssh::execute(
         &profile,
         "bash -s",
@@ -2415,35 +4393,230 @@ ABCDEPLOY_ROUTES
                 .unwrap_or("服务器没有返回检查结果")
         ));
     }
-    let problem = output.stdout.lines().find_map(|line| {
-        let mut fields = line.split('\t');
-        match fields.next()? {
-            "ABCDEPLOY_ROUTE_CONFLICT" => {
-                let host = fields.next().unwrap_or("正式地址");
-                let actual = fields.next().unwrap_or("旧服务");
-                let expected = fields.next().unwrap_or("本次发布");
-                Some(ServerRouteProblem::Takeover(format!(
-                    "{host} 仍由共享 Caddy 主配置转发到 {actual}，需要切换到 {expected}"
-                )))
+    let problems = output
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            match fields.next()? {
+                "ABCDEPLOY_ROUTE_CONFLICT" => {
+                    let host = fields.next().unwrap_or("正式地址");
+                    let actual = fields.next().unwrap_or("旧服务");
+                    let expected = fields.next().unwrap_or("本次发布");
+                    Some(ServerRouteProblem {
+                        kind: ServerRouteProblemKind::Takeover,
+                        host: host.to_string(),
+                        message: format!(
+                            "{host} 仍由旧服务 {actual} 提供，需要确认后切换到新版本 {expected}"
+                        ),
+                    })
+                }
+                "ABCDEPLOY_ROUTE_MISMATCH" => {
+                    let host = fields.next().unwrap_or("正式地址");
+                    let actual = fields.next().unwrap_or("其他服务");
+                    let expected = fields.next().unwrap_or("本次发布");
+                    Some(ServerRouteProblem {
+                        kind: ServerRouteProblemKind::Repair,
+                        host: host.to_string(),
+                        message: format!(
+                            "{host} 的地址配置仍指向 {actual}，需要恢复到新版本 {expected}"
+                        ),
+                    })
+                }
+                "ABCDEPLOY_ROUTE_MISSING" => {
+                    let host = fields.next().unwrap_or("正式地址");
+                    Some(ServerRouteProblem {
+                        kind: ServerRouteProblemKind::Repair,
+                        host: host.to_string(),
+                        message: format!("{host} 已解析，但服务器尚未启用这个访问地址"),
+                    })
+                }
+                _ => None,
             }
-            "ABCDEPLOY_ROUTE_MISMATCH" => {
-                let host = fields.next().unwrap_or("正式地址");
-                let actual = fields.next().unwrap_or("其他服务");
-                let expected = fields.next().unwrap_or("本次发布");
-                Some(ServerRouteProblem::Repair(format!(
-                    "{host} 当前转发到 {actual}，应当转发到 {expected}"
-                )))
-            }
-            "ABCDEPLOY_ROUTE_MISSING" => {
-                let host = fields.next().unwrap_or("正式地址");
-                Some(ServerRouteProblem::Repair(format!(
-                    "{host} 还没有加载到统一 Caddy"
-                )))
-            }
-            _ => None,
+        })
+        .collect();
+    Ok(problems)
+}
+
+fn caddy_route_declared_shell_function() -> &'static str {
+    r#"route_declared_in_file() {
+  awk -v target_host="$1" '
+    BEGIN {
+      target=tolower(target_host);
+      sub(/^https?:\/\//, "", target);
+      sub(/:(80|443)$/, "", target);
+      sub(/\.$/, "", target);
+      depth=0;
+      found=0;
+    }
+    {
+      open_line=$0; close_line=$0;
+      opens=gsub(/\{/, "{", open_line); closes=gsub(/\}/, "}", close_line);
+      if (depth == 0 && index($0, "{") > 0) {
+        header=$0;
+        sub(/\{.*/, "", header);
+        gsub(/[[:space:]]/, "", header);
+        count=split(header, labels, ",");
+        for (i=1; i<=count; i++) {
+          candidate=tolower(labels[i]);
+          sub(/^https?:\/\//, "", candidate);
+          sub(/:(80|443)$/, "", candidate);
+          sub(/\.$/, "", candidate);
+          if (candidate == target) found=1;
         }
-    });
-    Ok(problem)
+      }
+      depth += opens - closes;
+    }
+    END { exit found ? 0 : 1 }
+  ' "$2"
+}"#
+}
+
+fn caddy_main_route_rewrite_shell_function() -> &'static str {
+    r#"rewrite_caddy_main_routes() {
+  awk -v hosts_file="$1" '
+    function normalize(value, normalized) {
+      normalized=tolower(value);
+      sub(/^https?:\/\//, "", normalized);
+      sub(/:(80|443)$/, "", normalized);
+      sub(/\.$/, "", normalized);
+      return normalized;
+    }
+    function trim(value) {
+      sub(/^[[:space:]]+/, "", value);
+      sub(/[[:space:]]+$/, "", value);
+      return value;
+    }
+    BEGIN {
+      while ((getline host < hosts_file) > 0) targets[normalize(host)]=1;
+      close(hosts_file);
+      depth=0;
+      skip=0;
+    }
+    {
+      original=$0;
+      open_line=$0; close_line=$0;
+      opens=gsub(/\{/, "{", open_line); closes=gsub(/\}/, "}", close_line);
+      rewritten=0;
+      if (!skip && depth == 0 && index($0, "{") > 0) {
+        header=$0;
+        sub(/\{.*/, "", header);
+        count=split(header, labels, ",");
+        remaining="";
+        matched=0;
+        for (i=1; i<=count; i++) {
+          label=trim(labels[i]);
+          if (label != "" && targets[normalize(label)]) {
+            matched=1;
+          } else if (label != "") {
+            remaining=(remaining == "" ? label : remaining ", " label);
+          }
+        }
+        if (matched && remaining == "") {
+          skip=1;
+        } else if (matched) {
+          indent=$0;
+          sub(/[^[:space:]].*/, "", indent);
+          suffix=$0;
+          sub(/^[^\{]*\{/, "{", suffix);
+          print indent remaining " " suffix;
+          rewritten=1;
+        }
+      }
+      if (!skip && !rewritten) print original;
+      depth += opens - closes;
+      if (skip && depth == 0) skip=0;
+    }
+  ' "$2" >"$3"
+}"#
+}
+
+fn server_route_activation_script(site_name: &str, route_targets: &[String]) -> String {
+    let route_payload = if route_targets.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", route_targets.join("\n"))
+    };
+    let encoded_routes = BASE64.encode(route_payload.as_bytes());
+    let route_declared = caddy_route_declared_shell_function();
+    format!(
+        r#"set -eu
+CADDY_CONTAINER="$(cat "$HOME/.deploydesk/caddy/container-name" 2>/dev/null || true)"
+CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory" 2>/dev/null || true)"
+test -n "$CADDY_CONTAINER" || {{ echo '统一 Caddy 尚未完成连接' >&2; exit 1; }}
+case "$CADDY_SITE_DIRECTORY" in /*) ;; *) echo '统一 Caddy 路由目录无效' >&2; exit 1 ;; esac
+docker inspect "$CADDY_CONTAINER" >/dev/null 2>&1 || {{ echo '统一 Caddy 当前没有运行' >&2; exit 1; }}
+SITE_NAME={site_name}
+SITE_FILE="$CADDY_SITE_DIRECTORY/$SITE_NAME"
+MAIN_FILE="$(mktemp)"
+ACTIVE_CONFIG="$(mktemp)"
+ROUTES_FILE="$(mktemp)"
+trap 'rm -f "$MAIN_FILE" "$ACTIVE_CONFIG" "$ROUTES_FILE"' EXIT
+printf '%s' {encoded_routes} | base64 --decode >"$ROUTES_FILE"
+docker exec "$CADDY_CONTAINER" cat /etc/caddy/Caddyfile >"$MAIN_FILE" || {{ echo '无法读取统一 Caddy 主配置' >&2; exit 1; }}
+docker exec "$CADDY_CONTAINER" caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile >"$ACTIVE_CONFIG" 2>/dev/null || {{ echo '无法读取统一 Caddy 当前配置' >&2; exit 1; }}
+block_target() {{
+  awk -v target_host="$1" '
+    BEGIN {{
+      target=tolower(target_host);
+      sub(/^https?:\/\//, "", target);
+      sub(/:(80|443)$/, "", target);
+      sub(/\.$/, "", target);
+      depth=0;
+    }}
+    {{
+      open_line=$0; close_line=$0;
+      opens=gsub(/\{{/, "{{", open_line); closes=gsub(/\}}/, "}}", close_line);
+      if (!inside && depth == 0 && index($0, "{{") > 0) {{
+        header=$0;
+        sub(/\{{.*/, "", header);
+        gsub(/[[:space:]]/, "", header);
+        count=split(header, labels, ",");
+        for (i=1; i<=count; i++) {{
+          site_host=tolower(labels[i]);
+          sub(/^https?:\/\//, "", site_host);
+          sub(/:(80|443)$/, "", site_host);
+          sub(/\.$/, "", site_host);
+          if (site_host == target) inside=1;
+        }}
+      }}
+      if (inside && $1 == "reverse_proxy") {{ print $2; exit }}
+      depth += opens - closes;
+      if (inside && depth == 0) exit;
+    }}
+  ' "$2"
+}}
+{route_declared}
+while IFS="$(printf '\t')" read -r host expected; do
+  [ -n "$host" ] || continue
+  if route_declared_in_file "$host" "$MAIN_FILE"; then
+    main_target="$(block_target "$host" "$MAIN_FILE")"
+    [ -n "$main_target" ] || main_target='已有 Caddy 配置'
+    printf 'ABCDEPLOY_ROUTE_CONFLICT\t%s\t%s\t%s\n' "$host" "$main_target" "$expected"
+    continue
+  fi
+  if [ ! -f "$SITE_FILE" ]; then
+    printf 'ABCDEPLOY_ROUTE_MISSING\t%s\tfile\t%s\n' "$host" "$expected"
+    continue
+  fi
+  if ! route_declared_in_file "$host" "$SITE_FILE"; then
+    printf 'ABCDEPLOY_ROUTE_MISSING\t%s\tfile\t%s\n' "$host" "$expected"
+    continue
+  fi
+  site_target="$(block_target "$host" "$SITE_FILE")"
+  if [ -z "$site_target" ]; then
+    printf 'ABCDEPLOY_ROUTE_MISMATCH\t%s\t%s\t%s\n' "$host" '未识别上游服务' "$expected"
+  elif [ "$site_target" != "$expected" ]; then
+    printf 'ABCDEPLOY_ROUTE_MISMATCH\t%s\t%s\t%s\n' "$host" "$site_target" "$expected"
+  elif ! grep -Fq -- "$host" "$ACTIVE_CONFIG" || ! grep -Fq -- "$expected" "$ACTIVE_CONFIG"; then
+    printf 'ABCDEPLOY_ROUTE_MISSING\t%s\tactive\t%s\n' "$host" "$expected"
+  fi
+done <"$ROUTES_FILE"
+"#,
+        encoded_routes = shell_quote(&encoded_routes),
+        site_name = shell_quote(site_name),
+        route_declared = route_declared,
+    )
 }
 
 fn deployment_server_profile(
@@ -2480,7 +4653,9 @@ fn deployment_routing_manifest(
 ) -> Result<deploy_core::model::ProjectManifest, String> {
     let root = Path::new(&run.project_path);
     let deployed = deployment_manifest(run)?;
+    validate_deployment_routing_manifest(&deployed, "已部署版本")?;
     let current = load_manifest(&root.join(MANIFEST_FILE)).map_err(public_error)?;
+    validate_deployment_routing_manifest(&current, "当前项目")?;
     if current.project.name != deployed.project.name {
         return Err("当前项目配置与已部署版本不属于同一个项目".to_string());
     }
@@ -2505,7 +4680,81 @@ fn deployment_routing_manifest(
     Ok(current)
 }
 
-fn apply_public_route_checks(run: &mut DeploymentRun, checks: &[PublicRouteCheck]) {
+fn validate_deployment_routing_manifest(
+    manifest: &deploy_core::model::ProjectManifest,
+    source: &str,
+) -> Result<(), String> {
+    let validation = validate_manifest(manifest);
+    if validation.valid {
+        return Ok(());
+    }
+    let reason = validation
+        .issues
+        .iter()
+        .find(|issue| matches!(issue.level, deploy_core::model::DiagnosticLevel::Error))
+        .map_or("部署配置不合法", |issue| issue.message.as_str());
+    Err(format!("{source}的 deploy.yaml 未通过安全校验：{reason}"))
+}
+
+fn overlay_server_route_problems(
+    checks: &mut [PublicRouteStatus],
+    problems: &[ServerRouteProblem],
+) {
+    for problem in problems {
+        let Some(check) = checks
+            .iter_mut()
+            .find(|check| check.host.eq_ignore_ascii_case(&problem.host))
+        else {
+            continue;
+        };
+        check.phase = match problem.kind {
+            ServerRouteProblemKind::Takeover => "route-conflict",
+            ServerRouteProblemKind::Repair => "route-missing",
+        }
+        .to_string();
+        check.reachable = false;
+        check.http_status = None;
+        check.message.clone_from(&problem.message);
+    }
+}
+
+fn apply_server_route_problems(run: &mut DeploymentRun, problems: &[ServerRouteProblem]) -> bool {
+    let takeover = problems
+        .iter()
+        .filter(|problem| problem.kind == ServerRouteProblemKind::Takeover)
+        .collect::<Vec<_>>();
+    if !takeover.is_empty() {
+        let mut message = takeover
+            .iter()
+            .map(|problem| problem.message.as_str())
+            .collect::<Vec<_>>()
+            .join("；");
+        let repairs = problems
+            .iter()
+            .filter(|problem| problem.kind == ServerRouteProblemKind::Repair)
+            .count();
+        if repairs > 0 {
+            let _ = write!(
+                message,
+                "；另外 {repairs} 个未冲突地址尚未启用，可以先单独恢复，不影响正在使用的旧服务"
+            );
+        }
+        apply_server_route_takeover_problem(run, &message);
+        return true;
+    }
+    let repairs = problems
+        .iter()
+        .filter(|problem| problem.kind == ServerRouteProblemKind::Repair)
+        .map(|problem| problem.message.as_str())
+        .collect::<Vec<_>>();
+    if repairs.is_empty() {
+        return false;
+    }
+    apply_server_route_problem(run, &repairs.join("；"));
+    true
+}
+
+fn apply_public_route_checks(run: &mut DeploymentRun, checks: &[PublicRouteStatus]) {
     let failures = checks
         .iter()
         .filter(|check| !check.reachable)
@@ -2582,6 +4831,44 @@ fn list_deployment_runs(
 }
 
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
+fn list_project_environments(
+    path: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<Vec<ProjectEnvironment>, String> {
+    state.list_project_environments(Path::new(&path))
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
+fn list_project_versions(
+    path: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<Vec<ProjectVersion>, String> {
+    state.list_project_versions(Path::new(&path))
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
+fn list_version_validations(
+    path: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<Vec<VersionValidation>, String> {
+    state.list_version_validations(Path::new(&path))
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // Tauri IPC deserializes owned arguments.
+fn set_version_validation(
+    path: String,
+    run_id: String,
+    validation_state: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<VersionValidation, String> {
+    state.set_version_validation(Path::new(&path), &run_id, &validation_state)
+}
+
+#[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // Tauri injects managed state by value.
 fn list_active_deployment_runs(
     state: State<'_, WorkspaceState>,
@@ -2612,6 +4899,13 @@ async fn sync_external_deployments(
     state: State<'_, WorkspaceState>,
 ) -> Result<Vec<DeploymentRun>, String> {
     let root = PathBuf::from(&path);
+    let adoption = state.project_adoption(&root)?;
+    if adoption.mode == "pending" {
+        return Err("AD-ADOPT-101：请先选择继续管理已有部署或重新设置部署".to_string());
+    }
+    if adoption.fresh_draft {
+        return Err("AD-ADOPT-102：请先确认新的部署设置，再检查后续构建".to_string());
+    }
     let manifest = load_manifest(&root.join(MANIFEST_FILE)).map_err(public_error)?;
     let token = Zeroizing::new(resolve_cnb_token(String::new())?);
     let client = CnbClient::new(token.as_str()).map_err(public_error)?;
@@ -2619,15 +4913,19 @@ async fn sync_external_deployments(
         .recent_builds(&manifest.providers.build.repository, 30)
         .await
         .map_err(cnb_build_history_error)?;
+    let mut records = ordered_build_records(&payload);
+    let latest_success_serials = latest_success_serials_by_environment(&records);
     let mut imported = Vec::new();
     let mut diagnosed_failure = false;
-    for record in build_records(&payload) {
+    for record in records.drain(..) {
         // `deploydesk-production` 只是把已验证提交转换为生产自定义事件，
         // 自身不部署测试环境。历史同步不能把这条 push 误记为新的测试版。
         if is_production_approval_build(&record) {
-            if let Some(mut run) = state
-                .deployment_run_by_serial(&manifest.providers.build.repository, &record.serial)?
-            {
+            if let Some(mut run) = state.deployment_run_by_serial_for_project(
+                &root,
+                &manifest.providers.build.repository,
+                &record.serial,
+            )? {
                 apply_version_title(&mut run, &record, &root);
                 run.status = "cancelled".to_string();
                 run.current_stage = "complete".to_string();
@@ -2643,29 +4941,73 @@ async fn sync_external_deployments(
         let Some(environment) = build_environment_for_event(&record.event) else {
             continue;
         };
-        let started_at = record
+        let is_latest_success = record.status == "success"
+            && latest_success_serials
+                .get(environment)
+                .is_some_and(|serial| serial == &record.serial);
+        let record_started_at = record
             .created_at
             .as_deref()
             .filter(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
-            .map_or_else(|| Utc::now().to_rfc3339(), ToString::to_string);
-        if let Some(mut run) =
-            state.deployment_run_by_serial(&manifest.providers.build.repository, &record.serial)?
-        {
+            .map(ToString::to_string);
+        if let Some(mut run) = state.deployment_run_by_serial_for_project(
+            &root,
+            &manifest.providers.build.repository,
+            &record.serial,
+        )? {
+            // The deployment-path workflow owns its task from the local snapshot
+            // through registry transfer, server mutation and the final route
+            // check.  The legacy CNB-history importer only knows that the remote
+            // build finished; treating that as a complete environment deployment
+            // overwrites the live path task with `verify-existing-deployment`
+            // before the desktop can transfer the immutable images to TCR.
+            //
+            // Keep returning the row so callers can refresh their local list, but
+            // never let the legacy importer mutate a run already bound to a path.
+            if deployment_path_owns_history_reconciliation(
+                environment,
+                state.deployment_path_for_run(&run.id).is_ok(),
+            ) {
+                imported.push(run);
+                continue;
+            }
             apply_version_title(&mut run, &record, &root);
             // 旧版本先插入本机时间再更新 CNB 时间，但 SQLite 的 upsert 曾没有更新
             // started_at，导致数月前的失败记录排在刚成功的版本前面。每次后台同步都
             // 用 CNB 原始时间修正；运行中的任务也顺便收敛到远端最终状态。
-            run.started_at = started_at;
-            if matches!(run.status.as_str(), "queued" | "running")
+            if let Some(started_at) = record_started_at {
+                run.started_at = started_at;
+            }
+            let status_changed = matches!(run.status.as_str(), "queued" | "running")
                 || (run.status == "failed" && record.status == "success")
-            {
+                || (run.status == "needs_action" && record.status != "success");
+            if status_changed {
                 apply_history_status(&mut run, &record.status);
                 run.message = synced_history_message(environment, &run.status);
-                if run.status == "success" {
-                    finalize_successful_deployment(&mut run, &state).await;
-                    if run.status == "success" && environment == "production" {
-                        run.message = "已同步手机端完成的正式发布，并核对同一镜像摘要".to_string();
-                    }
+            }
+            if environment == "production"
+                && let Some(revision) = record.revision.as_deref()
+                && let Some(source) = state.successful_staging_run_by_revision(&root, revision)?
+            {
+                // A production record may have been imported before its
+                // staging source in an older app version. Reconcile the link
+                // on every sync instead of leaving it permanently unresolved.
+                run.source_run_id = Some(source.id);
+            }
+            let should_verify_existing = record.status == "success"
+                && is_latest_success
+                && (status_changed
+                    || run.artifacts.is_empty()
+                    || matches!(
+                        run.action_kind.as_deref(),
+                        Some("verify-existing-deployment" | "artifact-mismatch")
+                    ));
+            if should_verify_existing {
+                apply_history_status(&mut run, &record.status);
+                run.action_kind = Some("verify-existing-deployment".to_string());
+                finalize_successful_deployment(&mut run, &state).await;
+                if run.status == "success" && environment == "production" {
+                    run.message = "已同步手机端完成的正式发布，并核对同一镜像摘要".to_string();
                 }
             }
             if run.status == "failed" && !diagnosed_failure {
@@ -2677,7 +5019,30 @@ async fn sync_external_deployments(
             imported.push(run);
             continue;
         }
-        let mut run = state.create_deployment_run(
+        let started_at = if adoption.mode == "fresh" {
+            let Some(started_at) = record_started_at else {
+                // A provider record without a trustworthy creation time could
+                // predate the local reset. Fresh mode is conservative and
+                // never guesses that such a record is new.
+                continue;
+            };
+            let Some(cutoff) = adoption.history_import_after.as_deref() else {
+                continue;
+            };
+            let Ok(started) = chrono::DateTime::parse_from_rfc3339(&started_at) else {
+                continue;
+            };
+            let Ok(cutoff) = chrono::DateTime::parse_from_rfc3339(cutoff) else {
+                continue;
+            };
+            if started <= cutoff {
+                continue;
+            }
+            started_at
+        } else {
+            record_started_at.unwrap_or_else(|| Utc::now().to_rfc3339())
+        };
+        let mut run = state.deployment_run_draft(
             &root,
             &manifest.project.name,
             environment,
@@ -2717,11 +5082,28 @@ async fn sync_external_deployments(
             enrich_failed_cnb_run(&client, &mut run, &state).await;
             diagnosed_failure = true;
         }
-        if run.status == "success" {
+        if run.status == "success" && is_latest_success {
+            // This successful deployment was discovered remotely rather than
+            // started by the current local task. If the server binding is not
+            // available yet, present it as an existing deployment awaiting
+            // verification instead of as a newly failed release.
+            run.action_kind = Some("verify-existing-deployment".to_string());
             finalize_successful_deployment(&mut run, &state).await;
             if run.status == "success" && environment == "production" {
                 run.message = "已同步手机端完成的正式发布，并核对同一镜像摘要".to_string();
             }
+        } else if run.status == "success"
+            && environment == "production"
+            && run.source_run_id.is_none()
+        {
+            // Historic CNB success is still useful deployment history, but a
+            // production row without its staging source cannot safely become
+            // an immutable version pointer.
+            run.status = "needs_action".to_string();
+            run.current_stage = "verify-release".to_string();
+            run.action_kind = Some("verify-existing-deployment".to_string());
+            run.issue_code = Some("AD-REL-301".to_string());
+            run.message = "历史正式发布已导入，但缺少对应的测试版本，暂未核对".to_string();
         }
         state.save_deployment_run(&run)?;
         imported.push(run);
@@ -2730,17 +5112,69 @@ async fn sync_external_deployments(
     Ok(imported)
 }
 
+fn ordered_build_records(payload: &serde_json::Value) -> Vec<CnbBuildRecord> {
+    let mut records = build_records(payload);
+    records.sort_by(|left, right| {
+        let left_time = left
+            .created_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+        let right_time = right
+            .created_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+        left_time
+            .cmp(&right_time)
+            .then_with(|| {
+                build_record_environment_order(left).cmp(&build_record_environment_order(right))
+            })
+            .then_with(|| left.serial.cmp(&right.serial))
+    });
+    records
+}
+
+fn build_record_environment_order(record: &CnbBuildRecord) -> u8 {
+    match build_environment_for_event(&record.event) {
+        Some("deployment") => 0,
+        Some("staging") => 1,
+        Some("production") => 2,
+        _ => 3,
+    }
+}
+
+fn deployment_path_owns_history_reconciliation(
+    environment: &str,
+    bound_to_deployment_path: bool,
+) -> bool {
+    environment == "deployment" && bound_to_deployment_path
+}
+
+fn latest_success_serials_by_environment(
+    records: &[CnbBuildRecord],
+) -> BTreeMap<&'static str, String> {
+    let mut result = BTreeMap::new();
+    for record in records {
+        if record.status != "success" || is_production_approval_build(record) {
+            continue;
+        }
+        if let Some(environment) = build_environment_for_event(&record.event) {
+            result.insert(environment, record.serial.clone());
+        }
+    }
+    result
+}
+
 fn synced_history_message(environment: &str, status: &str) -> String {
-    let label = if environment == "production" {
-        "正式发布"
-    } else {
-        "测试部署"
+    let label = match environment {
+        "production" => "正式发布",
+        "staging" => "测试部署",
+        _ => "上线版本",
     };
     if status == "success" {
-        if environment == "production" {
-            "已同步手机端完成的正式发布".to_string()
-        } else {
-            "已同步 CNB 完成的测试部署".to_string()
+        match environment {
+            "production" => "已同步手机端完成的正式发布".to_string(),
+            "staging" => "已同步 CNB 完成的测试部署".to_string(),
+            _ => "已同步构建服务完成的上线版本".to_string(),
         }
     } else if matches!(status, "running" | "queued") {
         format!("已同步 CNB 页面触发的{label}任务")
@@ -2764,7 +5198,8 @@ fn safe_candidate_tag(value: &str) -> Option<&str> {
 
 fn build_environment_for_event(event: &str) -> Option<&'static str> {
     match event {
-        "push" | "git_push" | "api_trigger_staging" | "tag_deploy.staging" => Some("staging"),
+        "push" | "git_push" | "api_trigger_deployment_path_build" => Some("deployment"),
+        "api_trigger_staging" | "tag_deploy.staging" => Some("staging"),
         "api_trigger_production" | "tag_deploy.production" => Some("production"),
         _ => None,
     }
@@ -2816,7 +5251,7 @@ async fn trigger_cnb_run(
     revision: Option<&str>,
     prefer_push_build: bool,
     state: &WorkspaceState,
-) -> DeploymentRun {
+) -> Result<DeploymentRun, String> {
     if run.commit_sha.is_none() && run.environment == "staging" {
         run.commit_sha = local_git_revision(Path::new(&run.project_path));
     }
@@ -2826,10 +5261,12 @@ async fn trigger_cnb_run(
         let client = CnbClient::new(token.as_str()).map_err(public_error)?;
         if prefer_push_build
             && let Some(expected_revision) = expected_revision.as_deref()
-            && let Some(serial) = recover_push_triggered_staging_build(
+            && let Some(serial) = recover_triggered_build(
                 &client,
                 &run.repository,
                 expected_revision,
+                &run.environment,
+                5,
             )
             .await?
         {
@@ -2870,7 +5307,7 @@ async fn trigger_cnb_run(
                 return Ok::<(Option<String>, bool), String>((serial, false));
             }
             Err(error)
-                if event == "api_trigger_staging"
+                if matches!(event, "api_trigger_staging" | "api_trigger_deployment_path_build")
                     && prefer_push_build
                     && matches!(&error, DeployError::CnbApi { status: 403, .. }) =>
             {
@@ -2878,10 +5315,12 @@ async fn trigger_cnb_run(
                 let Some(expected_revision) = expected_revision.as_deref() else {
                     return Err(trigger_error);
                 };
-                if let Some(serial) = recover_push_triggered_staging_build(
+                if let Some(serial) = recover_triggered_build(
                     &client,
                     &run.repository,
                     expected_revision,
+                    &run.environment,
+                    5,
                 )
                 .await?
                 {
@@ -2975,8 +5414,8 @@ async fn trigger_cnb_run(
         }
     }
     run.updated_at = Utc::now().to_rfc3339();
-    let _ = state.save_deployment_run(&run);
-    run
+    state.save_deployment_run(&run)?;
+    Ok(run)
 }
 
 fn local_git_revision(root: &Path) -> Option<String> {
@@ -3092,14 +5531,6 @@ fn checked_git_revision(value: Option<&str>) -> Result<Option<String>, String> {
     Ok(Some(value.to_string()))
 }
 
-async fn recover_push_triggered_staging_build(
-    client: &CnbClient,
-    repository: &str,
-    expected_revision: &str,
-) -> Result<Option<String>, String> {
-    recover_triggered_build(client, repository, expected_revision, "staging", 5).await
-}
-
 async fn recover_triggered_build(
     client: &CnbClient,
     repository: &str,
@@ -3134,6 +5565,8 @@ fn build_serial_for_revision(
                 return false;
             }
             build_environment_for_event(&record.event) == Some(environment)
+                || (environment == "staging"
+                    && matches!(record.event.as_str(), "push" | "git_push"))
         })
         .map(|record| record.serial)
 }
@@ -3489,7 +5922,7 @@ async fn check_server(
         .await
         .map_err(public_error)?;
     if result.ok {
-        state.remember_server(&profile)?;
+        state.remember_checked_server(&profile)?;
     }
     Ok(result)
 }
@@ -3522,7 +5955,7 @@ async fn install_server_key_with_password(
         .await
         .map_err(public_error)?;
     if result.ok {
-        state.remember_server(&profile)?;
+        state.remember_checked_server(&profile)?;
     }
     Ok(result)
 }
@@ -3551,7 +5984,7 @@ async fn bootstrap_server_caddy(
         .await
         .map_err(public_error)?;
     if result.ok {
-        state.remember_server(&profile)?;
+        state.remember_checked_server(&profile)?;
     }
     Ok(result)
 }
@@ -3565,6 +5998,7 @@ async fn inspect_server_route_conflicts(
     let environment_name = parse_deploy_environment(&environment)?;
     let manifest =
         load_manifest(&PathBuf::from(&path).join(MANIFEST_FILE)).map_err(public_error)?;
+    validate_deployment_routing_manifest(&manifest, "当前项目")?;
     let hosts = manifest
         .environments
         .get(environment_name)
@@ -3584,6 +6018,7 @@ async fn inspect_server_route_conflicts(
         .collect::<Vec<_>>()
         .join(" ");
     let site_name = format!("{}-{environment}.caddy", manifest.project.name);
+    let route_declared = caddy_route_declared_shell_function();
     let script = format!(
         r#"set -eu
 CADDY_CONTAINER="$(cat "$HOME/.deploydesk/caddy/container-name")"
@@ -3593,22 +6028,25 @@ test -n "$MAIN_FILE" && test -f "$MAIN_FILE"
 ACTIVE_MAIN_FILE="$(mktemp)"
 trap 'rm -f "$ACTIVE_MAIN_FILE"' EXIT
 docker exec "$CADDY_CONTAINER" cat /etc/caddy/Caddyfile >"$ACTIVE_MAIN_FILE"
-TARGET_SITE="$CADDY_SITE_DIRECTORY/{site_name}"
+SITE_NAME={site_name}
+TARGET_SITE="$CADDY_SITE_DIRECTORY/$SITE_NAME"
+{route_declared}
 for host in {host_arguments}; do
-  if awk -v host="$host" '{{ site_host=$1; sub(/^https?:\/\//, "", site_host); if (site_host == host && $2 == "{{") found=1 }} END {{ exit found ? 0 : 1 }}' "$ACTIVE_MAIN_FILE"; then
+  if route_declared_in_file "$host" "$ACTIVE_MAIN_FILE"; then
     printf 'ABCDEPLOY_ROUTE_CONFLICT\t%s\tmain\n' "$host"
     continue
   fi
   for file in "$CADDY_SITE_DIRECTORY"/*.caddy; do
     [ -f "$file" ] || continue
     [ "$file" = "$TARGET_SITE" ] && continue
-    if awk -v host="$host" '{{ site_host=$1; sub(/^https?:\/\//, "", site_host); if (site_host == host && $2 == "{{") found=1 }} END {{ exit found ? 0 : 1 }}' "$file"; then
+    if route_declared_in_file "$host" "$file"; then
       printf 'ABCDEPLOY_ROUTE_CONFLICT\t%s\tmanaged\n' "$host"
       break
     fi
   done
 done
 "#,
+        site_name = shell_quote(&site_name),
     );
     let output = ssh::execute(
         &server.profile(),
@@ -3659,6 +6097,7 @@ async fn take_over_server_routes(
     let environment_name = parse_deploy_environment(&environment)?;
     let manifest =
         load_manifest(&PathBuf::from(&path).join(MANIFEST_FILE)).map_err(public_error)?;
+    validate_deployment_routing_manifest(&manifest, "当前项目")?;
     let hosts = manifest
         .environments
         .get(environment_name)
@@ -3669,7 +6108,6 @@ async fn take_over_server_routes(
     if hosts.is_empty() {
         return Err("正式环境还没有配置地址".to_string());
     }
-    let host_lines = hosts.join("\n");
     let site_name = format!("{}-{environment}.caddy", manifest.project.name);
     let caddy_path = format!(
         ".deploydesk/generated/{}/Caddyfile",
@@ -3681,7 +6119,19 @@ async fn take_over_server_routes(
         .find(|file| file.path == caddy_path)
         .ok_or_else(|| "无法生成当前正式地址的 Caddy 路由".to_string())?
         .content;
+    take_over_caddy_routes(&server.profile(), &hosts, &site_name, &caddy).await
+}
+
+async fn take_over_caddy_routes(
+    profile: &ssh::SshProfile,
+    hosts: &[String],
+    site_name: &str,
+    caddy: &str,
+) -> Result<ProviderCheck, String> {
+    let encoded_hosts = BASE64.encode(format!("{}\n", hosts.join("\n")).as_bytes());
     let encoded_caddy = BASE64.encode(caddy.as_bytes());
+    let route_declared = caddy_route_declared_shell_function();
+    let rewrite_main_routes = caddy_main_route_rewrite_shell_function();
     let script = format!(
         r#"set -eu
 mkdir -p "$HOME/.deploydesk/locks"
@@ -3690,27 +6140,31 @@ flock -w 60 9 || {{ echo '同一服务器正在执行其他部署操作' >&2; ex
 CADDY_CONTAINER="$(cat "$HOME/.deploydesk/caddy/container-name")"
 CADDY_SITE_DIRECTORY="$(cat "$HOME/.deploydesk/caddy/site-directory")"
 MAIN_FILE="$(docker inspect --format '{{{{range .Mounts}}}}{{{{if eq .Destination "/etc/caddy/Caddyfile"}}}}{{{{.Source}}}}{{{{end}}}}{{{{end}}}}' "$CADDY_CONTAINER")"
-SITE_FILE="$CADDY_SITE_DIRECTORY/{site_name}"
+SITE_NAME={site_name}
+SITE_FILE="$CADDY_SITE_DIRECTORY/$SITE_NAME"
 test -n "$MAIN_FILE" && test -f "$MAIN_FILE" && test -w "$MAIN_FILE"
 WORK_DIR="$(mktemp -d "$HOME/.deploydesk/caddy/takeover.XXXXXX")"
 trap 'rm -rf "$WORK_DIR"' EXIT
-cat >"$WORK_DIR/hosts" <<'ABCDEPLOY_HOSTS'
-{host_lines}
-ABCDEPLOY_HOSTS
+printf '%s' {encoded_hosts} | base64 --decode >"$WORK_DIR/hosts"
+{route_declared}
+# The UI inspects conflicts before confirmation, but the server state can change in between.
+# Recheck managed project routes while holding the deployment lock and fail before any write.
+while IFS= read -r host; do
+  [ -n "$host" ] || continue
+  for file in "$CADDY_SITE_DIRECTORY"/*.caddy; do
+    [ -f "$file" ] || continue
+    [ "$file" = "$SITE_FILE" ] && continue
+    if route_declared_in_file "$host" "$file"; then
+      echo "地址 $host 已由其他项目管理，未修改服务器配置" >&2
+      exit 1
+    fi
+  done
+done <"$WORK_DIR/hosts"
 cp "$MAIN_FILE" "$WORK_DIR/main.host.original"
 docker exec "$CADDY_CONTAINER" cat /etc/caddy/Caddyfile >"$WORK_DIR/main.container.original"
 if [ -f "$SITE_FILE" ]; then cp "$SITE_FILE" "$WORK_DIR/site.original"; fi
-awk -v hosts_file="$WORK_DIR/hosts" '
-  BEGIN {{ while ((getline host < hosts_file) > 0) targets[host]=1; close(hosts_file); depth=0; skip=0 }}
-  {{
-    opens=gsub(/\{{/, "{{"); closes=gsub(/\}}/, "}}");
-    site_host=$1; sub(/^https?:\/\//, "", site_host);
-    if (!skip && depth == 0 && targets[site_host] && $2 == "{{") skip=1;
-    if (!skip) print;
-    depth += opens - closes;
-    if (skip && depth == 0) skip=0;
-  }}
-' "$WORK_DIR/main.container.original" >"$WORK_DIR/main.next"
+{rewrite_main_routes}
+rewrite_caddy_main_routes "$WORK_DIR/hosts" "$WORK_DIR/main.container.original" "$WORK_DIR/main.next"
 printf '%s' {encoded_caddy} | base64 --decode >"$WORK_DIR/site.next"
 sync_main_config() {{
   container_source="$1"
@@ -3760,16 +6214,18 @@ if ! docker exec "$CADDY_CONTAINER" caddy reload --config /etc/caddy/Caddyfile -
   echo '接管地址时 Caddy 重载失败，已恢复原配置' >&2
   exit 1
 fi
-BACKUP_DIR="$HOME/.deploydesk/caddy/backups/$(date -u +%Y%m%dT%H%M%SZ)-{site_name}"
+BACKUP_DIR="$HOME/.deploydesk/caddy/backups/$(date -u +%Y%m%dT%H%M%SZ)-$SITE_NAME"
 mkdir -p "$BACKUP_DIR"
 cp "$WORK_DIR/main.container.original" "$BACKUP_DIR/Caddyfile"
 cp "$WORK_DIR/main.host.original" "$BACKUP_DIR/Caddyfile.host"
-if [ -f "$WORK_DIR/site.original" ]; then cp "$WORK_DIR/site.original" "$BACKUP_DIR/{site_name}"; fi
+if [ -f "$WORK_DIR/site.original" ]; then cp "$WORK_DIR/site.original" "$BACKUP_DIR/$SITE_NAME"; fi
 "#,
         encoded_caddy = shell_quote(&encoded_caddy),
+        encoded_hosts = shell_quote(&encoded_hosts),
+        site_name = shell_quote(site_name),
     );
     let output = ssh::execute(
-        &server.profile(),
+        profile,
         "bash -s",
         Some(script.as_bytes()),
         Duration::from_secs(45),
@@ -3791,9 +6247,79 @@ if [ -f "$WORK_DIR/site.original" ]; then cp "$WORK_DIR/site.original" "$BACKUP_
         summary: "现有地址已安全切换到 ABCDeploy 管理".to_string(),
         details: vec![format!("已接管：{}", hosts.join("、"))],
         code: None,
-        next_steps: vec!["重新发布同一个测试版本，完成发布记录确认".to_string()],
+        next_steps: vec!["继续当前上线任务，完成访问地址核对".to_string()],
         retryable: false,
     })
+}
+
+#[tauri::command]
+async fn take_over_deployment_path_routes(
+    run_id: String,
+    confirmed: bool,
+    state: State<'_, WorkspaceState>,
+) -> Result<DeploymentRun, String> {
+    take_over_deployment_path_routes_inner(run_id, confirmed, state.inner()).await
+}
+
+async fn take_over_deployment_path_routes_inner(
+    run_id: String,
+    confirmed: bool,
+    state: &WorkspaceState,
+) -> Result<DeploymentRun, String> {
+    if !confirmed {
+        return Err("接管现有地址前必须明确确认".to_string());
+    }
+    let mut run = state.deployment_run(&run_id)?;
+    if run.environment != "deployment" {
+        return Err("这不是当前上线线路的任务".to_string());
+    }
+    if run.issue_code.as_deref() != Some("AD-SRV-206")
+        || run.action_kind.as_deref() != Some("deployment-path-route-takeover")
+    {
+        return Err("当前上线任务没有需要接管的服务器地址".to_string());
+    }
+    let path = state.deployment_path_for_run(&run.id)?;
+    let manifest = deployment_path_manifest(&run, &path, state)?;
+    let profile = verified_deployment_path_profile(&path, state).await?;
+    let routes = deployment_path_routes(&path);
+    let root_routes = routes
+        .iter()
+        .filter(|route| route.path == "/")
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut hosts = root_routes
+        .iter()
+        .map(|route| route.host.clone())
+        .collect::<Vec<_>>();
+    hosts.sort();
+    hosts.dedup();
+    if hosts.is_empty() {
+        return Err("当前上线线路没有需要接管的整站地址".to_string());
+    }
+    let bundle =
+        render_deployment_path_bundle(&manifest, &path.id, &root_routes).map_err(public_error)?;
+    state.begin_deployment_attempt(&run.id)?;
+    if let Err(message) =
+        take_over_caddy_routes(&profile, &hosts, &bundle.site_name, &bundle.caddy).await
+    {
+        run.message = redact_text(&message);
+        run.updated_at = Utc::now().to_rfc3339();
+        state.save_deployment_run(&run)?;
+        return Err(message);
+    }
+
+    run.status = "running".to_string();
+    run.current_stage = "server".to_string();
+    run.issue_code = None;
+    run.action_kind = None;
+    run.action_url = None;
+    run.message = "现有访问地址已安全接管，正在核对公网结果".to_string();
+    run.updated_at = Utc::now().to_rfc3339();
+    state.save_deployment_run(&run)?;
+    verify_deployment_path(&mut run, &path, state).await?;
+    run.updated_at = Utc::now().to_rfc3339();
+    state.save_deployment_run(&run)?;
+    Ok(run)
 }
 
 #[tauri::command]
@@ -3851,6 +6377,7 @@ async fn apply_deployment_routes(
         manifest.project.name, run.environment
     );
     let encoded_caddy = BASE64.encode(caddy.as_bytes());
+    let partial_route_script = caddy_partial_route_activation_script(&hosts);
     let script = format!(
         r#"set -eu
 mkdir -p "$HOME/.deploydesk/locks"
@@ -3868,23 +6395,15 @@ APP_DIRECTORY="$HOME/{remote_directory}"
 APP_FILE="$APP_DIRECTORY/Caddyfile"
 SITE_FILE="$CADDY_SITE_DIRECTORY/{site_name}"
 mkdir -p "$APP_DIRECTORY"
-for host in {host_arguments}; do
-  if awk -v host="$host" '{{ site_host=$1; sub(/^https?:\/\//, "", site_host); if (site_host == host && $2 == "{{") found=1 }} END {{ exit found ? 0 : 1 }}' "$MAIN_FILE"; then
-    echo "AD-SRV-206：$host 已由统一 Caddy 主配置管理，请先确认地址接管" >&2
-    exit 1
-  fi
-  for file in "$CADDY_SITE_DIRECTORY"/*.caddy; do
-    [ -f "$file" ] || continue
-    [ "$file" = "$SITE_FILE" ] && continue
-    if awk -v host="$host" '{{ site_host=$1; sub(/^https?:\/\//, "", site_host); if (site_host == host && $2 == "{{") found=1 }} END {{ exit found ? 0 : 1 }}' "$file"; then
-      echo "AD-SRV-206：$host 已由另一个项目管理，请先调整地址" >&2
-      exit 1
-    fi
-  done
-done
 WORK_DIR="$(mktemp -d "$HOME/.deploydesk/caddy/reapply.XXXXXX")"
 trap 'rm -rf "$WORK_DIR"' EXIT
 printf '%s' {encoded_caddy} | base64 --decode >"$WORK_DIR/Caddyfile.next"
+CANDIDATE_FILE="$WORK_DIR/Caddyfile.next"
+FILTERED_SITE_FILE="$WORK_DIR/Caddyfile.filtered"
+MAIN_CONFIG_FILE="$WORK_DIR/Caddyfile.main"
+ROUTE_CONFLICTS_FILE="$WORK_DIR/conflicts"
+FILTER_HOSTS_FILE="$WORK_DIR/filter-hosts"
+{partial_route_script}
 [ -f "$APP_FILE" ] && cp "$APP_FILE" "$WORK_DIR/app.original" || true
 [ -f "$SITE_FILE" ] && cp "$SITE_FILE" "$WORK_DIR/site.original" || true
 restore() {{
@@ -3892,7 +6411,7 @@ restore() {{
   if [ -f "$WORK_DIR/site.original" ]; then cp "$WORK_DIR/site.original" "$SITE_FILE"; else rm -f "$SITE_FILE"; fi
 }}
 cp "$WORK_DIR/Caddyfile.next" "$APP_FILE"
-cp "$WORK_DIR/Caddyfile.next" "$SITE_FILE"
+cp "$FILTERED_SITE_FILE" "$SITE_FILE"
 docker network inspect {network} >/dev/null 2>&1 || {{ restore; echo 'AD-SRV-204：项目网络不存在，请重新发布版本' >&2; exit 1; }}
 docker network connect {network} "$CADDY_CONTAINER" 2>/dev/null || true
 if ! docker exec "$CADDY_CONTAINER" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile; then
@@ -3906,7 +6425,7 @@ if ! docker exec "$CADDY_CONTAINER" caddy reload --config /etc/caddy/Caddyfile -
   echo 'AD-SRV-207：统一 Caddy 重载失败，已恢复原路由' >&2
   exit 1
 fi
-docker exec "$CADDY_CONTAINER" caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile >"$WORK_DIR/active.json" 2>/dev/null || {{ restore; echo 'AD-SRV-209：无法确认新地址是否生效' >&2; exit 1; }}
+docker exec "$CADDY_CONTAINER" caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile >"$WORK_DIR/active.json" 2>/dev/null || {{ restore; docker exec "$CADDY_CONTAINER" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 || true; echo 'AD-SRV-209：无法确认新地址是否生效' >&2; exit 1; }}
 for host in {host_arguments}; do
   if ! grep -Fq -- "$host" "$WORK_DIR/active.json"; then
     restore
@@ -3915,10 +6434,16 @@ for host in {host_arguments}; do
     exit 1
   fi
 done
+while IFS="$(printf '\t')" read -r host source; do
+  if [ "$source" = "main" ]; then
+    printf 'ROUTE_TAKEOVER_REQUIRED\t%s\n' "$host"
+  fi
+done <"$ROUTE_CONFLICTS_FILE"
 "#,
         encoded_caddy = shell_quote(&encoded_caddy),
         network = shell_quote(&network),
         remote_directory = remote_directory,
+        partial_route_script = partial_route_script,
     );
     let output = ssh::execute(
         &profile,
@@ -3935,13 +6460,29 @@ done
             .unwrap_or("重新应用地址失败，原路由已保留")
             .to_string());
     }
+    let takeover_hosts = output
+        .stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("ROUTE_TAKEOVER_REQUIRED\t"))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     Ok(ProviderCheck {
         provider: "caddy".to_string(),
         ok: true,
-        summary: "正式地址已重新应用".to_string(),
+        summary: if takeover_hosts.is_empty() {
+            "正式地址已重新应用".to_string()
+        } else {
+            format!(
+                "未冲突的正式地址已恢复，{} 个旧地址等待确认切换",
+                takeover_hosts.len()
+            )
+        },
         details: hosts,
         code: None,
-        next_steps: Vec::new(),
+        next_steps: (!takeover_hosts.is_empty())
+            .then(|| "确认接管仍由旧服务使用的地址".to_string())
+            .into_iter()
+            .collect(),
         retryable: false,
     })
 }
@@ -4518,6 +7059,15 @@ async fn ensure_remote_runtime_dependencies(
     config: &EnvironmentConfig,
     profile: &ssh::SshProfile,
 ) -> Result<BTreeMap<String, String>, String> {
+    ensure_remote_runtime_dependencies_scoped(root, environment.as_str(), config, profile).await
+}
+
+async fn ensure_remote_runtime_dependencies_scoped(
+    root: &Path,
+    scope: &str,
+    config: &EnvironmentConfig,
+    profile: &ssh::SshProfile,
+) -> Result<BTreeMap<String, String>, String> {
     let needs_postgres = config.database.is_some();
     let needs_redis = config.redis_namespace.is_some();
     if !needs_postgres && !needs_redis {
@@ -4539,7 +7089,7 @@ async fn ensure_remote_runtime_dependencies(
             local_infrastructure_secret(&format!(
                 "remote.database.{}.{}",
                 &project_storage_id(root)[..24],
-                environment.as_str()
+                scope
             ))
         })
         .transpose()?;
@@ -4586,7 +7136,7 @@ async fn ensure_remote_runtime_dependencies(
         profile,
         "sh -s",
         Some(script.as_bytes()),
-        Duration::from_mins(2),
+        Duration::from_mins(12),
     )
     .await
     .map_err(public_error)?;
@@ -4596,11 +7146,7 @@ async fn ensure_remote_runtime_dependencies(
     if output.exit_status != Some(0) {
         database_password.iter_mut().for_each(Zeroize::zeroize);
         let message = redact_text(&output.stderr);
-        return Err(message
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("AD-INF-202：服务器运行依赖准备失败")
-            .to_string());
+        return Err(remote_dependency_error(&message));
     }
     let fields = output
         .stdout
@@ -4627,6 +7173,9 @@ async fn ensure_remote_runtime_dependencies(
                 database_name
             ),
         );
+        values.insert("POSTGRES_DB".to_string(), database_name.clone());
+        values.insert("POSTGRES_USER".to_string(), database_user.clone());
+        values.insert("POSTGRES_PASSWORD".to_string(), password.clone());
     }
     if needs_redis {
         let host = fields
@@ -4641,7 +7190,7 @@ async fn ensure_remote_runtime_dependencies(
         let mut password = BASE64
             .decode(encoded_password)
             .map_err(|_| "AD-INF-202：服务器返回的 Redis 凭据格式无效".to_string())?;
-        let database = remote_redis_database(root, environment);
+        let database = remote_redis_database_for_scope(root, scope);
         let url = if password.is_empty() {
             format!("redis://{host}:6379/{database}")
         } else {
@@ -4663,7 +7212,38 @@ const REMOTE_DEPENDENCY_SCRIPT: &str = r#"set -eu
 NETWORK='__NETWORK__'
 NEEDS_POSTGRES='__POSTGRES_FLAG__'
 NEEDS_REDIS='__REDIS_FLAG__'
+mkdir -p "$HOME/.deploydesk/locks"
+exec 8>"$HOME/.deploydesk/locks/runtime-dependencies.lock"
+flock -w 900 8 || { echo 'AD-INF-202：服务器正在准备另一组运行依赖，请稍后继续' >&2; exit 75; }
 decode() { printf '%s' "$1" | base64 -d; }
+pull_with_timeout() {
+  candidate="$1"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 150 docker pull "$candidate" >/dev/null 2>&1
+  else
+    docker pull "$candidate" >/dev/null 2>&1
+  fi
+}
+resolve_runtime_image() {
+  component="$1"
+  digest="$2"
+  local_image="$3"
+  shift 3
+  if docker image inspect "$local_image" >/dev/null 2>&1; then
+    RESOLVED_IMAGE="$local_image"
+    return 0
+  fi
+  for repository in "$@"; do
+    candidate="$repository@$digest"
+    if pull_with_timeout "$candidate"; then
+      docker tag "$candidate" "$local_image"
+      RESOLVED_IMAGE="$local_image"
+      return 0
+    fi
+  done
+  echo "AD-INF-202：服务器暂时无法下载${component}运行组件；系统已尝试国内来源" >&2
+  return 1
+}
 docker network inspect "$NETWORK" >/dev/null 2>&1 || docker network create "$NETWORK" >/dev/null
 
 if [ "$NEEDS_POSTGRES" = 1 ]; then
@@ -4673,13 +7253,27 @@ if [ "$NEEDS_POSTGRES" = 1 ]; then
   done
   if [ -z "$POSTGRES_CONTAINER" ]; then
     POSTGRES_ADMIN_PASSWORD="$(decode '__POSTGRES_ADMIN_PASSWORD__')"
+    POSTGRES_DIGEST='sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777'
+    POSTGRES_LOCAL_IMAGE='abcdeploy/runtime-postgres:16-57c72fd2a128e416'
+    resolve_runtime_image '数据库' "$POSTGRES_DIGEST" "$POSTGRES_LOCAL_IMAGE" \
+      'mirror.ccs.tencentyun.com/library/postgres' \
+      'm.daocloud.io/docker.io/library/postgres' \
+      'postgres' || exit 1
+    POSTGRES_IMAGE="$RESOLVED_IMAGE"
     docker volume create abcdeploy-postgres-data >/dev/null
-    docker run -d --name abcdeploy-postgres --restart unless-stopped \
+    if ! docker run -d --name abcdeploy-postgres --restart unless-stopped \
       --network "$NETWORK" -e POSTGRES_PASSWORD="$POSTGRES_ADMIN_PASSWORD" \
-      -v abcdeploy-postgres-data:/var/lib/postgresql/data postgres:16-alpine >/dev/null
+      -v abcdeploy-postgres-data:/var/lib/postgresql/data "$POSTGRES_IMAGE" >/dev/null; then
+      echo 'AD-INF-203：服务器数据库没有完成启动' >&2
+      exit 1
+    fi
     POSTGRES_CONTAINER=abcdeploy-postgres
-  else
-    docker network connect "$NETWORK" "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
+  fi
+  docker start "$POSTGRES_CONTAINER" >/dev/null 2>&1 || { echo 'AD-INF-203：服务器数据库无法重新启动' >&2; exit 1; }
+  docker network connect "$NETWORK" "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
+  if ! docker network inspect "$NETWORK" --format '{{range .Containers}}{{println .Name}}{{end}}' | grep -Fx -- "$POSTGRES_CONTAINER" >/dev/null; then
+    echo 'AD-INF-203：服务器数据库无法连接项目运行网络' >&2
+    exit 1
   fi
   ready=0
   for _ in $(seq 1 45); do
@@ -4708,20 +7302,33 @@ SQL
 fi
 
 if [ "$NEEDS_REDIS" = 1 ]; then
+  REDIS_PASSWORD="$(decode '__REDIS_PASSWORD__')"
   REDIS_CONTAINER=''
   for candidate in abcdeploy-redis infra-redis; do
     if docker inspect "$candidate" >/dev/null 2>&1; then REDIS_CONTAINER="$candidate"; break; fi
   done
   if [ -z "$REDIS_CONTAINER" ]; then
-    REDIS_PASSWORD="$(decode '__REDIS_PASSWORD__')"
+    REDIS_DIGEST='sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99'
+    REDIS_LOCAL_IMAGE='abcdeploy/runtime-redis:7-6ab0b6e738177933'
+    resolve_runtime_image '缓存' "$REDIS_DIGEST" "$REDIS_LOCAL_IMAGE" \
+      'mirror.ccs.tencentyun.com/library/redis' \
+      'm.daocloud.io/docker.io/library/redis' \
+      'redis' || exit 1
+    REDIS_IMAGE="$RESOLVED_IMAGE"
     docker volume create abcdeploy-redis-data >/dev/null
-    docker run -d --name abcdeploy-redis --restart unless-stopped --network "$NETWORK" \
-      -v abcdeploy-redis-data:/data redis:7-alpine \
-      redis-server --appendonly yes --requirepass "$REDIS_PASSWORD" >/dev/null
+    if ! docker run -d --name abcdeploy-redis --restart unless-stopped --network "$NETWORK" \
+      -v abcdeploy-redis-data:/data "$REDIS_IMAGE" \
+      redis-server --appendonly yes --requirepass "$REDIS_PASSWORD" >/dev/null; then
+      echo 'AD-INF-204：服务器缓存服务没有完成启动' >&2
+      exit 1
+    fi
     REDIS_CONTAINER=abcdeploy-redis
-  else
-    docker network connect "$NETWORK" "$REDIS_CONTAINER" >/dev/null 2>&1 || true
-    REDIS_PASSWORD="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$REDIS_CONTAINER" | sed -n 's/^REDIS_PASSWORD=//p' | head -n 1)"
+  fi
+  docker start "$REDIS_CONTAINER" >/dev/null 2>&1 || { echo 'AD-INF-204：服务器缓存服务无法重新启动' >&2; exit 1; }
+  docker network connect "$NETWORK" "$REDIS_CONTAINER" >/dev/null 2>&1 || true
+  if ! docker network inspect "$NETWORK" --format '{{range .Containers}}{{println .Name}}{{end}}' | grep -Fx -- "$REDIS_CONTAINER" >/dev/null; then
+    echo 'AD-INF-204：服务器缓存服务无法连接项目运行网络' >&2
+    exit 1
   fi
   ready=0
   for _ in $(seq 1 30); do
@@ -4737,6 +7344,23 @@ if [ "$NEEDS_REDIS" = 1 ]; then
   printf 'REDIS_PASSWORD_B64=%s\n' "$(printf '%s' "$REDIS_PASSWORD" | base64 | tr -d '\n')"
 fi
 "#;
+
+fn remote_dependency_error(stderr: &str) -> String {
+    stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with("AD-") && (line.contains('：') || line.contains(':')))
+        .or_else(|| {
+            stderr
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+        })
+        .unwrap_or("AD-INF-202：服务器运行依赖准备失败")
+        .to_string()
+}
 
 fn safe_postgres_identifier(value: &str) -> bool {
     !value.is_empty()
@@ -4763,10 +7387,10 @@ fn remote_server_id(profile: &ssh::SshProfile) -> String {
     digest[..24].to_string()
 }
 
-fn remote_redis_database(root: &Path, environment: EnvironmentName) -> u8 {
+fn remote_redis_database_for_scope(root: &Path, scope: &str) -> u8 {
     let mut digest = Sha256::new();
     digest.update(project_storage_id(root).as_bytes());
-    digest.update(environment.as_str().as_bytes());
+    digest.update(scope.as_bytes());
     let bytes = digest.finalize();
     (bytes[0] % 15) + 1
 }
@@ -4783,11 +7407,75 @@ fn url_encode_userinfo(value: &str) -> String {
     encoded
 }
 
+fn ensure_runtime_template_variables(mut content: String, required: &[String]) -> String {
+    let existing = content
+        .lines()
+        .filter_map(|line| {
+            let left = line.split_once('=')?.0;
+            let key = left
+                .trim()
+                .strip_prefix("export ")
+                .unwrap_or_else(|| left.trim())
+                .trim();
+            valid_environment_variable(key).then(|| key.to_string())
+        })
+        .collect::<BTreeSet<_>>();
+    let missing = required
+        .iter()
+        .filter(|variable| !existing.contains(*variable))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return content;
+    }
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if !content.is_empty() {
+        content.push_str("\n# ABCDeploy 检测到的必要配置\n");
+    }
+    for variable in missing {
+        writeln!(&mut content, "{variable}=").expect("writing to a String is infallible");
+    }
+    content
+}
+
+fn runtime_defaults(
+    content: &str,
+    secret_variables: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let (left, raw_value) = line.split_once('=')?;
+            let key = left
+                .trim()
+                .strip_prefix("export ")
+                .unwrap_or_else(|| left.trim())
+                .trim();
+            let value = raw_value.trim().trim_matches(['\'', '"']);
+            if !valid_environment_variable(key)
+                || secret_variables.contains(key)
+                || value.is_empty()
+                || remote_runtime_value_invalid(raw_value)
+            {
+                return None;
+            }
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+fn postgres_runtime_url(value: &str) -> bool {
+    let value = value.trim().trim_matches(['\'', '"']);
+    value.starts_with("postgresql://") || value.starts_with("postgres://")
+}
+
 fn fill_managed_runtime_dependencies(
     content: &str,
     suggestions: &BTreeMap<String, String>,
 ) -> (String, Vec<String>) {
     let mut filled = Vec::new();
+    let mut seen_suggestions = BTreeSet::new();
     let mut output = content
         .lines()
         .map(|line| {
@@ -4802,8 +7490,15 @@ fn fill_managed_runtime_dependencies(
             let Some(suggestion) = suggestions.get(key) else {
                 return line.to_string();
             };
+            seen_suggestions.insert(key.to_string());
             let value = raw_value.trim().trim_matches(['\'', '"']);
-            if !value.is_empty() && !remote_runtime_value_invalid(raw_value) {
+            let wrong_managed_protocol = key == "DATABASE_URL"
+                && postgres_runtime_url(suggestion)
+                && !postgres_runtime_url(value);
+            if !value.is_empty()
+                && !remote_runtime_value_invalid(raw_value)
+                && !wrong_managed_protocol
+            {
                 return line.to_string();
             }
             filled.push(key.to_string());
@@ -4811,10 +7506,71 @@ fn fill_managed_runtime_dependencies(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    if content.ends_with('\n') {
+    for (key, suggestion) in suggestions {
+        if seen_suggestions.contains(key) {
+            continue;
+        }
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        writeln!(&mut output, "{key}={}", dotenv_value(suggestion))
+            .expect("writing to a String is infallible");
+        filled.push(key.clone());
+    }
+    if content.ends_with('\n') && !output.ends_with('\n') {
         output.push('\n');
     }
     (output, filled)
+}
+
+fn replace_managed_runtime_dependencies(
+    content: &str,
+    suggestions: &BTreeMap<String, String>,
+    managed_keys: &BTreeSet<String>,
+) -> (String, Vec<String>) {
+    let mut replaced = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut output = content
+        .lines()
+        .map(|line| {
+            let Some((left, _)) = line.split_once('=') else {
+                return line.to_string();
+            };
+            let key = left
+                .trim()
+                .strip_prefix("export ")
+                .unwrap_or_else(|| left.trim())
+                .trim();
+            if !managed_keys.contains(key) {
+                return line.to_string();
+            }
+            let Some(suggestion) = suggestions.get(key) else {
+                return line.to_string();
+            };
+            seen.insert(key.to_string());
+            replaced.push(key.to_string());
+            format!("{left}={}", dotenv_value(suggestion))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for key in managed_keys {
+        if seen.contains(key) {
+            continue;
+        }
+        let Some(suggestion) = suggestions.get(key) else {
+            continue;
+        };
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        writeln!(&mut output, "{key}={}", dotenv_value(suggestion))
+            .expect("writing to a String is infallible");
+        replaced.push(key.clone());
+    }
+    if content.ends_with('\n') && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    (output, replaced)
 }
 
 #[tauri::command]
@@ -4831,6 +7587,17 @@ async fn rollback_environment(
     parse_deploy_environment(&environment)?;
     let root = PathBuf::from(&path);
     let manifest = load_manifest(&root.join(MANIFEST_FILE)).map_err(public_error)?;
+    let rollback_source = if environment == "production" {
+        Some(
+            state
+                .production_rollback_source_run(&root)?
+                .ok_or_else(|| {
+                    "本机没有可核对的上一生产版本，已停止回滚以免切换到未知镜像".to_string()
+                })?,
+        )
+    } else {
+        None
+    };
     let mut run = state.create_deployment_run(
         &root,
         &manifest.project.name,
@@ -4838,6 +7605,12 @@ async fn rollback_environment(
         &manifest.providers.build.repository,
         &manifest.source.release_branch,
     )?;
+    if let Some(source) = &rollback_source {
+        run.commit_sha.clone_from(&source.commit_sha);
+        run.source_title.clone_from(&source.source_title);
+        run.source_run_id = Some(source.id.clone());
+        run.candidate_tag.clone_from(&source.candidate_tag);
+    }
     run.status = "running".to_string();
     run.current_stage = "rollback".to_string();
     run.message = format!(
@@ -4871,6 +7644,12 @@ async fn rollback_environment(
             run.current_stage = "complete".to_string();
             run.message = format!("已安全回滚到 {release}");
             run.completed_steps = vec!["rollback".to_string(), "healthcheck".to_string()];
+            if environment == "production" {
+                finalize_successful_deployment(&mut run, &state).await;
+                if run.status == "success" {
+                    run.message = format!("已安全回滚到 {release}，并核对为历史测试通过版本");
+                }
+            }
         }
         Ok(output) => {
             run.status = "failed".to_string();
@@ -5024,6 +7803,24 @@ fn valid_registry_host(value: &str) -> bool {
         })
 }
 
+fn valid_registry_namespace(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= 100
+        && value == value.to_ascii_lowercase()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+}
+
 fn check_registry_login(
     registry: &str,
     username: &str,
@@ -5161,6 +7958,104 @@ async fn check_registry_credentials(
         .map_err(public_error)?
 }
 
+fn optional_keyring_secret(key: &str) -> Result<Option<Zeroizing<String>>, String> {
+    match read_keyring_secret(key) {
+        Ok(value) => Ok(Some(Zeroizing::new(value))),
+        Err(error) if error == "missing" => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn restore_keyring_secret(key: &str, value: Option<&Zeroizing<String>>) -> Result<(), String> {
+    if let Some(value) = value {
+        write_keyring_secret(key, value.as_str())
+    } else {
+        match delete_keyring_secret(key) {
+            Ok(()) => Ok(()),
+            Err(error) if error == "missing" => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[tauri::command]
+async fn replace_registry_credentials(
+    registry: String,
+    secret_prefix: String,
+    username: String,
+    password: String,
+    state: State<'_, WorkspaceState>,
+) -> Result<ProviderCheck, String> {
+    if !matches!(secret_prefix.as_str(), TCR_SECRET_PREFIX | "registry.oci") {
+        return Err("镜像仓库凭据类型不正确".to_string());
+    }
+    let registry_for_connection = registry.clone();
+    let is_tcr = secret_prefix == TCR_SECRET_PREFIX;
+    let permit = tokio::time::timeout(Duration::from_secs(5), KEYCHAIN_WRITE_GATE.acquire())
+        .await
+        .map_err(|_| "系统密钥库正在处理上一项操作，请稍后再试".to_string())?
+        .map_err(public_error)?;
+    let replace = tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        let username = Zeroizing::new(username.trim().to_string());
+        let password = Zeroizing::new(password);
+        let check = check_registry_login(&registry, username.as_str(), password.as_str())?;
+        if !check.ok {
+            return Ok(check);
+        }
+
+        let username_key = format!("{secret_prefix}.username");
+        let password_key = format!("{secret_prefix}.password");
+        let previous_username = optional_keyring_secret(&username_key)?;
+        let previous_password = optional_keyring_secret(&password_key)?;
+
+        write_keyring_secret(&username_key, username.as_str())?;
+        if let Err(error) = write_keyring_secret(&password_key, password.as_str()) {
+            // 两个字段必须作为一组生效。第二项写入失败时恢复旧值，避免
+            // 留下“新用户名 + 旧密码”的混合连接。
+            let username_restore =
+                restore_keyring_secret(&username_key, previous_username.as_ref());
+            let password_restore =
+                restore_keyring_secret(&password_key, previous_password.as_ref());
+            if username_restore.is_err() || password_restore.is_err() {
+                return Err(
+                    "AD-REG-104：新登录信息没有完整保存，旧连接恢复也未完成，请重新填写后验证"
+                        .to_string(),
+                );
+            }
+            return Err(error);
+        }
+        Ok(check)
+    });
+    let result = tokio::time::timeout(Duration::from_secs(40), replace)
+        .await
+        .map_err(|_| "验证并保存镜像仓库登录信息超时，请重新尝试".to_string())?
+        .map_err(public_error)??;
+    if result.ok && is_tcr {
+        let namespace = state
+            .setting("registry.tcr.namespace")?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let mut metadata = BTreeMap::from([("endpoint".to_string(), registry_for_connection)]);
+        if let Some(namespace) = namespace {
+            metadata.insert("namespace".to_string(), namespace);
+        }
+        let checked_at = Utc::now().to_rfc3339();
+        state.upsert_compat_connection(
+            TCR_REGISTRY_CONNECTION_ID,
+            "registry",
+            "tcr",
+            "腾讯云 TCR",
+            Some("registry.tcr.v2.password"),
+            &metadata,
+            &["push".to_string(), "pull".to_string()],
+            "ready",
+            Some(&checked_at),
+        )?;
+    }
+    Ok(result)
+}
+
 #[tauri::command]
 async fn check_saved_registry_credentials(
     registry: String,
@@ -5212,26 +8107,47 @@ async fn connect_cnb(
     state: State<'_, WorkspaceState>,
 ) -> Result<CnbAccount, String> {
     let token = Zeroizing::new(token);
-    let client = CnbClient::new(token.as_str()).map_err(cnb_public_error)?;
-    let account = fetch_cnb_account(&client).await?;
     if let Some(repository) = repository
         .as_deref()
         .map(str::trim)
         .filter(|repository| !repository.is_empty())
     {
+        // The repository is context for the setup screen, not part of account
+        // authentication. A token that can identify its user and groups is a
+        // valid replacement even when that repository does not expose build
+        // history to it (for example because the token is repository-scoped).
         validate_repository_slug(repository)?;
-        client
-            .recent_builds(repository, 1)
-            .await
-            .map_err(cnb_build_history_error)?;
     }
+    let client = CnbClient::new(token.as_str()).map_err(cnb_public_error)?;
+    let account = fetch_cnb_account(&client).await?;
+    // Persist the newly verified identity before any repository capability is
+    // needed. Repository-specific capabilities are checked by the operation
+    // that actually needs them, with an operation-specific recovery path.
     if persist {
         write_keyring_secret("cnb-token", token.as_str())?;
     } else {
         cache_secret("cnb-token", token.as_str());
     }
-    remember_cnb_account(state.inner(), &account)?;
+    // Once the token is durable (or cached for this session), a failure to
+    // update non-secret SQLite metadata must not make the UI claim that the
+    // replacement token was not saved. Both summaries are reconstructable
+    // from the saved token on the next connection check.
+    save_cnb_connection_metadata_best_effort(
+        || remember_cnb_account(state.inner(), &account),
+        || mark_cnb_connection_ready(state.inner(), &account),
+    );
     Ok(account)
+}
+
+fn save_cnb_connection_metadata_best_effort<Remember, Mark>(remember: Remember, mark: Mark)
+where
+    Remember: FnOnce() -> Result<(), String>,
+    Mark: FnOnce() -> Result<(), String>,
+{
+    let _ = remember();
+    // Keep attempting the first-class connection row even if the legacy
+    // account summary failed; neither metadata write changes token validity.
+    let _ = mark();
 }
 
 #[tauri::command]
@@ -5259,7 +8175,7 @@ async fn get_cnb_account(state: State<'_, WorkspaceState>) -> Result<CnbAccount,
                 namespaces: Vec::new(),
             });
         }
-        Err(error) => return Err(public_error(error)),
+        Err(error) => return Err(cnb_keyring_issue(&error).1.to_string()),
     };
     let client = CnbClient::new(token.as_str()).map_err(cnb_public_error)?;
     let account = fetch_cnb_account(&client).await?;
@@ -5568,6 +8484,26 @@ fn sync_project_to_cnb(
     repository: String,
     branch: String,
     allow_uncommitted: bool,
+    task_id: Option<String>,
+    state: State<'_, WorkspaceState>,
+) -> Result<SourceSyncResult, String> {
+    sync_project_to_cnb_inner(
+        path,
+        repository,
+        branch,
+        allow_uncommitted,
+        task_id,
+        state.inner(),
+    )
+}
+
+fn sync_project_to_cnb_inner(
+    path: String,
+    repository: String,
+    branch: String,
+    allow_uncommitted: bool,
+    task_id: Option<String>,
+    state: &WorkspaceState,
 ) -> Result<SourceSyncResult, String> {
     validate_repository_slug(&repository)?;
     validate_git_branch(&branch)?;
@@ -5576,7 +8512,7 @@ fn sync_project_to_cnb(
         .canonicalize()
         .map_err(|error| format!("项目目录无法读取：{error}"))?;
     let generated_lockfile = ensure_dependency_lockfile(&root)?;
-    let mut committed = ensure_git_repository_for_sync(&root, &branch)?;
+    let initialized = ensure_git_repository_for_sync(&root, &branch)?;
     let mut allowed = deployment_owned_paths(&root);
     if let Some(lockfile) = generated_lockfile {
         allowed.push(lockfile);
@@ -5613,37 +8549,6 @@ fn sync_project_to_cnb(
         ));
     }
 
-    if !allowed.is_empty() {
-        stage_deployment_owned_files(&root, &allowed)?;
-
-        let staged = system_command("git")
-            .current_dir(&root)
-            .args(["diff", "--cached", "--quiet"])
-            .status()
-            .map_err(|error| git_launch_error("检查部署配置", &error))?;
-        if !staged.success() {
-            let mut commit = system_command("git");
-            commit
-                .current_dir(&root)
-                .args([
-                    "-c",
-                    "user.name=ABCDeploy",
-                    "-c",
-                    "user.email=abcdeploy@localhost",
-                    "-c",
-                    "commit.gpgsign=false",
-                    "commit",
-                    "--only",
-                    "-m",
-                    "chore: configure ABCDeploy deployment",
-                    "--",
-                ])
-                .args(&allowed);
-            run_git_command(commit, "提交部署配置")?;
-            committed = true;
-        }
-    }
-
     let token = Zeroizing::new(resolve_cnb_token(String::new())?);
     let credentials = Zeroizing::new(format!("cnb:{}", token.as_str()));
     let authorization = Zeroizing::new(format!(
@@ -5651,7 +8556,37 @@ fn sync_project_to_cnb(
         BASE64.encode(credentials.as_bytes())
     ));
     let remote = format!("https://cnb.cool/{repository}.git");
-    let refspec = format!("HEAD:refs/heads/{branch}");
+    let snapshot_parent = cnb_snapshot_parent(&root, &remote, &branch, authorization.as_str())?;
+    let (commit_sha, snapshot_created) =
+        create_deployment_git_snapshot(&root, &allowed, snapshot_parent.as_deref())?;
+    let committed = initialized || snapshot_created;
+    if let Some(task_id) = task_id {
+        let mut run = state.deployment_run(&task_id)?;
+        let task_root = Path::new(&run.project_path)
+            .canonicalize()
+            .map_err(|error| format!("项目目录无法读取：{error}"))?;
+        if !matches!(run.environment.as_str(), "staging" | "deployment") || task_root != root {
+            return Err("保存的部署任务与即将同步的项目不一致".to_string());
+        }
+        run.repository.clone_from(&repository);
+        run.branch.clone_from(&branch);
+        run.commit_sha = Some(commit_sha.clone());
+        run.source_title = local_git_title(&root, &commit_sha);
+        run.status = "queued".to_string();
+        run.current_stage = "sync-source".to_string();
+        run.issue_code = None;
+        run.action_kind = None;
+        run.message = if run.environment == "deployment" {
+            "当前本地项目已经生成独立快照，正在同步到构建服务".to_string()
+        } else {
+            "完整代码版本已保存，正在同步到 CNB".to_string()
+        };
+        run.updated_at = Utc::now().to_rfc3339();
+        // push 可能自动触发构建，因此必须先保存完整 SHA。
+        state.save_deployment_run(&run)?;
+    }
+
+    let refspec = format!("{commit_sha}:refs/heads/{branch}");
     let mut push = system_command("git");
     push.current_dir(&root)
         .arg("push")
@@ -5664,9 +8599,6 @@ fn sync_project_to_cnb(
         .env_remove("GIT_TRACE")
         .env_remove("GIT_TRACE_CURL");
     run_git_command(push, "同步代码到 CNB")?;
-    let commit_sha = git_stdout(&root, &["rev-parse", "HEAD"])?
-        .trim()
-        .to_string();
     Ok(SourceSyncResult {
         repository,
         branch,
@@ -5851,6 +8783,239 @@ fn ensure_git_repository_for_sync(root: &Path, branch: &str) -> Result<bool, Str
     Ok(true)
 }
 
+/// Creates a detached commit from the current working tree with a temporary
+/// Git index. The user's branch, staging area and local changes stay exactly
+/// where they were; the returned commit is pushed directly to the managed CNB
+/// branch. This is the product contract behind “上线当前本地项目”.
+fn create_deployment_git_snapshot(
+    root: &Path,
+    deployment_owned_paths: &[String],
+    parent_override: Option<&str>,
+) -> Result<(String, bool), String> {
+    let temporary = tempfile::tempdir().map_err(public_error)?;
+    let index = temporary.path().join("index");
+    let index_value = index.to_string_lossy().into_owned();
+    let run = |arguments: &[&str], action: &str| -> Result<std::process::Output, String> {
+        let output = system_command("git")
+            .current_dir(root)
+            .args(arguments)
+            .env("GIT_INDEX_FILE", &index_value)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_TRACE")
+            .env_remove("GIT_TRACE_CURL")
+            .output()
+            .map_err(|error| git_launch_error(action, &error))?;
+        if output.status.success() {
+            Ok(output)
+        } else {
+            Err(git_failure(action, &output.stdout, &output.stderr))
+        }
+    };
+
+    run(&["read-tree", "HEAD"], "准备独立上线快照")?;
+    run(&["add", "--all", "--", "."], "收集当前本地项目")?;
+    if !deployment_owned_paths.is_empty() {
+        let mut command = system_command("git");
+        command
+            .current_dir(root)
+            .args(["add", "--force", "--"])
+            .args(deployment_owned_paths)
+            .env("GIT_INDEX_FILE", &index_value)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_TRACE")
+            .env_remove("GIT_TRACE_CURL");
+        run_git_command(command, "收集 ABCDeploy 生成文件")?;
+    }
+
+    let listed = run(&["ls-files", "-z"], "检查上线快照中的文件")?;
+    let sensitive = listed
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|path| std::str::from_utf8(path).ok())
+        .filter(|path| sensitive_deployment_snapshot_path(path))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    for paths in sensitive.chunks(100) {
+        let mut command = system_command("git");
+        command
+            .current_dir(root)
+            .args(["rm", "-r", "--cached", "--ignore-unmatch", "--"])
+            .args(paths)
+            .env("GIT_INDEX_FILE", &index_value)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_TRACE")
+            .env_remove("GIT_TRACE_CURL");
+        run_git_command(command, "从上线快照排除本机密钥")?;
+    }
+
+    let tree = String::from_utf8_lossy(&run(&["write-tree"], "生成上线快照")?.stdout)
+        .trim()
+        .to_string();
+    let parent = if let Some(parent) = parent_override {
+        checked_git_revision(Some(parent))?
+            .ok_or_else(|| "AD-GIT-105：无法读取 CNB 上一次上线快照".to_string())?
+    } else {
+        checked_git_revision(Some(&git_stdout(root, &["rev-parse", "HEAD"])?))?
+            .ok_or_else(|| "AD-GIT-105：无法读取当前代码版本".to_string())?
+    };
+    let parent_tree_expression = format!("{parent}^{{tree}}");
+    let current_tree = git_stdout(root, &["rev-parse", &parent_tree_expression])?
+        .trim()
+        .to_string();
+    if tree == current_tree {
+        return Ok((parent, false));
+    }
+    let output = system_command("git")
+        .current_dir(root)
+        .args([
+            "-c",
+            "user.name=ABCDeploy",
+            "-c",
+            "user.email=abcdeploy@localhost",
+            "-c",
+            "commit.gpgsign=false",
+            "commit-tree",
+            &tree,
+            "-p",
+            &parent,
+            "-m",
+            "chore: ABCDeploy deployment snapshot",
+        ])
+        .env("GIT_INDEX_FILE", &index_value)
+        .env("GIT_AUTHOR_NAME", "ABCDeploy")
+        .env("GIT_AUTHOR_EMAIL", "abcdeploy@localhost")
+        .env("GIT_COMMITTER_NAME", "ABCDeploy")
+        .env("GIT_COMMITTER_EMAIL", "abcdeploy@localhost")
+        .env_remove("GIT_TRACE")
+        .env_remove("GIT_TRACE_CURL")
+        .output()
+        .map_err(|error| git_launch_error("保存独立上线快照", &error))?;
+    if !output.status.success() {
+        return Err(git_failure(
+            "保存独立上线快照",
+            &output.stdout,
+            &output.stderr,
+        ));
+    }
+    let revision = checked_git_revision(Some(&String::from_utf8_lossy(&output.stdout)))?
+        .ok_or_else(|| "AD-GIT-105：独立上线快照没有返回完整版本".to_string())?;
+    Ok((revision, true))
+}
+
+/// Returns the parent for a new detached deployment snapshot without changing
+/// the user's branch. A remote-only tip is reusable only when it is an exact
+/// `ABCDeploy` snapshot; arbitrary CNB-side commits are never overwritten.
+fn cnb_snapshot_parent(
+    root: &Path,
+    remote: &str,
+    branch: &str,
+    authorization: &str,
+) -> Result<Option<String>, String> {
+    let remote_ref = format!("refs/heads/{branch}");
+    let mut list = system_command("git");
+    list.current_dir(root)
+        .args(["ls-remote", "--heads", remote, &remote_ref])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "http.https://cnb.cool/.extraHeader")
+        .env("GIT_CONFIG_VALUE_0", authorization)
+        .env_remove("GIT_TRACE")
+        .env_remove("GIT_TRACE_CURL");
+    let listed = list
+        .output()
+        .map_err(|error| git_launch_error("检查 CNB 部署分支", &error))?;
+    if !listed.status.success() {
+        return Err(git_failure(
+            "检查 CNB 部署分支",
+            &listed.stdout,
+            &listed.stderr,
+        ));
+    }
+    let Some(remote_tip) = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .find_map(|revision| checked_git_revision(Some(revision)).ok().flatten())
+    else {
+        return Ok(None);
+    };
+    let local_head = checked_git_revision(Some(&git_stdout(root, &["rev-parse", "HEAD"])?))?
+        .ok_or_else(|| "AD-GIT-105：无法读取当前代码版本".to_string())?;
+    if remote_tip == local_head {
+        return Ok(None);
+    }
+
+    let mut fetch = system_command("git");
+    fetch
+        .current_dir(root)
+        .args([
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--depth=1",
+            remote,
+            &remote_ref,
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "http.https://cnb.cool/.extraHeader")
+        .env("GIT_CONFIG_VALUE_0", authorization)
+        .env_remove("GIT_TRACE")
+        .env_remove("GIT_TRACE_CURL");
+    run_git_command(fetch, "读取 CNB 上一次上线快照")?;
+
+    let ancestor = system_command("git")
+        .current_dir(root)
+        .args(["merge-base", "--is-ancestor", &remote_tip, &local_head])
+        .status()
+        .map_err(|error| git_launch_error("核对 CNB 部署分支", &error))?;
+    if ancestor.success() {
+        return Ok(None);
+    }
+    let metadata = git_stdout(
+        root,
+        &["show", "-s", "--format=%an%x00%ae%x00%s", &remote_tip],
+    )?;
+    let mut fields = metadata.trim_end().split('\0');
+    let managed = fields.next() == Some("ABCDeploy")
+        && fields.next() == Some("abcdeploy@localhost")
+        && fields.next() == Some("chore: ABCDeploy deployment snapshot");
+    if !managed {
+        return Err(
+            "AD-GIT-102：CNB 部署分支包含非 ABCDeploy 更新，已停止覆盖；请先同步代码后重试"
+                .to_string(),
+        );
+    }
+    Ok(Some(remote_tip))
+}
+
+fn sensitive_deployment_snapshot_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    if is_deployment_internal_path(&normalized) {
+        return true;
+    }
+    let file = normalized.rsplit('/').next().unwrap_or(&normalized);
+    let lower = file.to_ascii_lowercase();
+    if lower == ".env"
+        || (lower.starts_with(".env.")
+            && !matches!(
+                lower.as_str(),
+                ".env.example" | ".env.sample" | ".env.template"
+            ))
+    {
+        return true;
+    }
+    let sensitive_extension = Path::new(file)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ["pem", "key", "p12", "pfx"]
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        });
+    matches!(lower.as_str(), "id_rsa" | "id_ed25519") || sensitive_extension
+}
+
+#[cfg(test)]
 fn stage_deployment_owned_files(root: &Path, paths: &[String]) -> Result<(), String> {
     let mut add = system_command("git");
     // 项目常见的 `build/` 忽略规则也会命中
@@ -5862,26 +9027,103 @@ fn stage_deployment_owned_files(root: &Path, paths: &[String]) -> Result<(), Str
     run_git_command(add, "暂存部署配置")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredCnbToken<'a> {
+    Present(&'a str),
+    Missing,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CnbTokenResolutionError {
+    StoredCredentialUnavailable,
+}
+
+fn resolve_cnb_token_sources(
+    provided: &str,
+    stored: StoredCnbToken<'_>,
+    environment: Option<&str>,
+    git_credential: Option<&str>,
+) -> Result<Option<String>, CnbTokenResolutionError> {
+    if let Some(token) = [provided]
+        .into_iter()
+        .map(str::trim)
+        .find(|token| !token.is_empty())
+        .map(ToString::to_string)
+    {
+        return Ok(Some(token));
+    }
+
+    match stored {
+        StoredCnbToken::Present(token) if !token.trim().is_empty() => {
+            return Ok(Some(token.trim().to_string()));
+        }
+        StoredCnbToken::Unavailable => {
+            return Err(CnbTokenResolutionError::StoredCredentialUnavailable);
+        }
+        StoredCnbToken::Present(_) | StoredCnbToken::Missing => {}
+    }
+
+    Ok([environment, git_credential]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|token| !token.is_empty())
+        .map(ToString::to_string))
+}
+
+fn cnb_keyring_issue(error: &str) -> (&'static str, &'static str) {
+    if error == "missing" {
+        ("AD-CNB-101", CNB_LOGIN_MISSING_ERROR)
+    } else {
+        ("AD-CNB-108", CNB_KEYCHAIN_UNAVAILABLE_ERROR)
+    }
+}
+
 fn resolve_cnb_token(mut provided: String) -> Result<String, String> {
-    if !provided.trim().is_empty() {
-        let token = provided.trim().to_string();
+    // Do not touch the system keychain when the current UI action already
+    // supplied a token. Besides being faster, this prevents an unrelated
+    // keychain availability error from rejecting a valid replacement token.
+    if let Some(token) = resolve_cnb_token_sources(&provided, StoredCnbToken::Missing, None, None)
+        .expect("a missing stored token cannot fail")
+    {
         provided.zeroize();
         return Ok(token);
     }
     provided.zeroize();
-    if let Ok(token) = std::env::var("CNB_TOKEN") {
-        let token = token.trim();
-        if !token.is_empty() {
-            return Ok(token.to_string());
+
+    // A token successfully saved by the connection screen is cached in the
+    // same process and must outrank stale shell or Git credentials.
+    if let Some(cached) = cached_secret("cnb-token") {
+        let cached = Zeroizing::new(cached);
+        if !cached.trim().is_empty() {
+            return Ok(cached.trim().to_string());
         }
     }
-    if let Ok(token) = read_keyring_secret_without_prompt("cnb-token")
-        && !token.trim().is_empty()
-    {
+
+    let (stored, stored_unavailable) = match read_keyring_secret_without_prompt("cnb-token") {
+        Ok(token) => (Some(Zeroizing::new(token)), false),
+        Err(error) if error == "missing" => (None, false),
+        Err(_) => (None, true),
+    };
+    let environment = std::env::var("CNB_TOKEN").ok();
+    let stored_source = if stored_unavailable {
+        StoredCnbToken::Unavailable
+    } else {
+        stored.as_deref().map_or(StoredCnbToken::Missing, |token| {
+            StoredCnbToken::Present(token.as_str())
+        })
+    };
+    let selected = resolve_cnb_token_sources("", stored_source, environment.as_deref(), None)
+        .map_err(|_| CNB_KEYCHAIN_UNAVAILABLE_ERROR.to_string())?;
+    if let Some(token) = selected {
         return Ok(token);
     }
-    read_cnb_git_credential()
-        .map_err(|_| "AD-CNB-101：CNB 登录状态已失效，请返回连接步骤重新授权".to_string())
+
+    let git_credential = read_cnb_git_credential().ok();
+    resolve_cnb_token_sources("", StoredCnbToken::Missing, None, git_credential.as_deref())
+        .expect("a missing stored token cannot fail")
+        .ok_or_else(|| "AD-CNB-101：CNB 登录状态已失效，请返回连接步骤重新授权".to_string())
 }
 
 fn read_cnb_git_credential() -> Result<String, String> {
@@ -6009,11 +9251,12 @@ fn runtime_config_template(
         .map(|variable| variable.name.clone())
         .collect::<BTreeSet<_>>();
     let prepare_content = |content: String| {
-        if environment == EnvironmentName::Development {
+        let content = if environment == EnvironmentName::Development {
             content
         } else {
             remote_runtime_content(&content, &secret_variables, true)
-        }
+        };
+        ensure_runtime_template_variables(content, &required_variables)
     };
     let mut sections = Vec::new();
     for relative in &inspection.environment_files {
@@ -6127,6 +9370,10 @@ fn required_runtime_variables(
     let mut variables = manifest
         .services
         .iter()
+        // A static image has already baked Vite/Taro/UniApp variables into
+        // its assets. Asking for them again on the server cannot change that
+        // image and creates a false deployment blocker.
+        .filter(|service| service.kind != deploy_core::model::ServiceKind::Static)
         .flat_map(|service| &service.runtime_env)
         .filter(|variable| variable.required)
         .map(|variable| variable.name.clone())
@@ -6143,11 +9390,31 @@ fn required_runtime_variables(
     variables
 }
 
+fn deployment_path_managed_runtime_variables(
+    manifest: &deploy_core::ProjectManifest,
+) -> BTreeSet<String> {
+    const OCR_URL_VARIABLE: &str = "PP_OCRV6_TINY_URL";
+    let has_ocr = manifest.services.iter().any(|service| service.id == "ocr");
+    if has_ocr
+        && manifest.services.iter().any(|service| {
+            service
+                .runtime_env
+                .iter()
+                .any(|variable| variable.name == OCR_URL_VARIABLE)
+        })
+    {
+        BTreeSet::from([OCR_URL_VARIABLE.to_string()])
+    } else {
+        BTreeSet::new()
+    }
+}
+
 fn parse_runtime_environment(value: &str) -> Result<EnvironmentName, String> {
     match value {
         "development" => Ok(EnvironmentName::Development),
         "staging" => Ok(EnvironmentName::Staging),
         "production" => Ok(EnvironmentName::Production),
+        value if valid_deployment_path_scope(value) => Ok(EnvironmentName::Production),
         _ => Err("项目运行环境名称不正确".to_string()),
     }
 }
@@ -6156,8 +9423,17 @@ fn parse_deploy_environment(value: &str) -> Result<EnvironmentName, String> {
     match value {
         "staging" => Ok(EnvironmentName::Staging),
         "production" => Ok(EnvironmentName::Production),
+        value if valid_deployment_path_scope(value) => Ok(EnvironmentName::Production),
         _ => Err("持续部署密钥只能用于测试或生产环境".to_string()),
     }
+}
+
+fn valid_deployment_path_scope(value: &str) -> bool {
+    value.starts_with("path-")
+        && value.len() <= 80
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn config_profile_secret_key(profile_id: &str, field: &str) -> String {
@@ -7025,7 +10301,7 @@ fn local_development_services(
                 container_port,
                 Some(build_target),
                 format!(
-                    "node -e \"fetch('http://127.0.0.1:{}{}').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))\"",
+                    "node -e \"fetch('http://127.0.0.1:{}{}').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
                     container_port, service.healthcheck.path
                 ),
             )
@@ -8352,6 +11628,23 @@ fn public_error(error: impl std::fmt::Display) -> String {
 }
 
 fn cnb_public_error(error: DeployError) -> String {
+    if let DeployError::CnbApi {
+        status: 403,
+        message,
+    } = &error
+    {
+        let scopes = missing_permission_scopes(message);
+        if scopes.len() == 1 && scopes[0] == "repo-cnb-history:r" {
+            return "AD-CNB-103：CNB 授权缺少“构建记录读取”权限（repo-cnb-history:r）".to_string();
+        }
+        if scopes.len() == 1 && scopes[0] == "repo-cnb-trigger:rw" {
+            return "AD-CNB-103：CNB 授权缺少“触发构建”权限（repo-cnb-trigger:rw）".to_string();
+        }
+        if !scopes.is_empty() {
+            return format!("AD-CNB-103：CNB 授权缺少以下权限：{}", scopes.join("、"));
+        }
+    }
+
     let (code, message) = match error {
         DeployError::MissingCredential(_) | DeployError::CnbApi { status: 401, .. } => {
             ("AD-CNB-101", "CNB 登录状态已失效，请返回连接步骤重新授权")
@@ -8360,23 +11653,10 @@ fn cnb_public_error(error: DeployError) -> String {
             ("AD-CNB-107", "CNB 请求过于频繁，请稍后重新尝试")
         }
         DeployError::Http(_) => ("AD-CNB-102", "暂时无法连接 CNB，请检查网络后重试"),
-        DeployError::CnbApi {
-            status: 403,
-            message,
-        } if message.contains("repo-cnb-history:r") => (
+        DeployError::CnbApi { status: 403, .. } => (
             "AD-CNB-103",
-            "CNB 授权缺少“构建记录读取”权限（repo-cnb-history:r）",
+            "CNB 拒绝当前操作；令牌的授权范围或使用范围可能不适用于当前资源，请检查授权设置",
         ),
-        DeployError::CnbApi {
-            status: 403,
-            message,
-        } if message.contains("repo-cnb-trigger:rw") => (
-            "AD-CNB-103",
-            "CNB 授权缺少“触发构建”权限（repo-cnb-trigger:rw）",
-        ),
-        DeployError::CnbApi { status: 403, .. } => {
-            ("AD-CNB-103", "CNB 授权不完整，请补齐连接页列出的权限")
-        }
         DeployError::CnbApi { status: 404, .. } => {
             ("AD-CNB-104", "CNB 中找不到所选组织或仓库，请重新选择组织")
         }
@@ -8402,11 +11682,331 @@ fn cnb_public_error(error: DeployError) -> String {
 
 fn cnb_build_history_error(error: DeployError) -> String {
     match error {
-        DeployError::CnbApi { status: 403, .. } => {
+        DeployError::CnbApi {
+            status: 403,
+            message,
+        } if message.contains("repo-cnb-history:r") => {
             "AD-CNB-103：CNB 授权缺少“构建记录读取”权限（repo-cnb-history:r）".to_string()
+        }
+        DeployError::CnbApi { status: 403, .. } => {
+            "AD-CNB-103：CNB 拒绝读取这个仓库的构建记录；令牌的授权范围（scope）或使用范围可能不匹配当前仓库，请检查 CNB 授权设置"
+                .to_string()
         }
         other => cnb_public_error(other),
     }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PilotDeploymentEvidence {
+    project: String,
+    deployment_path_id: String,
+    task_id: String,
+    status: String,
+    build_serial: Option<String>,
+    commit_sha: Option<String>,
+    artifacts: Vec<DeploymentArtifact>,
+    public_urls: Vec<String>,
+}
+
+/// Runs the same path engine as the desktop UI for a real-project acceptance
+/// pilot. This intentionally lives behind a hidden binary argument: it is a
+/// local QA entry point, not a second deployment implementation or a user
+/// workflow. Output contains only immutable identifiers and public URLs.
+pub fn run_pilot_validation_cli(project_path: &str) -> Result<(), String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "无法定位当前用户目录".to_string())?;
+    let database = home
+        .join("Library")
+        .join("Application Support")
+        .join("cloud.finagent.abcdeploy")
+        .join("workspace.sqlite3");
+    let state = WorkspaceState::open(&database)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(public_error)?;
+    let evidence = runtime.block_on(run_pilot_validation(PathBuf::from(project_path), &state))?;
+    let output = serde_json::to_string_pretty(&evidence).map_err(public_error)?;
+    println!("{output}");
+    Ok(())
+}
+
+async fn run_pilot_validation(
+    root: PathBuf,
+    state: &WorkspaceState,
+) -> Result<PilotDeploymentEvidence, String> {
+    let root = root.canonicalize().map_err(public_error)?;
+    if !root.join(MANIFEST_FILE).is_file() {
+        return Err("试点项目缺少 deploy.yaml".to_string());
+    }
+    reconcile_compat_connections(state)?;
+    open_project_preview(root.clone(), state)?;
+    if state.project_adoption(&root)?.mode == "pending" {
+        state.continue_existing_deployment(&root)?;
+    }
+
+    let inspection = inspect_project(&root).map_err(public_error)?;
+    let mut manifest = load_manifest(&root.join(MANIFEST_FILE)).map_err(public_error)?;
+    reconcile_detected_services(&inspection, &mut manifest);
+    let (namespace, repository_name) = manifest
+        .providers
+        .build
+        .repository
+        .split_once('/')
+        .ok_or_else(|| "构建仓库格式不正确".to_string())?;
+    let setup = ensure_cnb_repository(namespace.to_string(), repository_name.to_string()).await?;
+    manifest
+        .providers
+        .build
+        .repository
+        .clone_from(&setup.repository);
+    if manifest.source.repository.starts_with("owner/")
+        || manifest.source.repository.contains("replace-me")
+    {
+        manifest.source.repository.clone_from(&setup.repository);
+    }
+    let validation = validate_manifest(&manifest);
+    if !validation.valid {
+        return Err("试点项目的部署配置没有通过校验".to_string());
+    }
+    let plan = build_plan(&root, &inspection, &manifest).map_err(public_error)?;
+    apply_plan(&root, &plan).map_err(public_error)?;
+    state.mark_project_fresh_draft_saved(&root)?;
+    state.set_project_step(&root, "workspace")?;
+
+    // The pilot must exercise the same line that the user sees in the UI.
+    // Creating a hidden parallel line would let it take over the same public
+    // host while the visible line still reported an older version as online.
+    let existing = state
+        .list_deployment_paths(&root)?
+        .into_iter()
+        .find(|path| path.name == "上线")
+        .or_else(|| state.list_deployment_paths(&root).ok()?.into_iter().next())
+        .ok_or_else(|| "请先在客户端创建并配置一条可见的上线线路".to_string())?;
+    if existing.routes.is_empty() {
+        return Err("请先在线路的运行服务器节点设置访问地址".to_string());
+    }
+    let source_id = existing
+        .source_connection_id
+        .as_deref()
+        .ok_or_else(|| "请先在线路中选择构建服务".to_string())?;
+    let source = state.connection_by_id(source_id)?;
+    if source.kind != "source" || source.provider != "cnb" || source.status != "ready" {
+        return Err("线路当前选择的构建服务尚未验证".to_string());
+    }
+    let registry_id = existing
+        .registry_connection_id
+        .as_deref()
+        .ok_or_else(|| "请先在线路中选择版本仓库".to_string())?;
+    let registry = state.connection_by_id(registry_id)?;
+    if registry.kind != "registry" || registry.status != "ready" {
+        return Err("线路当前选择的版本仓库尚未验证".to_string());
+    }
+    let server_id = existing
+        .server_id
+        .as_deref()
+        .ok_or_else(|| "请先在线路中选择运行服务器".to_string())?;
+    let server = state.server_by_id(server_id)?;
+    if !server.key_path_exists || server.host_fingerprint.is_none() {
+        return Err("线路当前选择的运行服务器尚未验证".to_string());
+    }
+    let path = state.save_deployment_path(DeploymentPathInput {
+        id: Some(existing.id.clone()),
+        project_path: root.to_string_lossy().into_owned(),
+        name: existing.name.clone(),
+        source_connection_id: Some(source.id),
+        registry_connection_id: Some(registry.id),
+        server_id: Some(server.id),
+        config_profile_ids: existing.config_profile_ids.clone(),
+        address: existing.address.clone(),
+        routes: existing.routes.clone(),
+        state: Some("ready".to_string()),
+        last_run_id: existing.last_run_id.clone(),
+        last_successful_revision: existing.last_successful_revision,
+    })?;
+    seed_pilot_runtime_config(&root, &path.id)?;
+
+    let profile = verified_deployment_path_profile(&path, state).await?;
+    let caddy_check = caddy::bootstrap_server(&profile, true)
+        .await
+        .map_err(public_error)?;
+    if !caddy_check.ok {
+        return Err(caddy_check.summary);
+    }
+    state.remember_checked_server(&profile)?;
+
+    // A repaired address resumes the same immutable task. This is the same
+    // continuation rule as the visible UI: completed build/registry work is
+    // retained, only the server node gets a fresh append-only attempt.
+    if let Some(last_run_id) = path.last_run_id.as_deref()
+        && let Ok(previous) = state.deployment_run(last_run_id)
+        && matches!(previous.status.as_str(), "queued" | "running")
+    {
+        let run = await_pilot_deployment(&manifest.project.name, previous, state).await?;
+        return Ok(pilot_evidence(manifest.project.name, path.id, run));
+    }
+    if let Some(last_run_id) = path.last_run_id.as_deref()
+        && let Ok(previous) = state.deployment_run(last_run_id)
+        && previous.status == "needs_action"
+        && !previous.artifacts.is_empty()
+        && pilot_can_resume_existing_artifacts(&previous)
+    {
+        let prepared =
+            prepare_deployment_path_retry_inner(previous.id, "server".to_string(), state)?;
+        // The visible “继续上线” button invokes refresh after a repaired node
+        // has been selected. The pilot must exercise that exact continuation
+        // boundary as well instead of treating the prepared needs-action
+        // record as a terminal error.
+        let run = refresh_deployment_path(prepared, state).await?;
+        let run = await_pilot_deployment(&manifest.project.name, run, state).await?;
+        return Ok(pilot_evidence(manifest.project.name, path.id, run));
+    }
+
+    let task = create_deployment_task_inner(
+        root.to_string_lossy().into_owned(),
+        "deployment".to_string(),
+        None,
+        Some(path.id.clone()),
+        state,
+    )?;
+    state.begin_deployment_attempt(&task.id)?;
+    let source = sync_project_to_cnb_inner(
+        root.to_string_lossy().into_owned(),
+        manifest.providers.build.repository.clone(),
+        manifest.source.release_branch.clone(),
+        true,
+        Some(task.id.clone()),
+        state,
+    )?;
+    let run = start_deployment_path_inner(
+        root.to_string_lossy().into_owned(),
+        source.commit_sha,
+        task.id,
+        state,
+    )
+    .await?;
+    let run = await_pilot_deployment(&manifest.project.name, run, state).await?;
+    Ok(pilot_evidence(manifest.project.name, path.id, run))
+}
+
+fn pilot_can_resume_existing_artifacts(run: &DeploymentRun) -> bool {
+    let unhealthy_container =
+        run.message.contains("container ") && run.message.contains(" is unhealthy");
+    let artifact_failure = run.issue_code.as_deref().is_some_and(|code| {
+        ["AD-BLD-", "AD-PKG-", "AD-IMG-", "AD-CTR-"]
+            .iter()
+            .any(|prefix| code.starts_with(prefix))
+    });
+    !unhealthy_container && !artifact_failure
+}
+
+async fn await_pilot_deployment(
+    project_name: &str,
+    mut run: DeploymentRun,
+    state: &WorkspaceState,
+) -> Result<DeploymentRun, String> {
+    let started = Instant::now();
+    let mut retries = 0_u8;
+    let mut last_progress = String::new();
+    loop {
+        let progress = format!("{}:{}", run.status, run.current_stage);
+        if progress != last_progress {
+            eprintln!("ABCDeploy pilot {project_name} {progress}");
+            last_progress = progress;
+        }
+        match run.status.as_str() {
+            "success" => break,
+            "needs_action"
+                if run.action_kind.as_deref() == Some("deployment-path-route-takeover") =>
+            {
+                run = take_over_deployment_path_routes_inner(run.id, true, state).await?;
+                continue;
+            }
+            "needs_action" if run.action_kind.as_deref() == Some("deployment-path-route-check") => {
+                if retries >= 12 {
+                    return Err(run.message);
+                }
+                retries += 1;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            "failed" | "cancelled" | "needs_action" => return Err(run.message),
+            "queued" | "running" => {
+                tokio::time::sleep(Duration::from_secs(8)).await;
+            }
+            _ => return Err("上线任务返回了无法识别的状态".to_string()),
+        }
+        if started.elapsed() > Duration::from_mins(90) {
+            return Err("试点上线超过 90 分钟，已停止本次验收".to_string());
+        }
+        run = refresh_deployment_path(run, state).await?;
+    }
+    Ok(run)
+}
+
+fn pilot_evidence(
+    project: String,
+    deployment_path_id: String,
+    run: DeploymentRun,
+) -> PilotDeploymentEvidence {
+    PilotDeploymentEvidence {
+        project,
+        deployment_path_id,
+        task_id: run.id,
+        status: run.status,
+        build_serial: run.build_serial,
+        commit_sha: run.commit_sha,
+        artifacts: run.artifacts,
+        public_urls: run
+            .route_checks
+            .into_iter()
+            .filter(|check| check.reachable)
+            .map(|check| check.url)
+            .collect(),
+    }
+}
+
+fn seed_pilot_runtime_config(root: &Path, path_id: &str) -> Result<(), String> {
+    let target_key = runtime_config_key(root, path_id)?;
+    let mut content = match read_keyring_secret(&target_key) {
+        Ok(value) if !value.trim().is_empty() => Zeroizing::new(value),
+        Ok(mut value) => {
+            value.zeroize();
+            Zeroizing::new(String::new())
+        }
+        Err(error) if error == "missing" => Zeroizing::new(String::new()),
+        Err(error) => return Err(error),
+    };
+    if content.trim().is_empty() {
+        for scope in ["production", "staging", "development"] {
+            let key = runtime_config_key(root, scope)?;
+            if let Ok(mut value) = read_keyring_secret(&key)
+                && !value.trim().is_empty()
+            {
+                *content = remote_runtime_content(&value, &BTreeSet::new(), false);
+                value.zeroize();
+                break;
+            }
+        }
+    }
+    if content.trim().is_empty() {
+        for filename in [".env.production", ".env.staging", ".env"] {
+            let path = root.join(filename);
+            if let Ok(mut value) = fs::read_to_string(path)
+                && !value.trim().is_empty()
+            {
+                *content = remote_runtime_content(&value, &BTreeSet::new(), false);
+                value.zeroize();
+                break;
+            }
+        }
+    }
+
+    if !content.trim().is_empty() {
+        write_keyring_secret(&target_key, &content)?;
+    }
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -8436,6 +12036,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_preflight,
             open_project,
+            continue_existing_deployment,
+            reset_project_deployment,
             relink_project,
             list_recent_projects,
             save_project_step,
@@ -8446,11 +12048,19 @@ pub fn run() {
             get_app_setting,
             get_app_settings,
             set_app_setting,
+            list_connections,
+            get_project_connection_bindings,
+            list_deployment_paths,
+            list_deployment_path_runs,
+            save_deployment_path,
+            delete_deployment_path,
+            redeploy_deployment_path_version,
             list_config_profiles,
             save_config_profile,
             delete_config_profile,
             bind_config_profile,
             list_config_profile_bindings,
+            set_environment_config_bindings,
             recommend_runtime_config,
             write_local_env,
             get_local_infrastructure_status,
@@ -8466,12 +12076,24 @@ pub fn run() {
             get_local_preview_status,
             stop_local_preview,
             stop_local_preview_service,
+            create_deployment_task,
+            begin_deployment_attempt,
+            list_deployment_attempts,
+            pause_deployment_task,
+            prepare_deployment_path_retry,
             start_staging_deployment,
+            start_deployment_path,
             resume_staging_deployment,
             promote_production_deployment,
             refresh_deployment,
+            check_deployment_routes,
+            retry_deployment_certificates,
             open_staging_preview_tunnel,
             list_deployment_runs,
+            list_project_environments,
+            list_project_versions,
+            list_version_validations,
+            set_version_validation,
             list_active_deployment_runs,
             list_attention_deployment_runs,
             list_recent_successful_deployment_runs,
@@ -8487,6 +12109,7 @@ pub fn run() {
             bootstrap_server_caddy,
             inspect_server_route_conflicts,
             take_over_server_routes,
+            take_over_deployment_path_routes,
             reapply_deployment_routes,
             detect_dns_provider,
             prepare_pipeline_identity,
@@ -8504,6 +12127,7 @@ pub fn run() {
             store_secret,
             delete_secret,
             check_registry_credentials,
+            replace_registry_credentials,
             check_saved_registry_credentials,
             connect_cnb,
             get_cnb_account,
@@ -8539,39 +12163,57 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet};
     use std::{fmt::Write as _, fs, path::Path, process::Command};
 
+    use base64::Engine as _;
     use serde_json::json;
     use tempfile::tempdir;
 
     use super::{
-        CNB_ACCOUNT_CACHE_KEY, CnbBuildRecord, DeploymentRun, LocalPreviewService,
-        LocalPreviewStatus, ProjectRelinkIdentity, WorkspaceState, apply_container_log_diagnostic,
-        apply_deployed_service_states, apply_planned_local_build_strategies,
-        apply_public_route_checks, apply_runner_log_diagnostic, apply_server_route_problem,
+        BASE64, CNB_ACCOUNT_CACHE_KEY, CNB_KEYCHAIN_UNAVAILABLE_ERROR, CnbBuildRecord,
+        CnbTokenResolutionError, DeploymentArtifact, DeploymentPath, DeploymentRun,
+        LocalPreviewService, LocalPreviewStatus, ProjectRelinkIdentity, REMOTE_DEPENDENCY_SCRIPT,
+        RegistryConfig, ServerRouteProblem, ServerRouteProblemKind, StoredCnbToken, WorkspaceState,
+        apply_container_log_diagnostic, apply_deployed_service_states,
+        apply_planned_local_build_strategies, apply_public_route_checks,
+        apply_runner_log_diagnostic, apply_server_route_problem, apply_server_route_problems,
         apply_server_route_takeover_problem, apply_version_title, build_environment_for_event,
         build_serial_for_revision, cache_secret, cached_cnb_account, cached_secret,
-        cloud_setup_required, cnb_account_from_responses, cnb_build_history_error,
-        cnb_public_error, cnb_secret_filename, container_runtime_env, deployment_manifest,
-        deployment_owned_paths, deployment_routing_manifest, ensure_git_repository_for_sync,
-        evict_cached_secret, existing_cnb_repository, fill_empty_runtime_values,
-        fill_managed_runtime_dependencies, git_failure, is_deployment_internal_path,
-        is_deployment_owned_path, is_production_approval_build, load_existing_project_config,
-        local_build_failure_summary, local_build_proxy_attempts, local_database_name,
-        local_git_title, local_infrastructure_compose, local_start_failure,
-        looks_like_dependency_network_text, parse_deployed_service_states,
-        parse_deployment_artifacts, parse_local_container_readiness,
-        parse_managed_local_port_owner, readable_version_title, remember_cnb_account,
-        repository_identity, rollback_script, run_local_build_with_recovery,
-        runnable_local_service_ids, runtime_config_key, runtime_config_template,
+        caddy_certificate_reload_script, caddy_main_route_rewrite_shell_function,
+        caddy_route_declared_shell_function, certificate_retry_allowed, cloud_setup_required,
+        cnb_account_from_responses, cnb_build_history_error, cnb_keyring_issue, cnb_public_error,
+        cnb_secret_filename, container_runtime_env, create_deployment_git_snapshot,
+        deployment_manifest, deployment_needs_public_route_recheck, deployment_owned_paths,
+        deployment_path_managed_runtime_variables, deployment_path_manifest,
+        deployment_path_owns_history_reconciliation, deployment_routing_manifest,
+        ensure_git_repository_for_sync, ensure_runtime_template_variables, evict_cached_secret,
+        existing_cnb_repository, fill_empty_runtime_values, fill_managed_runtime_dependencies,
+        git_failure, git_stdout, internal_runtime_secret, interrupted_public_route_status,
+        interrupted_route_check_message, is_deployment_internal_path, is_deployment_owned_path,
+        is_production_approval_build, latest_success_serials_by_environment,
+        load_existing_project_config, local_build_failure_summary, local_build_proxy_attempts,
+        local_database_name, local_git_title, local_infrastructure_compose, local_start_failure,
+        looks_like_dependency_network_text, ordered_build_records, overlay_server_route_problems,
+        parse_deployed_service_states, parse_deployment_artifacts, parse_local_container_readiness,
+        parse_managed_local_port_owner, pause_deployment_path_after_deploy_error,
+        pause_public_route_inspection, pilot_can_resume_existing_artifacts,
+        prepare_deployment_path_retry_inner, provider_check_failure, readable_version_title,
+        remember_cnb_account, remote_dependency_error, replace_managed_runtime_dependencies,
+        repository_identity, required_runtime_variables, resolve_cnb_token_sources,
+        rollback_script, run_git_command, run_local_build_with_recovery,
+        runnable_local_service_ids, runtime_config_key, runtime_config_template, runtime_defaults,
         runtime_secret_key, safe_postgres_identifier, same_artifact_digests,
-        services_use_public_generated_dockerfiles, stage_deployment_owned_files, stage_key,
-        update_run_from_cnb, url_encode_userinfo, valid_registry_host, validate_git_branch,
-        validate_project_relink, validate_repository_slug, write_project_local_env,
+        save_cnb_connection_metadata_best_effort, serialize_manifest,
+        server_route_activation_script, services_use_public_generated_dockerfiles,
+        split_deployment_error, stage_deployment_owned_files, stage_key, system_command,
+        update_run_from_cnb, url_encode_userinfo, valid_registry_host,
+        validate_deployment_routing_manifest, validate_git_branch, validate_project_relink,
+        validate_repository_slug, verify_public_routes, write_project_local_env,
     };
     use deploy_core::error::DeployError;
-    use deploy_core::model::{EnvironmentName, PackageManager, PublicRouteCheck};
+    use deploy_core::model::{EnvironmentName, PackageManager, ProviderCheck, PublicRouteStatus};
 
     fn run() -> DeploymentRun {
         DeploymentRun {
@@ -8587,6 +12229,7 @@ mod tests {
             source_run_id: None,
             candidate_tag: None,
             artifacts: Vec::new(),
+            route_checks: Vec::new(),
             action_kind: None,
             action_url: None,
             issue_code: None,
@@ -8626,6 +12269,162 @@ mod tests {
         assert_eq!(
             runnable_local_service_ids(&status),
             vec!["api".to_string(), "web".to_string()]
+        );
+    }
+
+    #[test]
+    fn unhealthy_image_requires_an_update_instead_of_redeploying_the_same_artifacts() {
+        let mut deployment = run();
+        deployment.artifacts.push(DeploymentArtifact {
+            service: "api".to_string(),
+            image: "registry.example/api".to_string(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+        });
+        pause_deployment_path_after_deploy_error(
+            &mut deployment,
+            "container sample-api-1 is unhealthy",
+        );
+
+        assert_eq!(deployment.issue_code.as_deref(), Some("AD-CTR-201"));
+        assert_eq!(
+            deployment.action_kind.as_deref(),
+            Some("deployment-path-image-update")
+        );
+        assert!(!pilot_can_resume_existing_artifacts(&deployment));
+    }
+
+    #[test]
+    fn remote_dependency_errors_prefer_the_stable_coded_line() {
+        let stderr = "Unable to find image 'postgres:16-alpine' locally\n\
+            request to registry-1.docker.io timed out\n\
+            AD-INF-202：服务器暂时无法下载数据库运行组件；系统已尝试国内来源\n";
+
+        assert_eq!(
+            remote_dependency_error(stderr),
+            "AD-INF-202：服务器暂时无法下载数据库运行组件；系统已尝试国内来源"
+        );
+        assert_eq!(
+            split_deployment_error(&remote_dependency_error(stderr)),
+            Some((
+                "AD-INF-202",
+                "服务器暂时无法下载数据库运行组件；系统已尝试国内来源"
+            ))
+        );
+    }
+
+    #[test]
+    fn remote_runtime_images_use_pinned_domestic_fallbacks() {
+        for component in ["postgres", "redis"] {
+            assert!(
+                REMOTE_DEPENDENCY_SCRIPT
+                    .contains(&format!("mirror.ccs.tencentyun.com/library/{component}"))
+            );
+            assert!(
+                REMOTE_DEPENDENCY_SCRIPT
+                    .contains(&format!("m.daocloud.io/docker.io/library/{component}"))
+            );
+        }
+        assert!(
+            REMOTE_DEPENDENCY_SCRIPT.contains(
+                "sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777"
+            )
+        );
+        assert!(
+            REMOTE_DEPENDENCY_SCRIPT.contains(
+                "sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99"
+            )
+        );
+        assert!(!REMOTE_DEPENDENCY_SCRIPT.contains(" postgres:16-alpine"));
+        assert!(!REMOTE_DEPENDENCY_SCRIPT.contains(" redis:7-alpine"));
+        assert!(
+            REMOTE_DEPENDENCY_SCRIPT.contains("runtime-dependencies.lock"),
+            "shared infrastructure setup must be serialized on one server"
+        );
+        assert!(REMOTE_DEPENDENCY_SCRIPT.contains("docker start \"$POSTGRES_CONTAINER\""));
+        assert!(REMOTE_DEPENDENCY_SCRIPT.contains("docker start \"$REDIS_CONTAINER\""));
+        assert!(
+            REMOTE_DEPENDENCY_SCRIPT.contains(
+                "docker network inspect \"$NETWORK\" --format '{{range .Containers}}{{println .Name}}{{end}}'"
+            )
+        );
+    }
+
+    #[test]
+    fn runtime_dependency_failures_resume_the_same_server_deploy() {
+        let mut deployment = run();
+        deployment.environment = "deployment".to_string();
+        pause_deployment_path_after_deploy_error(
+            &mut deployment,
+            "AD-INF-202：服务器暂时无法下载数据库运行组件；系统已尝试国内来源",
+        );
+
+        assert_eq!(deployment.current_stage, "deploy");
+        assert_eq!(deployment.issue_code.as_deref(), Some("AD-INF-202"));
+        assert_eq!(
+            deployment.action_kind.as_deref(),
+            Some("deployment-path-retry")
+        );
+        assert_eq!(
+            deployment.message,
+            "服务器暂时无法下载数据库运行组件；系统已尝试国内来源"
+        );
+    }
+
+    #[test]
+    fn unknown_server_errors_are_not_misclassified_as_route_conflicts() {
+        let mut deployment = run();
+        pause_deployment_path_after_deploy_error(
+            &mut deployment,
+            "unexpected remote command failure",
+        );
+
+        assert_eq!(deployment.current_stage, "deploy");
+        assert_eq!(deployment.issue_code.as_deref(), Some("AD-DEP-201"));
+        assert!(!deployment.message.contains("remote command"));
+    }
+
+    #[test]
+    fn route_reconciliation_failures_resume_without_redeploying_the_application() {
+        let mut deployment = run();
+        deployment.environment = "deployment".to_string();
+        pause_deployment_path_after_deploy_error(
+            &mut deployment,
+            "AD-SRV-209：访问地址配置尚未加载，已保留运行中的服务",
+        );
+
+        assert_eq!(deployment.current_stage, "server");
+        assert_eq!(deployment.issue_code.as_deref(), Some("AD-SRV-209"));
+        assert_eq!(
+            deployment.action_kind.as_deref(),
+            Some("deployment-path-retry")
+        );
+    }
+
+    #[test]
+    fn pre_deploy_server_failures_do_not_skip_the_version_update() {
+        let mut deployment = run();
+        deployment.environment = "deployment".to_string();
+        pause_deployment_path_after_deploy_error(&mut deployment, "AD-SRV-208：服务器磁盘空间不足");
+
+        assert_eq!(deployment.current_stage, "deploy");
+        assert_eq!(deployment.issue_code.as_deref(), Some("AD-SRV-208"));
+    }
+
+    #[test]
+    fn provider_failures_keep_the_bootstrap_error_code() {
+        let check = ProviderCheck {
+            provider: "caddy".to_string(),
+            ok: false,
+            summary: "服务器暂时无法下载统一访问组件".to_string(),
+            details: Vec::new(),
+            code: Some("AD-SRV-212".to_string()),
+            next_steps: Vec::new(),
+            retryable: true,
+        };
+
+        assert_eq!(
+            provider_check_failure(&check),
+            "AD-SRV-212：服务器暂时无法下载统一访问组件"
         );
     }
 
@@ -8942,8 +12741,14 @@ mod tests {
             ("api".to_string(), "sample-staging-api-1".to_string()),
             ("web".to_string(), "sample-staging-web-1".to_string()),
         ];
-        let healthy =
-            parse_deployed_service_states("api\trunning\thealthy\nweb\trunning\tnone\n", &expected);
+        let healthy = parse_deployed_service_states(
+            "api\trunning\thealthy\tregistry.example/api@sha256:abc\nweb\trunning\tnone\tregistry.example/web@sha256:def\n",
+            &expected,
+        );
+        assert_eq!(
+            healthy[0].image.as_deref(),
+            Some("registry.example/api@sha256:abc")
+        );
         let mut deployment = run();
         deployment.status = "success".to_string();
         deployment.current_stage = "complete".to_string();
@@ -9211,6 +13016,23 @@ providers:
     }
 
     #[test]
+    fn runtime_template_adds_new_manifest_requirements_without_overwriting_values() {
+        let prepared = ensure_runtime_template_variables(
+            "NODE_ENV=production\nDATABASE_URL=postgresql://db/app\n".to_string(),
+            &[
+                "NODE_ENV".to_string(),
+                "DATABASE_URL".to_string(),
+                "AUTH_TOKEN_SECRET".to_string(),
+            ],
+        );
+
+        assert_eq!(prepared.matches("NODE_ENV=").count(), 1);
+        assert!(prepared.contains("DATABASE_URL=postgresql://db/app"));
+        assert!(prepared.contains("# ABCDeploy 检测到的必要配置"));
+        assert!(prepared.ends_with("AUTH_TOKEN_SECRET=\n"));
+    }
+
+    #[test]
     fn remote_runtime_config_clears_local_and_secret_example_values() {
         let project = tempdir().expect("temp project");
         let template = concat!(
@@ -9265,6 +13087,93 @@ providers:
             ),
             ["DATABASE_URL"]
         );
+    }
+
+    #[test]
+    fn only_internal_application_secrets_are_safe_to_generate() {
+        for variable in [
+            "AUTH_TOKEN_SECRET",
+            "JWT_SECRET",
+            "FINAGENT_SESSION_SECRET",
+            "COOKIE_SECRET",
+            "ENCRYPTION_KEY",
+        ] {
+            assert!(internal_runtime_secret(variable), "{variable}");
+        }
+        for variable in [
+            "MINIMAX_API_KEY",
+            "TCR_PASSWORD",
+            "CNB_TOKEN",
+            "DATABASE_URL",
+        ] {
+            assert!(!internal_runtime_secret(variable), "{variable}");
+        }
+    }
+
+    #[test]
+    fn static_build_variables_do_not_block_server_runtime() {
+        let project = tempdir().expect("project");
+        fs::create_dir_all(project.path().join("src")).expect("source directory");
+        fs::write(
+            project.path().join("package.json"),
+            r#"{"name":"sample-web","scripts":{"dev":"vite","build":"vite build"},"dependencies":{"vite":"1"}}"#,
+        )
+        .expect("package manifest");
+        fs::write(project.path().join("src/main.ts"), "export {};\n").expect("entrypoint");
+        fs::write(
+            project.path().join(".env.example"),
+            "VITE_API_BASE_URL=/api\n",
+        )
+        .expect("environment example");
+
+        let inspection = deploy_core::inspect_project(project.path()).expect("inspection");
+        let manifest = deploy_core::create_default_manifest(&inspection);
+        assert!(manifest.services.iter().any(|service| {
+            service.kind == deploy_core::model::ServiceKind::Static
+                && service
+                    .runtime_env
+                    .iter()
+                    .any(|variable| variable.name == "VITE_API_BASE_URL")
+        }));
+        assert!(
+            !required_runtime_variables(&manifest, EnvironmentName::Production)
+                .contains(&"VITE_API_BASE_URL".to_string())
+        );
+    }
+
+    #[test]
+    fn deployment_path_does_not_ask_users_for_managed_ocr_service_urls() {
+        let project = tempdir().expect("project");
+        fs::write(
+            project.path().join("package.json"),
+            r#"{"name":"sample-api","scripts":{"start":"node server.js"}}"#,
+        )
+        .expect("package manifest");
+        fs::write(project.path().join("server.js"), "process.exit(0);\n").expect("entrypoint");
+        let inspection = deploy_core::inspect_project(project.path()).expect("inspection");
+        let mut manifest = deploy_core::create_default_manifest(&inspection);
+        manifest.services[0]
+            .runtime_env
+            .push(deploy_core::model::EnvironmentVariable {
+                name: "PP_OCRV6_TINY_URL".to_string(),
+                required: true,
+                secret: false,
+                default: None,
+                description: String::new(),
+            });
+        let mut ocr = manifest.services[0].clone();
+        ocr.id = "ocr".to_string();
+        ocr.image = "sample-ocr".to_string();
+        ocr.container_port = 8000;
+        ocr.runtime_env.clear();
+        manifest.services.push(ocr);
+
+        assert_eq!(
+            deployment_path_managed_runtime_variables(&manifest),
+            BTreeSet::from(["PP_OCRV6_TINY_URL".to_string()])
+        );
+        manifest.services.retain(|service| service.id != "ocr");
+        assert!(deployment_path_managed_runtime_variables(&manifest).is_empty());
     }
 
     #[test]
@@ -9412,14 +13321,127 @@ providers:
         );
         assert!(!permission.contains("Missing required scopes"));
 
+        let build_detail = cnb_public_error(DeployError::CnbApi {
+            status: 403,
+            message: r#"{"errmsg":"Missing required scopes: repo-code:rw, repo-cnb-detail:r","repository":"private-name"}"#
+                .to_string(),
+        });
+        assert_eq!(
+            build_detail,
+            "AD-CNB-103：CNB 授权缺少以下权限：repo-code:rw、repo-cnb-detail:r"
+        );
+        assert!(!build_detail.contains("private-name"));
+
         let history = cnb_build_history_error(DeployError::CnbApi {
             status: 403,
             message: "[NO_RIGHT]Token scope not match".to_string(),
         });
         assert_eq!(
             history,
+            "AD-CNB-103：CNB 拒绝读取这个仓库的构建记录；令牌的授权范围（scope）或使用范围可能不匹配当前仓库，请检查 CNB 授权设置"
+        );
+
+        let explicit_history = cnb_build_history_error(DeployError::CnbApi {
+            status: 403,
+            message: "权限不足。缺少授权范围：repo-cnb-history:r。".to_string(),
+        });
+        assert_eq!(
+            explicit_history,
             "AD-CNB-103：CNB 授权缺少“构建记录读取”权限（repo-cnb-history:r）"
         );
+    }
+
+    #[test]
+    fn cnb_token_selection_prefers_current_ui_then_saved_connection() {
+        assert_eq!(
+            resolve_cnb_token_sources(
+                "  ui-token  ",
+                StoredCnbToken::Unavailable,
+                Some("environment-token"),
+                Some("git-token")
+            )
+            .expect("provided token must short-circuit unavailable storage")
+            .as_deref(),
+            Some("ui-token")
+        );
+        assert_eq!(
+            resolve_cnb_token_sources(
+                "",
+                StoredCnbToken::Present(" saved-token "),
+                Some("environment-token"),
+                Some("git-token")
+            )
+            .expect("stored token")
+            .as_deref(),
+            Some("saved-token")
+        );
+        assert_eq!(
+            resolve_cnb_token_sources(
+                "",
+                StoredCnbToken::Missing,
+                Some("environment-token"),
+                Some("git-token")
+            )
+            .expect("missing storage may fall back")
+            .as_deref(),
+            Some("environment-token")
+        );
+        assert_eq!(
+            resolve_cnb_token_sources(
+                "",
+                StoredCnbToken::Present("  "),
+                Some("  "),
+                Some(" git-token ")
+            )
+            .expect("empty storage may fall back")
+            .as_deref(),
+            Some("git-token")
+        );
+        assert_eq!(
+            resolve_cnb_token_sources(
+                "",
+                StoredCnbToken::Unavailable,
+                Some("stale-environment-token"),
+                Some("stale-git-token")
+            ),
+            Err(CnbTokenResolutionError::StoredCredentialUnavailable)
+        );
+        assert_eq!(
+            CNB_KEYCHAIN_UNAVAILABLE_ERROR,
+            "AD-CNB-108：无法读取系统密钥库中的 CNB 授权，请重新打开应用；仍未恢复时更新 CNB 授权"
+        );
+    }
+
+    #[test]
+    fn cnb_keyring_failures_use_safe_distinct_issue_codes() {
+        assert_eq!(
+            cnb_keyring_issue("missing"),
+            ("AD-CNB-101", "CNB 登录已失效，请重新连接后继续")
+        );
+        let raw_error = "User interaction is not allowed for account secret-token";
+        let unavailable = cnb_keyring_issue(raw_error);
+        assert_eq!(unavailable.0, "AD-CNB-108");
+        assert_eq!(unavailable.1, CNB_KEYCHAIN_UNAVAILABLE_ERROR);
+        assert!(!unavailable.1.contains(raw_error));
+        assert!(!unavailable.1.contains("secret-token"));
+    }
+
+    #[test]
+    fn cnb_connection_metadata_failures_do_not_reject_a_saved_token() {
+        let remember_attempted = Cell::new(false);
+        let mark_attempted = Cell::new(false);
+        save_cnb_connection_metadata_best_effort(
+            || {
+                remember_attempted.set(true);
+                Err("summary database unavailable".to_string())
+            },
+            || {
+                mark_attempted.set(true);
+                Err("connection database unavailable".to_string())
+            },
+        );
+        assert!(remember_attempted.get());
+        assert!(mark_attempted.get());
     }
 
     #[test]
@@ -9453,6 +13475,132 @@ providers:
         assert!(!is_deployment_internal_path(
             ".deploydesk/generated/staging/Caddyfile"
         ));
+    }
+
+    #[test]
+    fn deployment_snapshot_contains_working_tree_without_mutating_user_git_state() {
+        let project = tempfile::tempdir().expect("project");
+        fs::write(project.path().join("app.txt"), "old\n").expect("app");
+        fs::write(project.path().join("legacy.pem"), "private\n").expect("legacy secret");
+        let mut init = system_command("git");
+        init.current_dir(project.path()).args(["init", "--quiet"]);
+        run_git_command(init, "init").expect("init");
+        let mut add = system_command("git");
+        add.current_dir(project.path()).args(["add", "--all"]);
+        run_git_command(add, "add").expect("add");
+        let mut commit = system_command("git");
+        commit.current_dir(project.path()).args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "initial",
+        ]);
+        run_git_command(commit, "commit").expect("commit");
+
+        fs::write(project.path().join("app.txt"), "current\n").expect("change app");
+        fs::write(project.path().join("new.txt"), "new\n").expect("new file");
+        fs::write(project.path().join(".env"), "TOKEN=do-not-push\n").expect("env");
+        fs::write(project.path().join("staged.txt"), "staged\n").expect("staged file");
+        let mut stage = system_command("git");
+        stage
+            .current_dir(project.path())
+            .args(["add", "staged.txt"]);
+        run_git_command(stage, "stage").expect("stage");
+        fs::write(project.path().join("staged.txt"), "working\n").expect("working file");
+
+        let head_before = git_stdout(project.path(), &["rev-parse", "HEAD"]).expect("head");
+        let index_before =
+            git_stdout(project.path(), &["diff", "--cached", "--binary"]).expect("index");
+        let (snapshot, created) =
+            create_deployment_git_snapshot(project.path(), &[], None).expect("snapshot");
+        assert!(created);
+        assert_eq!(
+            git_stdout(project.path(), &["rev-parse", "HEAD"]).expect("head after"),
+            head_before
+        );
+        assert_eq!(
+            git_stdout(project.path(), &["diff", "--cached", "--binary"]).expect("index after"),
+            index_before
+        );
+        assert_eq!(
+            git_stdout(project.path(), &["show", &format!("{snapshot}:app.txt")])
+                .expect("snapshot app"),
+            "current\n"
+        );
+        assert_eq!(
+            git_stdout(project.path(), &["show", &format!("{snapshot}:staged.txt")])
+                .expect("snapshot staged"),
+            "working\n"
+        );
+        assert!(
+            system_command("git")
+                .current_dir(project.path())
+                .args(["cat-file", "-e", &format!("{snapshot}:.env")])
+                .status()
+                .is_ok_and(|status| !status.success())
+        );
+        assert!(
+            system_command("git")
+                .current_dir(project.path())
+                .args(["cat-file", "-e", &format!("{snapshot}:legacy.pem")])
+                .status()
+                .is_ok_and(|status| !status.success())
+        );
+    }
+
+    #[test]
+    fn deployment_snapshots_continue_from_a_verified_remote_snapshot_parent() {
+        let project = tempfile::tempdir().expect("project");
+        fs::write(project.path().join("app.txt"), "initial\n").expect("app");
+        let mut init = system_command("git");
+        init.current_dir(project.path()).args(["init", "--quiet"]);
+        run_git_command(init, "init").expect("init");
+        let mut add = system_command("git");
+        add.current_dir(project.path()).args(["add", "--all"]);
+        run_git_command(add, "add").expect("add");
+        let mut commit = system_command("git");
+        commit.current_dir(project.path()).args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "initial",
+        ]);
+        run_git_command(commit, "commit").expect("commit");
+
+        fs::write(project.path().join("app.txt"), "snapshot one\n").expect("first change");
+        let (first, first_created) =
+            create_deployment_git_snapshot(project.path(), &[], None).expect("first snapshot");
+        assert!(first_created);
+        let (unchanged, unchanged_created) =
+            create_deployment_git_snapshot(project.path(), &[], Some(&first))
+                .expect("unchanged snapshot");
+        assert_eq!(unchanged, first);
+        assert!(!unchanged_created);
+
+        fs::write(project.path().join("app.txt"), "snapshot two\n").expect("second change");
+        let (second, second_created) =
+            create_deployment_git_snapshot(project.path(), &[], Some(&first))
+                .expect("second snapshot");
+        assert!(second_created);
+        assert_eq!(
+            git_stdout(project.path(), &["show", "-s", "--format=%P", &second])
+                .expect("parent")
+                .trim(),
+            first
+        );
+        assert_eq!(
+            git_stdout(project.path(), &["show", &format!("{second}:app.txt")])
+                .expect("second content"),
+            "snapshot two\n"
+        );
     }
 
     #[test]
@@ -9584,13 +13732,11 @@ providers:
     }
 
     #[test]
-    fn classifies_main_pushes_as_staging_deployments_for_background_sync() {
-        for event in [
-            "push",
-            "git_push",
-            "api_trigger_staging",
-            "tag_deploy.staging",
-        ] {
+    fn classifies_main_pushes_as_independent_deployment_path_builds() {
+        for event in ["push", "git_push", "api_trigger_deployment_path_build"] {
+            assert_eq!(build_environment_for_event(event), Some("deployment"));
+        }
+        for event in ["api_trigger_staging", "tag_deploy.staging"] {
             assert_eq!(build_environment_for_event(event), Some("staging"));
         }
         for event in ["api_trigger_production", "tag_deploy.production"] {
@@ -9615,6 +13761,87 @@ providers:
             title: "staging".to_string(),
             created_at: None,
         }));
+    }
+
+    #[test]
+    fn legacy_history_sync_never_overwrites_a_bound_deployment_path_run() {
+        assert!(deployment_path_owns_history_reconciliation(
+            "deployment",
+            true
+        ));
+        assert!(!deployment_path_owns_history_reconciliation(
+            "deployment",
+            false
+        ));
+        assert!(!deployment_path_owns_history_reconciliation(
+            "staging", true
+        ));
+        assert!(!deployment_path_owns_history_reconciliation(
+            "production",
+            true
+        ));
+    }
+
+    #[test]
+    fn imports_cnb_history_oldest_first_and_keeps_latest_result_per_line_kind() {
+        let payload = json!({
+            "data": [
+                {
+                    "sn": "approval",
+                    "event": "push",
+                    "status": "success",
+                    "sourceRef": "deploydesk-production",
+                    "createTime": "2026-07-04T00:00:00Z"
+                },
+                {
+                    "sn": "production-new",
+                    "event": "api_trigger_production",
+                    "status": "success",
+                    "createTime": "2026-07-03T00:00:00Z"
+                },
+                {
+                    "sn": "staging-new",
+                    "event": "push",
+                    "status": "success",
+                    "sourceRef": "main",
+                    "createTime": "2026-07-02T00:00:00Z"
+                },
+                {
+                    "sn": "production-old",
+                    "event": "api_trigger_production",
+                    "status": "success",
+                    "createTime": "2026-07-01T00:00:00Z"
+                },
+                {
+                    "sn": "staging-old",
+                    "event": "push",
+                    "status": "success",
+                    "sourceRef": "main",
+                    "createTime": "2026-07-01T00:00:00Z"
+                }
+            ]
+        });
+        let records = ordered_build_records(&payload);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.serial.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "staging-old",
+                "production-old",
+                "staging-new",
+                "production-new",
+                "approval"
+            ]
+        );
+        assert_eq!(
+            latest_success_serials_by_environment(&records),
+            BTreeMap::from([
+                ("deployment", "staging-new".to_string()),
+                ("production", "production-new".to_string()),
+            ])
+        );
     }
 
     #[test]
@@ -9674,6 +13901,7 @@ environments:
     secrets_ref: https://cnb.cool/team/sample-secrets/-/blob/main/env.staging.yml
   production:
     target: { kind: server, server: default, namespace: sample-production }
+    approval_required: true
     secrets_ref: https://cnb.cool/team/sample-secrets/-/blob/main/env.production.yml
 providers:
   build: { kind: cnb, repository: team/sample }
@@ -9708,11 +13936,12 @@ providers:
         deployment.completed_steps.push("healthcheck".to_string());
         apply_public_route_checks(
             &mut deployment,
-            &[PublicRouteCheck {
+            &[PublicRouteStatus {
+                host: "app.example.com".to_string(),
                 url: "https://app.example.com/".to_string(),
                 reachable: false,
                 phase: "dns".to_string(),
-                status: None,
+                http_status: None,
                 message: "app.example.com 尚未解析".to_string(),
             }],
         );
@@ -9729,6 +13958,360 @@ providers:
         assert!(deployment.message.contains("应用已经部署成功"));
     }
 
+    #[tokio::test]
+    async fn route_inspection_failures_preserve_the_last_per_address_results() {
+        let directory = tempdir().expect("temporary workspace");
+        let state = WorkspaceState::open(&directory.path().join("workspace.sqlite3"))
+            .expect("open workspace");
+        let mut deployment = run();
+        deployment.project_path = directory
+            .path()
+            .join("missing-project")
+            .to_string_lossy()
+            .into_owned();
+        deployment.route_checks = vec![PublicRouteStatus {
+            host: "app.example.com".to_string(),
+            url: "https://app.example.com/".to_string(),
+            phase: "ready".to_string(),
+            reachable: true,
+            http_status: Some(200),
+            message: "上次检查可访问".to_string(),
+        }];
+        let previous = deployment.route_checks.clone();
+
+        verify_public_routes(&mut deployment, &state)
+            .await
+            .expect("invalid snapshot becomes a durable task");
+
+        assert_eq!(deployment.route_checks, previous);
+        assert_eq!(deployment.status, "needs_action");
+    }
+
+    #[test]
+    fn repaired_deployment_path_drops_the_previous_issue_code() {
+        let directory = tempdir().expect("temporary workspace");
+        let state = WorkspaceState::open(&directory.path().join("workspace.sqlite3"))
+            .expect("open workspace");
+        let mut deployment = run();
+        deployment.project_path = directory
+            .path()
+            .canonicalize()
+            .expect("canonical project path")
+            .to_string_lossy()
+            .into_owned();
+        deployment.environment = "deployment".to_string();
+        deployment.status = "needs_action".to_string();
+        deployment.current_stage = "local".to_string();
+        deployment.issue_code = Some("AD-GIT-102".to_string());
+        deployment.action_kind = Some("deployment-path-source-retry".to_string());
+        state
+            .remember_project(directory.path(), "sample", true, 1)
+            .expect("remember project");
+        state
+            .save_deployment_run(&deployment)
+            .expect("save interrupted run");
+
+        let repaired =
+            prepare_deployment_path_retry_inner(deployment.id, "server".to_string(), &state)
+                .expect("prepare retry");
+
+        assert_eq!(repaired.current_stage, "server");
+        assert_eq!(repaired.issue_code, None);
+        assert_eq!(
+            repaired.action_kind.as_deref(),
+            Some("deployment-path-retry")
+        );
+    }
+
+    #[test]
+    fn repaired_deployment_path_routes_keep_existing_artifacts_on_the_server() {
+        let directory = tempdir().expect("temporary workspace");
+        let state = WorkspaceState::open(&directory.path().join("workspace.sqlite3"))
+            .expect("open workspace");
+        let mut deployment = run();
+        deployment.project_path = directory
+            .path()
+            .canonicalize()
+            .expect("canonical project path")
+            .to_string_lossy()
+            .into_owned();
+        deployment.environment = "deployment".to_string();
+        deployment.status = "needs_action".to_string();
+        deployment.current_stage = "server".to_string();
+        deployment.issue_code = Some("AD-NET-201".to_string());
+        deployment.action_kind = Some("deployment-path-route-check".to_string());
+        deployment.artifacts.push(DeploymentArtifact {
+            service: "web".to_string(),
+            image: "registry.example.com/sample/web".to_string(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+        });
+        state
+            .remember_project(directory.path(), "sample", true, 1)
+            .expect("remember project");
+        state
+            .save_deployment_run(&deployment)
+            .expect("save interrupted run");
+
+        let repaired =
+            prepare_deployment_path_retry_inner(deployment.id, "routes".to_string(), &state)
+                .expect("prepare route retry");
+
+        assert_eq!(repaired.current_stage, "server");
+        assert_eq!(repaired.artifacts.len(), 1);
+        assert_eq!(repaired.issue_code, None);
+        assert_eq!(
+            repaired.action_kind.as_deref(),
+            Some("deployment-path-retry")
+        );
+        assert!(repaired.message.contains("访问地址"));
+    }
+
+    #[test]
+    fn interrupted_first_route_check_preserves_the_deployed_version() {
+        let mut deployment = run();
+        deployment.environment = "production".to_string();
+        deployment.status = "success".to_string();
+        deployment.current_stage = "complete".to_string();
+        deployment.artifacts.push(DeploymentArtifact {
+            service: "api".to_string(),
+            image: "registry.example.com/sample/api".to_string(),
+            digest: "sha256:abc".to_string(),
+        });
+
+        pause_public_route_inspection(&mut deployment, "本机网络暂时不可用");
+
+        assert_eq!(deployment.status, "needs_action");
+        assert_eq!(deployment.action_kind.as_deref(), Some("route-check"));
+        assert_eq!(deployment.issue_code.as_deref(), Some("AD-NET-202"));
+        assert_eq!(deployment.artifacts.len(), 1);
+        assert!(deployment.message.contains("服务已经部署"));
+        assert!(deployment.message.contains("网络恢复后会自动继续"));
+    }
+
+    #[test]
+    fn certificate_retry_requires_dns_ready_https_only_failures() {
+        let status = |host: &str, phase: &str, reachable: bool| PublicRouteStatus {
+            host: host.to_string(),
+            url: format!("https://{host}/"),
+            phase: phase.to_string(),
+            reachable,
+            http_status: reachable.then_some(200),
+            message: String::new(),
+        };
+        assert!(certificate_retry_allowed(&[
+            status("app.example.com", "ready", true),
+            status("api.example.com", "https", false),
+        ]));
+        assert!(!certificate_retry_allowed(&[status(
+            "app.example.com",
+            "dns",
+            false,
+        )]));
+        assert!(!certificate_retry_allowed(&[status(
+            "app.example.com",
+            "application",
+            false,
+        )]));
+        assert!(!certificate_retry_allowed(&[status(
+            "app.example.com",
+            "ready",
+            true,
+        )]));
+    }
+
+    #[test]
+    fn certificate_retry_validates_and_force_reloads_without_redeploying_services() {
+        let encoded_hosts = BASE64.encode(b"app.example.com\napi.example.com\n");
+        let script = caddy_certificate_reload_script(
+            "sample-production.caddy",
+            &encoded_hosts,
+            "203.0.113.10",
+        );
+        assert!(script.contains("server-deploy.lock"));
+        assert!(script.contains("getent ahosts"));
+        assert!(script.contains("不再指向绑定服务器"));
+        assert!(script.contains("caddy validate"));
+        assert!(script.contains("caddy reload --force"));
+        assert!(script.contains("sample-production.caddy"));
+        assert!(!script.contains("docker restart"));
+        assert!(!script.contains("docker compose"));
+        assert!(!script.contains("certificates/acme"));
+        let lock = script.find("flock -w 60").expect("server lock");
+        let dns = script.find("getent ahosts").expect("locked DNS recheck");
+        let reload = script.find("caddy reload --force").expect("forced reload");
+        assert!(lock < dns && dns < reload);
+    }
+
+    #[test]
+    fn route_activation_transfers_untrusted_rows_as_base64_data() {
+        let malicious =
+            "safe.example.com\tsample-production-api:3000\nABCDEPLOY_ROUTES\nprintf injected >&2";
+        let script =
+            server_route_activation_script("sample-production.caddy", &[malicious.to_string()]);
+
+        assert!(script.contains("base64 --decode"));
+        assert!(script.contains("ROUTES_FILE"));
+        assert!(!script.contains("<<'ABCDEPLOY_ROUTES'"));
+        assert!(!script.contains(malicious));
+        assert!(!script.contains("printf injected >&2"));
+    }
+
+    #[test]
+    fn caddy_route_detection_normalizes_shared_site_addresses() {
+        let directory = tempdir().expect("temp Caddy fixture");
+        let config = directory.path().join("Caddyfile");
+        fs::write(
+            &config,
+            r"{
+	admin off
+}
+
+https://API.EXAMPLE.COM.:443, legacy.example.com {
+	reverse_proxy old-api:3000
+}
+",
+        )
+        .expect("write Caddy fixture");
+        let script = format!(
+            "set -eu\n{}\nroute_declared_in_file api.example.com \"$CONFIG\"\nroute_declared_in_file LEGACY.EXAMPLE.COM. \"$CONFIG\"\n! route_declared_in_file missing.example.com \"$CONFIG\"\n",
+            caddy_route_declared_shell_function()
+        );
+        let output = Command::new("bash")
+            .args(["-c", &script])
+            .env("CONFIG", &config)
+            .output()
+            .expect("run Caddy route detector");
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn caddy_takeover_rewrites_only_target_addresses_and_is_idempotent() {
+        let directory = tempdir().expect("temp Caddy fixture");
+        let original = directory.path().join("Caddyfile.original");
+        let hosts = directory.path().join("hosts");
+        let first = directory.path().join("Caddyfile.first");
+        let second = directory.path().join("Caddyfile.second");
+        fs::write(
+            &original,
+            r"{
+	admin off
+}
+
+https://API.EXAMPLE.COM.:443, legacy.example.com {
+	reverse_proxy old-api:3000
+}
+
+ocr.example.com {
+	reverse_proxy old-ocr:8000
+}
+
+untouched.example.com {
+	respond 200
+}
+",
+        )
+        .expect("write Caddy fixture");
+        fs::write(&hosts, "api.example.com\nOCR.EXAMPLE.COM.\n").expect("write takeover hosts");
+        let script = format!(
+            "set -eu\n{}\nrewrite_caddy_main_routes \"$HOSTS\" \"$INPUT\" \"$FIRST\"\nrewrite_caddy_main_routes \"$HOSTS\" \"$FIRST\" \"$SECOND\"\n",
+            caddy_main_route_rewrite_shell_function()
+        );
+        let output = Command::new("bash")
+            .args(["-c", &script])
+            .env("HOSTS", &hosts)
+            .env("INPUT", &original)
+            .env("FIRST", &first)
+            .env("SECOND", &second)
+            .output()
+            .expect("run Caddy route takeover rewrite");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let first_content = fs::read_to_string(&first).expect("read rewritten Caddyfile");
+        let second_content = fs::read_to_string(&second).expect("read idempotent Caddyfile");
+        assert!(
+            !first_content
+                .to_ascii_lowercase()
+                .contains("api.example.com")
+        );
+        assert!(!first_content.contains("ocr.example.com"));
+        assert!(first_content.contains("legacy.example.com {"));
+        assert!(first_content.contains("reverse_proxy old-api:3000"));
+        assert!(first_content.contains("untouched.example.com"));
+        assert!(first_content.contains("respond 200"));
+        assert_eq!(first_content, second_content);
+    }
+
+    #[test]
+    fn routing_manifest_validation_rejects_a_host_with_embedded_commands() {
+        let raw = r#"version: 1
+project: { name: sample }
+source: { provider: local, repository: "", release_branch: main }
+services:
+  - id: api
+    kind: api
+    image: sample-api
+    context: .
+    dockerfile: Dockerfile
+    container_port: 3000
+    healthcheck: { path: /health }
+environments:
+  development: { target: { kind: local, namespace: sample-development } }
+  staging:
+    target: { kind: server, server: default, namespace: sample-staging }
+    secrets_ref: https://cnb.cool/team/sample-secrets/-/blob/main/env.staging.yml
+    domains: []
+  production:
+    target: { kind: server, server: default, namespace: sample-production }
+    secrets_ref: https://cnb.cool/team/sample-secrets/-/blob/main/env.production.yml
+    domains: [{ service: api, host: app.example.com, path: / }]
+providers:
+  build: { kind: cnb, repository: team/sample }
+  registry: { kind: cnb, repository: team/sample }
+"#;
+        let mut manifest = deploy_core::parse_manifest(raw, Path::new("deploy.yaml"))
+            .expect("parse routing manifest");
+        let mut unsafe_project = manifest.clone();
+        unsafe_project.project.name = "sample\nABCDEPLOY_HOSTS\nprintf injected >&2".to_string();
+        let project_error = validate_deployment_routing_manifest(&unsafe_project, "当前项目")
+            .expect_err("unsafe project name must be rejected before SSH");
+        assert!(project_error.contains("当前项目"));
+        assert!(!project_error.contains("printf injected"));
+
+        manifest.environments.production.domains[0].host =
+            "app.example.com\nprintf injected >&2".to_string();
+
+        let error = validate_deployment_routing_manifest(&manifest, "当前项目")
+            .expect_err("unsafe host must be rejected before SSH");
+
+        assert!(error.contains("当前项目"));
+        assert!(error.contains("域名只填写主机名"));
+        assert!(!error.contains("printf injected"));
+    }
+
+    #[test]
+    fn interrupted_route_checks_use_the_check_phase_contract() {
+        let production = interrupted_public_route_status("app.example.com", "/health");
+        assert_eq!(production.phase, "check");
+        assert_eq!(production.url, "https://app.example.com/health");
+        assert_eq!(
+            interrupted_route_check_message(std::slice::from_ref(&production)).as_deref(),
+            Some("app.example.com 的地址检查被中断，请重新检查")
+        );
+
+        let staging = interrupted_public_route_status("app.203-0-113-10.sslip.io", "/");
+        assert_eq!(staging.phase, "check");
+        assert_eq!(staging.url, "http://app.203-0-113-10.sslip.io/");
+    }
+
     #[test]
     fn multiple_public_route_failures_are_reported_together() {
         let mut deployment = run();
@@ -9737,18 +14320,20 @@ providers:
         apply_public_route_checks(
             &mut deployment,
             &[
-                PublicRouteCheck {
+                PublicRouteStatus {
+                    host: "app.example.com".to_string(),
                     url: "https://app.example.com/".to_string(),
                     reachable: false,
                     phase: "dns".to_string(),
-                    status: None,
+                    http_status: None,
                     message: "app.example.com 尚未解析，请添加 A 记录".to_string(),
                 },
-                PublicRouteCheck {
+                PublicRouteStatus {
+                    host: "api.example.com".to_string(),
                     url: "https://api.example.com/".to_string(),
                     reachable: false,
                     phase: "dns".to_string(),
-                    status: None,
+                    http_status: None,
                     message: "api.example.com 尚未解析，请添加 A 记录".to_string(),
                 },
             ],
@@ -9759,6 +14344,65 @@ providers:
         assert!(deployment.message.contains("app.example.com 尚未解析"));
         assert!(deployment.message.contains("api.example.com 尚未解析"));
         assert!(deployment.message.contains("应用已经部署成功"));
+    }
+
+    #[test]
+    fn every_route_attention_state_rechecks_public_addresses() {
+        for action in ["route-check", "route-repair", "route-takeover"] {
+            assert!(deployment_needs_public_route_recheck(Some(action)));
+        }
+        assert!(!deployment_needs_public_route_recheck(Some("cnb-auth")));
+        assert!(!deployment_needs_public_route_recheck(None));
+    }
+
+    #[test]
+    fn route_problems_are_kept_per_address_and_takeover_wins_over_repair() {
+        let ready = |host: &str| PublicRouteStatus {
+            host: host.to_string(),
+            url: format!("https://{host}/"),
+            reachable: true,
+            phase: "ready".to_string(),
+            http_status: Some(200),
+            message: format!("{host} 可以访问"),
+        };
+        let mut checks = vec![
+            ready("api.example.com"),
+            ready("h5.example.com"),
+            ready("ocr.example.com"),
+        ];
+        let problems = vec![
+            ServerRouteProblem {
+                kind: ServerRouteProblemKind::Takeover,
+                host: "api.example.com".to_string(),
+                message: "api.example.com 仍由旧服务提供".to_string(),
+            },
+            ServerRouteProblem {
+                kind: ServerRouteProblemKind::Repair,
+                host: "h5.example.com".to_string(),
+                message: "h5.example.com 尚未启用".to_string(),
+            },
+        ];
+
+        overlay_server_route_problems(&mut checks, &problems);
+
+        assert_eq!(checks[0].phase, "route-conflict");
+        assert!(!checks[0].reachable);
+        assert_eq!(checks[1].phase, "route-missing");
+        assert!(!checks[1].reachable);
+        assert_eq!(checks[2].phase, "ready");
+        assert!(checks[2].reachable);
+
+        let mut deployment = run();
+        deployment.status = "success".to_string();
+        assert!(apply_server_route_problems(&mut deployment, &problems));
+        assert_eq!(deployment.action_kind.as_deref(), Some("route-takeover"));
+        assert_eq!(deployment.issue_code.as_deref(), Some("AD-SRV-206"));
+        assert!(deployment.message.contains("api.example.com"));
+        assert!(
+            deployment
+                .message
+                .contains("另外 1 个未冲突地址尚未启用，可以先单独恢复")
+        );
     }
 
     #[test]
@@ -9814,11 +14458,12 @@ providers:
 
         apply_public_route_checks(
             &mut deployment,
-            &[PublicRouteCheck {
+            &[PublicRouteStatus {
+                host: "app.example.com".to_string(),
                 url: "https://app.example.com/".to_string(),
                 reachable: true,
                 phase: "ready".to_string(),
-                status: Some(200),
+                http_status: Some(200),
                 message: "app.example.com 可以访问".to_string(),
             }],
         );
@@ -9832,6 +14477,111 @@ providers:
                 .completed_steps
                 .contains(&"healthcheck".to_string())
         );
+    }
+
+    #[test]
+    fn deployment_path_uses_the_selected_registry_connection_over_stale_manifest_defaults() {
+        let project = tempdir().expect("temp project");
+        fs::write(
+            project.path().join("deploy.yaml"),
+            r#"version: 1
+project: { name: sample }
+source: { provider: local, repository: "", release_branch: main }
+services:
+  - id: api
+    kind: api
+    image: sample-api
+    context: .
+    dockerfile: Dockerfile
+    container_port: 3000
+    healthcheck: { path: /health }
+environments:
+  development: { target: { kind: local, namespace: sample-development } }
+  staging:
+    target: { kind: server, server: default, namespace: sample-staging }
+    domains: []
+  production:
+    target: { kind: server, server: default, namespace: sample-production }
+    domains: []
+providers:
+  build: { kind: cnb, repository: team/sample }
+  registry: { kind: tcr, registry: ccr.ccs.tencentyun.com, namespace: replace-me }
+"#,
+        )
+        .expect("write manifest");
+        for arguments in [
+            vec!["init", "-q"],
+            vec!["add", "deploy.yaml"],
+            vec![
+                "-c",
+                "user.name=ABCDeploy Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "snapshot",
+            ],
+        ] {
+            assert!(
+                Command::new("git")
+                    .current_dir(project.path())
+                    .args(arguments)
+                    .status()
+                    .expect("run git")
+                    .success()
+            );
+        }
+        let revision = git_stdout(project.path(), &["rev-parse", "HEAD"])
+            .expect("read revision")
+            .trim()
+            .to_string();
+        let state = WorkspaceState::open(&project.path().join("workspace.sqlite3"))
+            .expect("open workspace");
+        state
+            .upsert_compat_connection(
+                "registry-finagent",
+                "registry",
+                "tcr",
+                "腾讯云 TCR",
+                Some("registry.tcr.v2.password"),
+                &BTreeMap::from([
+                    ("endpoint".to_string(), "ccr.ccs.tencentyun.com".to_string()),
+                    ("namespace".to_string(), "finagent".to_string()),
+                ]),
+                &["push".to_string(), "pull".to_string()],
+                "ready",
+                None,
+            )
+            .expect("save registry connection");
+        let mut deployment = run();
+        deployment.project_path = project.path().to_string_lossy().into_owned();
+        deployment.commit_sha = Some(revision);
+        deployment.environment = "deployment".to_string();
+        let path = DeploymentPath {
+            id: "path-sample".to_string(),
+            project_path: deployment.project_path.clone(),
+            name: "上线".to_string(),
+            source_connection_id: None,
+            registry_connection_id: Some("registry-finagent".to_string()),
+            server_id: None,
+            config_profile_ids: Vec::new(),
+            address: String::new(),
+            routes: Vec::new(),
+            state: "ready".to_string(),
+            last_run_id: None,
+            last_successful_revision: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let resolved =
+            deployment_path_manifest(&deployment, &path, &state).expect("resolve path manifest");
+
+        assert!(matches!(
+            resolved.providers.registry,
+            RegistryConfig::Tcr { ref registry, ref namespace }
+                if registry == "ccr.ccs.tencentyun.com" && namespace == "finagent"
+        ));
     }
 
     #[test]
@@ -9852,9 +14602,14 @@ services:
     healthcheck: {{ path: /health }}
 environments:
   development: {{ target: {{ kind: local, namespace: sample-development }} }}
-  staging: {{ target: {{ kind: server, server: default, namespace: sample-staging }}, domains: [] }}
+  staging:
+    target: {{ kind: server, server: default, namespace: sample-staging }}
+    secrets_ref: https://cnb.cool/team/sample-secrets/-/blob/main/env.staging.yml
+    domains: []
   production:
     target: {{ kind: server, server: default, namespace: sample-production }}
+    approval_required: true
+    secrets_ref: https://cnb.cool/team/sample-secrets/-/blob/main/env.production.yml
     domains: [{{ service: api, host: {host}, path: / }}]
 providers:
   build: {{ kind: cnb, repository: team/sample }}
@@ -9919,14 +14674,77 @@ providers:
             "ocr.example.com"
         );
 
+        let mut newer_manifest =
+            deploy_core::parse_manifest(&manifest("ocr.example.com"), Path::new("deploy.yaml"))
+                .expect("parse newer manifest");
+        let mut ocr = newer_manifest.services[0].clone();
+        ocr.id = "ocr".to_string();
+        ocr.image = "sample-ocr".to_string();
+        newer_manifest.services.push(ocr);
+        newer_manifest.environments.production.domains[0].service = "ocr".to_string();
         fs::write(
             project.path().join("deploy.yaml"),
-            manifest("ocr.example.com").replace("service: api", "service: ocr"),
+            serialize_manifest(&newer_manifest).expect("serialize newer manifest"),
         )
         .expect("write route for a service absent from the candidate");
         let mismatch = deployment_routing_manifest(&deployment)
             .expect_err("new services require a new test candidate");
         assert!(mismatch.starts_with("AD-REL-204：ocr"));
+
+        let mut unsafe_manifest = newer_manifest;
+        unsafe_manifest.environments.production.domains[0].host =
+            "ocr.example.com\nABCDEPLOY_ROUTES".to_string();
+        fs::write(
+            project.path().join("deploy.yaml"),
+            serialize_manifest(&unsafe_manifest).expect("serialize unsafe manifest"),
+        )
+        .expect("write unsafe current manifest");
+        let unsafe_current = deployment_routing_manifest(&deployment)
+            .expect_err("current manifest must be validated before route inspection");
+        assert!(unsafe_current.starts_with("当前项目的 deploy.yaml 未通过安全校验"));
+        assert!(!unsafe_current.contains("ABCDEPLOY_ROUTES"));
+
+        assert!(
+            Command::new("git")
+                .current_dir(project.path())
+                .args(["add", "deploy.yaml"])
+                .status()
+                .expect("stage unsafe manifest")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .current_dir(project.path())
+                .args([
+                    "-c",
+                    "user.name=ABCDeploy Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-qm",
+                    "unsafe snapshot",
+                ])
+                .status()
+                .expect("commit unsafe manifest")
+                .success()
+        );
+        deployment.commit_sha = Some(
+            String::from_utf8(
+                Command::new("git")
+                    .current_dir(project.path())
+                    .args(["rev-parse", "HEAD"])
+                    .output()
+                    .expect("read unsafe revision")
+                    .stdout,
+            )
+            .expect("utf8 unsafe revision")
+            .trim()
+            .to_string(),
+        );
+        let unsafe_deployed = deployment_routing_manifest(&deployment)
+            .expect_err("deployed manifest must also be validated");
+        assert!(unsafe_deployed.starts_with("已部署版本的 deploy.yaml 未通过安全校验"));
+        assert!(!unsafe_deployed.contains("ABCDEPLOY_ROUTES"));
     }
 
     #[test]
@@ -10182,7 +15000,7 @@ providers:
     }
 
     #[test]
-    fn managed_remote_dependencies_replace_only_missing_or_local_values() {
+    fn managed_remote_dependencies_replace_missing_local_or_wrong_protocol_values() {
         let suggestions = BTreeMap::from([
             (
                 "DATABASE_URL".to_string(),
@@ -10194,7 +15012,7 @@ providers:
             ),
         ]);
         let (content, filled) = fill_managed_runtime_dependencies(
-            "DATABASE_URL=postgresql://old@localhost:55432/app\nREDIS_URL=redis://custom-redis:6379/0\n",
+            "DATABASE_URL=mysql://old-db/app\nREDIS_URL=redis://custom-redis:6379/0\n",
             &suggestions,
         );
         assert!(
@@ -10202,6 +15020,64 @@ providers:
         );
         assert!(content.contains("REDIS_URL=redis://custom-redis:6379/0"));
         assert_eq!(filled, vec!["DATABASE_URL"]);
+    }
+
+    #[test]
+    fn deployment_lines_replace_managed_values_when_the_server_changes() {
+        let suggestions = BTreeMap::from([
+            (
+                "DATABASE_URL".to_string(),
+                "postgresql://user:new@abcdeploy-postgres:5432/app".to_string(),
+            ),
+            (
+                "REDIS_URL".to_string(),
+                "redis://:new@abcdeploy-redis:6379/3".to_string(),
+            ),
+        ]);
+        let managed_keys = suggestions.keys().cloned().collect();
+
+        let (content, replaced) = replace_managed_runtime_dependencies(
+            concat!(
+                "DATABASE_URL=postgresql://user:old@abcdeploy-postgres:5432/app\n",
+                "REDIS_URL=redis://:old@abcdeploy-redis:6379/3\n",
+                "API_KEY=keep-me\n",
+            ),
+            &suggestions,
+            &managed_keys,
+        );
+
+        assert!(
+            content.contains("DATABASE_URL=\"postgresql://user:new@abcdeploy-postgres:5432/app\"")
+        );
+        assert!(content.contains("REDIS_URL=\"redis://:new@abcdeploy-redis:6379/3\""));
+        assert!(content.contains("API_KEY=keep-me"));
+        assert_eq!(replaced, vec!["DATABASE_URL", "REDIS_URL"]);
+    }
+
+    #[test]
+    fn stored_runtime_absorbs_only_safe_non_secret_defaults_and_new_managed_fields() {
+        let defaults = runtime_defaults(
+            concat!(
+                "BAILIAN_TTS_MODEL=cosyvoice-v1\n",
+                "BAILIAN_API_KEY=example-secret\n",
+                "DATABASE_URL=postgresql://user:pass@localhost/app\n",
+            ),
+            &BTreeSet::from(["BAILIAN_API_KEY".to_string()]),
+        );
+        assert_eq!(
+            defaults,
+            BTreeMap::from([("BAILIAN_TTS_MODEL".to_string(), "cosyvoice-v1".to_string(),)])
+        );
+
+        let suggestions = BTreeMap::from([
+            ("POSTGRES_DB".to_string(), "swifteng_path".to_string()),
+            ("POSTGRES_USER".to_string(), "swifteng_user".to_string()),
+        ]);
+        let (content, filled) =
+            fill_managed_runtime_dependencies("NODE_ENV=production\n", &suggestions);
+        assert!(content.contains("POSTGRES_DB=\"swifteng_path\""));
+        assert!(content.contains("POSTGRES_USER=\"swifteng_user\""));
+        assert_eq!(filled, vec!["POSTGRES_DB", "POSTGRES_USER"]);
     }
 
     #[test]

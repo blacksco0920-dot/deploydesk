@@ -13,7 +13,7 @@
     "site:build": "pnpm --filter @abcdeploy/site build",
     "site:dev": "pnpm --filter @abcdeploy/site dev",
     "tauri:build": "pnpm --filter @abcdeploy/desktop tauri build",
-    "tauri:build:app": "./scripts/build-macos-test-app.sh",
+    "tauri:build:app": "bash ./scripts/build-macos-test-app.sh",
     "tauri:build:mac": "CI=true APPLE_SIGNING_IDENTITY=- pnpm --filter @abcdeploy/desktop tauri build --bundles app,dmg --ci"
   }
 }
