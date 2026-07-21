@@ -62,13 +62,13 @@
         <main class="studio">
           <header class="studio-header">
             <div class="studio-title">
-              <button class="icon-button" id="backToProjects" type="button" aria-label="返回所有项目">‹</button>
+              <button class="icon-button" id="backToProjects" type="button" aria-label="返回所有项目">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
+              </button>
               <div>
                 <strong id="workflowProjectName">示例商城</strong>
-                <span>部署工作流</span>
               </div>
             </div>
-            <div class="studio-save"><i></i>所有修改已保存</div>
             <div class="studio-actions">
               <!-- 仅驱动原型假数据场景，正式客户端不渲染这个控件。 -->
               <select id="scenarioSelect" aria-label="原型内部状态" data-prototype-only="true" hidden>
@@ -80,45 +80,33 @@
               <button class="toolbar-icon-button" id="historyButton" type="button" aria-label="运行记录" title="运行记录">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg>
               </button>
-              <button class="primary-button" id="runButton" type="button"><span>▶</span><b id="runButtonText">开始上线</b></button>
+              <button class="primary-button" id="runButton" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7V5Z" /></svg>
+                <b id="runButtonText">开始上线</b>
+              </button>
             </div>
           </header>
 
           <div class="studio-body" id="studioBody">
             <aside class="resource-panel">
-              <div class="resource-tabs" role="tablist" aria-label="工作流资源">
-                <button class="active" type="button" role="tab">线路</button>
-                <button type="button" role="tab" id="connectionsTab">连接</button>
-              </div>
-
               <section class="resource-section">
                 <header><strong>部署线路</strong><button id="addLineButton" type="button" aria-label="新增线路">＋</button></header>
-                <button class="line-row active" type="button" data-line="online">
-                  <span class="line-icon">⌁</span>
-                  <span><strong>上线</strong><small>119.91.112.80</small></span>
-                  <i class="healthy"></i>
-                </button>
-                <button class="line-row" type="button" data-line="test">
-                  <span class="line-icon">⌁</span>
-                  <span><strong>测试服务器</strong><small>42.193.229.35</small></span>
-                  <i></i>
-                </button>
+                <div class="line-list" id="lineList"></div>
               </section>
 
               <section class="resource-section node-types">
                 <header><strong>节点类型</strong><span>4</span></header>
-                <button type="button" data-focus-node="source"><i class="source"></i><span><strong>代码来源</strong><small>确定上线哪份代码</small></span></button>
-                <button type="button" data-focus-node="build"><i class="build"></i><span><strong>版本构建</strong><small>生成可运行版本</small></span></button>
-                <button type="button" data-focus-node="artifact"><i class="artifact"></i><span><strong>版本存储</strong><small>保存不可变镜像</small></span></button>
-                <button type="button" data-focus-node="deploy"><i class="deploy"></i><span><strong>部署运行</strong><small>运行并提供访问地址</small></span></button>
+                <button type="button" data-focus-node="source"><i class="source"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 9 5 12l3 3M16 9l3 3-3 3M14 5l-4 14" /></svg></i><span><strong>代码来源</strong><small>确定上线哪份代码</small></span></button>
+                <button type="button" data-focus-node="build"><i class="build"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1" /><circle cx="12" cy="12" r="4" /></svg></i><span><strong>版本构建</strong><small>生成可运行版本</small></span></button>
+                <button type="button" data-focus-node="artifact"><i class="artifact"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4-8 4-8-4 8-4Z" /><path d="m4 12 8 4 8-4M4 17l8 4 8-4" /></svg></i><span><strong>版本存储</strong><small>保存不可变镜像</small></span></button>
+                <button type="button" data-focus-node="deploy"><i class="deploy"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="6" rx="2" /><rect x="4" y="14" width="16" height="6" rx="2" /><path d="M8 7h.01M8 17h.01" /></svg></i><span><strong>部署运行</strong><small>运行并提供访问地址</small></span></button>
               </section>
 
             </aside>
 
             <section class="canvas-area" id="canvasArea" aria-label="部署工作流画布">
               <div class="canvas-title">
-                <div><span>线路</span><strong id="canvasLineName">上线</strong><button class="icon-button" type="button" aria-label="修改线路名称">✎</button></div>
-                <p>代码经过四类节点，到达这条线路绑定的服务器。</p>
+                <div><strong id="canvasLineName">上线</strong><button class="icon-button" id="renameCurrentLineButton" type="button" aria-label="重命名当前线路" title="重命名当前线路"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16-.7 4.7L8 20l10.8-10.8a2 2 0 0 0-4-4L4 16Z" /><path d="m13.5 6.5 4 4" /></svg></button></div>
               </div>
 
               <div class="canvas-viewport" id="canvasViewport" tabindex="0">
@@ -134,23 +122,22 @@
                 </div>
               </div>
 
-              <div class="node-library" id="nodeLibrary" hidden>
-                <div class="library-search"><span>⌕</span><input id="nodeSearch" type="search" placeholder="搜索节点" /></div>
-                <p>基础节点</p>
-                <button type="button" data-library-node="source"><i class="source"></i><span><strong>代码来源</strong><small>本地项目、代码仓库</small></span></button>
-                <button type="button" data-library-node="build"><i class="build"></i><span><strong>版本构建</strong><small>CNB、本机构建</small></span></button>
-                <button type="button" data-library-node="artifact"><i class="artifact"></i><span><strong>版本存储</strong><small>TCR、Harbor</small></span></button>
-                <button type="button" data-library-node="deploy"><i class="deploy"></i><span><strong>部署运行</strong><small>Linux 服务器</small></span></button>
-                <div class="library-note">首版线路默认包含四类节点；再次添加“部署运行”会创建服务器分支。</div>
+              <div class="canvas-empty-state" id="canvasEmptyState" aria-live="polite">
+                <span class="canvas-empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="7" r="2"/><circle cx="18" cy="17" r="2"/><path d="M8 7h3a4 4 0 0 1 4 4v2a4 4 0 0 0 3 4"/></svg></span>
+                <strong>还没有部署线路</strong>
+                <p>创建后会自动生成固定的四个节点，你只需要依次选择连接。</p>
+                <button class="primary-button" id="createFirstLineButton" type="button">＋ 创建部署线路</button>
               </div>
 
               <div class="canvas-toolbar" aria-label="画布工具栏">
+                <button class="canvas-tool active" id="selectTool" type="button" aria-label="选择工具" aria-pressed="true" title="选择并移动节点"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 3 14 9-7 1-3 7L5 3Z" /></svg><b>选择</b></button>
+                <button class="canvas-tool" id="handTool" type="button" aria-label="抓手工具" aria-pressed="false" title="拖动画布"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 11V7a2 2 0 0 1 4 0v3-5a2 2 0 0 1 4 0v5-3a2 2 0 0 1 4 0v7c0 5-3 7-7 7-3 0-5-2-7-5l-2-3a2 2 0 0 1 3-2l1 1" /></svg><b>抓手</b></button>
+                <span></span>
                 <button id="zoomOut" type="button" aria-label="缩小">−</button>
                 <button id="zoomValue" type="button" aria-label="当前缩放">100%</button>
                 <button id="zoomIn" type="button" aria-label="放大">＋</button>
                 <span></span>
-                <button id="fitCanvas" type="button" aria-label="适应画布">⌗</button>
-                <button class="add-node" id="addNodeButton" type="button">＋ 添加节点</button>
+                <button id="fitCanvas" type="button" aria-label="适应画布" title="适应画布"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" /></svg></button>
               </div>
             </section>
 
@@ -159,7 +146,6 @@
                 <div class="inspector-title"><span class="node-type-icon" id="inspectorIcon"></span><div><small>节点配置</small><h2 id="inspectorTitle">版本构建</h2></div></div>
                 <button class="icon-button" id="closeInspector" type="button" aria-label="关闭节点配置">×</button>
               </header>
-              <div class="inspector-meta"><span>节点类型</span><strong id="inspectorType">版本构建</strong></div>
               <div class="inspector-content" id="inspectorContent"></div>
               <footer class="inspector-footer" id="inspectorFooter"></footer>
             </aside>
@@ -200,6 +186,24 @@
       <p id="successSummary">2 个服务已经在服务器运行，访问地址检查通过。</p>
       <a id="successAddress" href="#">https://customer-crm.example.com</a>
       <footer><button class="secondary-button" id="stayInWorkflow" type="button">继续查看工作流</button><button class="primary-button" id="successBackHome" type="button">返回所有项目</button></footer>
+    </dialog>
+
+    <dialog class="line-management-dialog" id="renameLineDialog">
+      <header><div><small>部署线路</small><h2>重命名线路</h2></div><button class="icon-button" id="closeRenameLine" type="button" aria-label="关闭重命名线路">×</button></header>
+      <div class="line-dialog-body">
+        <label for="renameLineInput">线路名称</label>
+        <input id="renameLineInput" maxlength="24" autocomplete="off" />
+        <p>名称只用于区分部署用途，不会改变服务器或节点配置。</p>
+      </div>
+      <footer><button class="secondary-button" id="cancelRenameLine" type="button">取消</button><button class="primary-button" id="confirmRenameLine" type="button">保存名称</button></footer>
+    </dialog>
+
+    <dialog class="line-management-dialog danger-dialog" id="deleteLineDialog">
+      <header><div><small>删除线路</small><h2>确认删除“<span id="deleteLineName"></span>”？</h2></div><button class="icon-button" id="closeDeleteLine" type="button" aria-label="关闭删除线路确认">×</button></header>
+      <div class="line-dialog-body">
+        <p>这会删除该线路的流程布局和配置记录，但不会删除项目代码，也不会删除配置中心里可复用的连接。</p>
+      </div>
+      <footer><button class="secondary-button" id="cancelDeleteLine" type="button">取消</button><button class="danger-button" id="confirmDeleteLine" type="button">删除线路</button></footer>
     </dialog>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>

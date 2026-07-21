@@ -8,7 +8,13 @@ import {
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "../api";
 import { saveDeploymentPath } from "../api";
-import type { DeploymentRun, WorkspacePreview } from "../types";
+import type {
+  ConnectionResource,
+  DeploymentPath,
+  DeploymentRun,
+  ServerResource,
+  WorkspacePreview,
+} from "../types";
 import { DeploymentPathWorkspace } from "./DeploymentPathWorkspace";
 
 // The workspace tests exercise deployment-path state and node-panel behavior.
@@ -17,21 +23,39 @@ import { DeploymentPathWorkspace } from "./DeploymentPathWorkspace";
 // the canvas integration has its own focused test.
 vi.mock("./DeploymentWorkflowCanvas", () => ({
   DeploymentWorkflowCanvas: ({
+    initialNodePositions,
     nodes,
+    onNodePositionsChange,
     onSelectNode,
   }: {
+    initialNodePositions?: Record<
+      "local" | "build" | "registry" | "server",
+      { x: number; y: number }
+    >;
     nodes: Array<{
       id: "local" | "build" | "registry" | "server";
+      provider?: string;
       statusLabel: string;
       summary: string;
       title: string;
     }>;
+    onNodePositionsChange?: (
+      positions: Record<
+        "local" | "build" | "registry" | "server",
+        { x: number; y: number }
+      >,
+    ) => void;
     onSelectNode: (node: "local" | "build" | "registry" | "server") => void;
   }) => (
-    <section aria-label="部署工作流画布">
+    <section
+      aria-label="部署工作流画布"
+      data-local-x={initialNodePositions?.local.x}
+      data-server-y={initialNodePositions?.server.y}
+    >
       {nodes.map((node) => (
         <button
           aria-label={`${node.title}：${node.statusLabel}，${node.summary}`}
+          data-provider={node.provider}
           key={node.id}
           onClick={() => onSelectNode(node.id)}
           type="button"
@@ -39,6 +63,20 @@ vi.mock("./DeploymentWorkflowCanvas", () => ({
           {node.title}
         </button>
       ))}
+      <button
+        aria-label="模拟移动画布节点"
+        onClick={() =>
+          onNodePositionsChange?.({
+            local: { x: 100, y: 120 },
+            build: { x: 430, y: 120 },
+            registry: { x: 760, y: 120 },
+            server: { x: 1090, y: 120 },
+          })
+        }
+        type="button"
+      >
+        移动画布节点
+      </button>
     </section>
   ),
 }));
@@ -136,13 +174,267 @@ function renderWorkspace(
   );
 }
 
+async function savePathFixture(
+  id: string,
+  name: string,
+  state: DeploymentPath["state"] = "draft",
+) {
+  await saveDeploymentPath({
+    id,
+    projectPath: "/demo/sample",
+    name,
+    sourceConnectionId: null,
+    registryConnectionId: null,
+    serverId: null,
+    configProfileIds: [],
+    address: "",
+    routes: [],
+    state,
+    lastRunId: null,
+    lastSuccessfulRevision: null,
+  });
+}
+
+function deploymentConnectionFixtures(
+  sourceStatus: ConnectionResource["status"] = "ready",
+  registryStatus: ConnectionResource["status"] = "ready",
+): ConnectionResource[] {
+  return [
+    {
+      id: "source-fact",
+      kind: "source",
+      provider: "cnb",
+      name: "我的 CNB 连接",
+      status: sourceStatus,
+      lastCheckedAt: "2026-07-21T08:00:00Z",
+      capabilities: [],
+      metadata: { username: "demo" },
+    },
+    {
+      id: "registry-fact",
+      kind: "registry",
+      provider: "tcr",
+      name: "公司 TCR",
+      status: registryStatus,
+      lastCheckedAt: "2026-07-21T08:00:00Z",
+      capabilities: [],
+      metadata: {
+        endpoint: "ccr.ccs.tencentyun.com",
+        namespace: "demo",
+      },
+    },
+  ];
+}
+
+function deploymentServerFixture(keyPathExists = true): ServerResource {
+  return {
+    id: "server-fact",
+    name: "线上服务器",
+    host: "203.0.113.80",
+    user: "ubuntu",
+    port: 22,
+    keyPath: "/Users/demo/.ssh/abcdeploy_ed25519",
+    keyPathExists,
+    hostFingerprint: "SHA256:server-fact",
+    lastCheckedAt: "2026-07-21T08:00:00Z",
+  };
+}
+
+async function saveFactCompletePath(id = "path-facts") {
+  await saveDeploymentPath({
+    id,
+    projectPath: "/demo/sample",
+    name: "上线",
+    sourceConnectionId: "source-fact",
+    registryConnectionId: "registry-fact",
+    serverId: "server-fact",
+    configProfileIds: [],
+    address: "app.example.com",
+    routes: [{ service: "web", host: "app.example.com", path: "/" }],
+    state: "draft",
+    lastRunId: null,
+    lastSuccessfulRevision: null,
+  });
+}
+
 describe("DeploymentPathWorkspace", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     localStorage.clear();
   });
 
-  it("在线路设置中确认删除最后一条线路后回到空状态", async () => {
+  it("顶部线路标签为中性、加载、警告和成功状态提供一致图标语义", async () => {
+    await savePathFixture("path-draft", "待配置线路", "draft");
+    await savePathFixture("path-deploying", "上线中线路", "deploying");
+    await savePathFixture("path-warning", "待处理线路", "needs_action");
+    await savePathFixture("path-online", "在线线路", "online");
+
+    renderWorkspace(false);
+
+    const assertBadge = (
+      label: string,
+      tone: "neutral" | "processing" | "success" | "warning",
+      iconClass: string,
+    ) => {
+      const badge = screen.getByLabelText(`线路状态：${label}`);
+      expect(badge).toHaveAttribute("data-path-state-tone", tone);
+      expect(badge).toHaveClass("h-5", "text-xs");
+      expect(badge.querySelector(iconClass)).not.toBeNull();
+    };
+
+    await screen.findByLabelText("线路状态：尚未配置");
+    assertBadge("尚未配置", "neutral", ".lucide-circle");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /^上线中线路\s+上线中$/ }),
+    );
+    assertBadge("上线中", "processing", ".lucide-loader-circle");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /^待处理线路\s+需要处理$/ }),
+    );
+    assertBadge("需要处理", "warning", ".lucide-circle-alert");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /^在线线路\s+已上线$/ }),
+    );
+    assertBadge("已上线", "success", ".lucide-check");
+  });
+
+  it("从线路列表重命名非当前线路时保持当前画布不变", async () => {
+    await savePathFixture("path-primary", "主线路");
+    await savePathFixture("path-standby", "备用线路");
+
+    renderWorkspace(false);
+    const primaryPath = await screen.findByRole("button", {
+      name: /^主线路\s+尚未配置$/,
+    });
+    expect(primaryPath).toHaveAttribute("aria-current", "page");
+
+    fireEvent.click(screen.getByRole("button", { name: "管理线路：备用线路" }));
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: "重命名线路" }),
+    );
+
+    expect(primaryPath).toHaveAttribute("aria-current", "page");
+    const settings = await screen.findByRole("dialog", {
+      name: "重命名线路",
+    });
+    expect(within(settings).getByLabelText("线路名称")).toHaveValue("备用线路");
+    fireEvent.change(within(settings).getByLabelText("线路名称"), {
+      target: { value: "灾备线路" },
+    });
+    fireEvent.click(within(settings).getByRole("button", { name: "保存名称" }));
+
+    const renamedPath = await screen.findByRole("button", {
+      name: /^灾备线路\s+尚未配置$/,
+    });
+    expect(primaryPath).toHaveAttribute("aria-current", "page");
+    expect(renamedPath).not.toHaveAttribute("aria-current");
+    await expect(api.listDeploymentPaths("/demo/sample")).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "path-primary", name: "主线路" }),
+        expect.objectContaining({ id: "path-standby", name: "灾备线路" }),
+      ]),
+    );
+  });
+
+  it("从线路列表删除指定线路并禁用部署中线路的删除入口", async () => {
+    await savePathFixture("path-primary", "主线路");
+    await savePathFixture("path-standby", "备用线路");
+    await savePathFixture("path-deploying", "上线中线路", "deploying");
+
+    renderWorkspace(false);
+    const primaryPath = await screen.findByRole("button", {
+      name: /^主线路\s+尚未配置$/,
+    });
+    expect(primaryPath).toHaveAttribute("aria-current", "page");
+    fireEvent.click(
+      screen.getByRole("button", { name: "管理线路：上线中线路" }),
+    );
+    expect(
+      await screen.findByRole("menuitem", { name: "删除线路" }),
+    ).toHaveAttribute("aria-disabled", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "管理线路：备用线路" }));
+    const deleteStandbyItem = (
+      await screen.findAllByRole("menuitem", { name: "删除线路" })
+    ).find((item) => item.getAttribute("aria-disabled") === "false");
+    expect(deleteStandbyItem).toBeDefined();
+    fireEvent.click(deleteStandbyItem!);
+    expect(primaryPath).toHaveAttribute("aria-current", "page");
+    const confirmation = await screen.findByRole("dialog", {
+      name: "确认删除线路",
+    });
+    expect(
+      within(confirmation).getByText(/确定删除“备用线路”吗/),
+    ).toBeInTheDocument();
+    expect(
+      within(confirmation).getByText(/不会删除本地项目代码或配置中心里的连接/),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      within(confirmation).getByRole("button", { name: "确认删除线路" }),
+    );
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "管理线路：备用线路" }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(primaryPath).toHaveAttribute("aria-current", "page");
+    const remainingPaths = await api.listDeploymentPaths("/demo/sample");
+    expect(remainingPaths.map((candidate) => candidate.id)).toEqual([
+      "path-primary",
+      "path-deploying",
+    ]);
+  });
+
+  it("按线路恢复并保存画布节点位置", async () => {
+    await savePathFixture("path-primary", "主线路");
+    await savePathFixture("path-standby", "备用线路");
+    await api.saveDeploymentPathCanvasLayout("/demo/sample", "path-primary", {
+      local: { x: 25, y: 35 },
+      build: { x: 345, y: 35 },
+      registry: { x: 665, y: 35 },
+      server: { x: 985, y: 35 },
+    });
+    await api.saveDeploymentPathCanvasLayout("/demo/sample", "path-standby", {
+      local: { x: -50, y: 75 },
+      build: { x: 300, y: 75 },
+      registry: { x: 650, y: 75 },
+      server: { x: 1000, y: 75 },
+    });
+
+    renderWorkspace(false);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("region", { name: "部署工作流画布" }),
+      ).toHaveAttribute("data-local-x", "25"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "模拟移动画布节点" }));
+    await waitFor(async () =>
+      expect(
+        await api.getDeploymentPathCanvasLayout("/demo/sample", "path-primary"),
+      ).toEqual({
+        local: { x: 100, y: 120 },
+        build: { x: 430, y: 120 },
+        registry: { x: 760, y: 120 },
+        server: { x: 1090, y: 120 },
+      }),
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /^备用线路\s+尚未配置$/ }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("region", { name: "部署工作流画布" }),
+      ).toHaveAttribute("data-local-x", "-50"),
+    );
+  });
+
+  it("在线路菜单中确认删除最后一条线路后回到空状态", async () => {
     await saveDeploymentPath({
       id: "path-only",
       projectPath: "/demo/sample",
@@ -158,17 +450,11 @@ describe("DeploymentPathWorkspace", () => {
       lastSuccessfulRevision: null,
     });
 
-    renderWorkspace(false);
+    const firstMount = renderWorkspace(false);
     fireEvent.click(
-      await screen.findByRole("button", { name: "修改线路名称" }),
+      await screen.findByRole("button", { name: "管理线路：唯一线路" }),
     );
-    const settings = await screen.findByRole("dialog", { name: "线路设置" });
-    expect(
-      within(settings).getByText(/删除后无法恢复.*不会删除配置中心里的连接/),
-    ).toBeInTheDocument();
-    fireEvent.click(
-      within(settings).getByRole("button", { name: "删除这条线路" }),
-    );
+    fireEvent.click(await screen.findByRole("menuitem", { name: "删除线路" }));
 
     const confirmation = await screen.findByRole("dialog", {
       name: "确认删除线路",
@@ -184,6 +470,32 @@ describe("DeploymentPathWorkspace", () => {
       await screen.findByRole("heading", { name: "创建第一条上线线路" }),
     ).toBeInTheDocument();
     await expect(api.listDeploymentPaths("/demo/sample")).resolves.toEqual([]);
+
+    firstMount.unmount();
+    renderWorkspace(false);
+
+    expect(
+      await screen.findByRole("heading", { name: "创建第一条上线线路" }),
+    ).toBeInTheDocument();
+    await expect(api.listDeploymentPaths("/demo/sample")).resolves.toEqual([]);
+
+    const emptyState = screen
+      .getByRole("heading", { name: "创建第一条上线线路" })
+      .closest("div");
+    expect(emptyState).not.toBeNull();
+    fireEvent.click(
+      within(emptyState!).getByRole("button", { name: "创建上线线路" }),
+    );
+
+    await waitFor(async () =>
+      expect(await api.listDeploymentPaths("/demo/sample")).toHaveLength(1),
+    );
+    expect(
+      screen.queryByRole("heading", { name: "创建第一条上线线路" }),
+    ).not.toBeInTheDocument();
+    expect(
+      await screen.findByRole("region", { name: "部署工作流画布" }),
+    ).toBeInTheDocument();
   });
 
   it("正式运行记录展示真实关键事实并折叠完整技术信息", async () => {
@@ -335,13 +647,250 @@ describe("DeploymentPathWorkspace", () => {
     renderWorkspace(false);
     fireEvent.click(await screen.findByRole("button", { name: "连接" }));
 
-    expect(screen.getByText("密钥已保存")).toHaveClass("text-emerald-600");
-    expect(screen.getByText("密钥缺失")).toHaveClass("text-amber-600");
+    expect(screen.getByText("密钥已保存")).toHaveClass("text-[var(--success)]");
+    expect(screen.getByText("密钥缺失")).toHaveClass("text-[var(--warning)]");
+  });
+
+  it("节点检查器使用紧凑信息层级并只突出当前主动作", async () => {
+    renderWorkspace();
+
+    const inspector = await screen.findByRole("dialog", { name: "版本构建" });
+    const title = within(inspector).getByRole("heading", { name: "版本构建" });
+    expect(title).toHaveClass("text-base");
+    expect(title.parentElement?.parentElement?.nextElementSibling).toHaveClass(
+      "text-xs",
+      "leading-[18px]",
+    );
+    const closeButton = within(inspector).getByRole("button", { name: "关闭" });
+    expect(closeButton).not.toHaveAttribute("icon");
+    expect(closeButton.querySelector("svg")).toBeInTheDocument();
+    expect(closeButton).toHaveStyle({ height: "32px", width: "32px" });
+
+    const addConnection = within(inspector).queryByRole("button", {
+      name: "添加新的构建服务",
+    });
+    if (addConnection) fireEvent.click(addConnection);
+
+    const primaryAction = within(inspector).getByRole("button", {
+      name: "验证并保存构建服务",
+    });
+    expect(primaryAction).toHaveAttribute(
+      "data-workspace-button-variant",
+      "default",
+    );
+    expect(
+      within(inspector)
+        .getAllByRole("button")
+        .filter(
+          (button) =>
+            button.getAttribute("data-workspace-button-variant") === "default",
+        ),
+    ).toEqual([primaryAction]);
+  });
+
+  it("更换构建连接时先选择草稿，确认前和验证失败后都保留原绑定", async () => {
+    const nextSource: ConnectionResource = {
+      id: "source-next",
+      kind: "source",
+      provider: "cnb",
+      name: "备用 CNB 连接",
+      status: "ready",
+      lastCheckedAt: "2026-07-21T09:00:00Z",
+      capabilities: [],
+      metadata: { username: "backup" },
+    };
+    vi.spyOn(api, "listConnections").mockResolvedValue([
+      ...deploymentConnectionFixtures(),
+      nextSource,
+    ]);
+    vi.spyOn(api, "listServers").mockResolvedValue([deploymentServerFixture()]);
+    vi.spyOn(api, "loadRuntimeConfig").mockResolvedValue({
+      environment: "path-path-facts",
+      filename: ".env.path-path-facts",
+      sourceFiles: [],
+      content: "",
+      templateContent: "",
+      requiredVariables: [],
+      stored: true,
+      authorizationRequired: false,
+    });
+    const repositoryCheck = vi
+      .spyOn(api, "checkCnbRepositoryAccess")
+      .mockResolvedValue({
+        provider: "cnb-repository",
+        ok: false,
+        summary: "备用连接暂时无法读取仓库",
+        details: [],
+      });
+    await saveFactCompletePath();
+
+    renderWorkspace(false);
+    fireEvent.click(
+      await screen.findByRole("button", { name: /版本构建：构建服务可用/ }),
+    );
+    const inspector = await screen.findByRole("dialog", { name: "版本构建" });
+    expect(within(inspector).getByText("服务提供方 · CNB")).toBeInTheDocument();
+    expect(
+      within(inspector).getByRole("button", { name: "更换构建服务" }),
+    ).toHaveAttribute("data-workspace-button-variant", "default");
+    expect(
+      within(inspector).queryByRole("button", { name: "完成" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(
+      within(inspector).getByRole("button", { name: "更换构建服务" }),
+    );
+    const nextCandidate = within(inspector).getByRole("radio", {
+      name: /备用 CNB 连接/,
+    });
+    fireEvent.click(nextCandidate);
+    expect(nextCandidate).toHaveAttribute("aria-checked", "true");
+    expect(
+      within(inspector).getByRole("button", { name: "使用这个连接" }),
+    ).toHaveAttribute("data-workspace-button-variant", "default");
+    expect(
+      (await api.listDeploymentPaths("/demo/sample"))[0]?.sourceConnectionId,
+    ).toBe("source-fact");
+
+    fireEvent.click(
+      within(inspector).getByRole("button", { name: "使用这个连接" }),
+    );
+    await waitFor(() => expect(repositoryCheck).toHaveBeenCalled());
+    expect(
+      (await api.listDeploymentPaths("/demo/sample"))[0]?.sourceConnectionId,
+    ).toBe("source-fact");
+    expect(
+      within(inspector).getByRole("radio", { name: /备用 CNB 连接/ }),
+    ).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("版本仓库和服务器候选也必须经唯一主按钮确认后才替换", async () => {
+    const nextRegistry: ConnectionResource = {
+      id: "registry-next",
+      kind: "registry",
+      provider: "tcr",
+      name: "备用 TCR",
+      status: "ready",
+      lastCheckedAt: "2026-07-21T09:00:00Z",
+      capabilities: [],
+      metadata: {
+        endpoint: "ccr.ccs.tencentyun.com",
+        namespace: "backup",
+      },
+    };
+    const nextServer: ServerResource = {
+      ...deploymentServerFixture(),
+      id: "server-next",
+      name: "备用服务器",
+      host: "203.0.113.81",
+    };
+    vi.spyOn(api, "listConnections").mockResolvedValue([
+      ...deploymentConnectionFixtures(),
+      nextRegistry,
+    ]);
+    vi.spyOn(api, "listServers").mockResolvedValue([
+      deploymentServerFixture(),
+      nextServer,
+    ]);
+    vi.spyOn(api, "loadRuntimeConfig").mockResolvedValue({
+      environment: "path-path-facts",
+      filename: ".env.path-path-facts",
+      sourceFiles: [],
+      content: "",
+      templateContent: "",
+      requiredVariables: [],
+      stored: true,
+      authorizationRequired: false,
+    });
+    vi.spyOn(api, "checkSavedRegistryCredentials").mockResolvedValue({
+      provider: "tcr",
+      ok: true,
+      summary: "版本仓库可用",
+      details: [],
+    });
+    vi.spyOn(api, "checkServer").mockResolvedValue({
+      provider: "ssh",
+      ok: true,
+      summary: "服务器可用",
+      details: [],
+    });
+    await saveFactCompletePath();
+
+    renderWorkspace(false);
+    fireEvent.click(
+      await screen.findByRole("button", { name: /版本存储：版本仓库可用/ }),
+    );
+    let inspector = await screen.findByRole("dialog", { name: "版本存储" });
+    expect(
+      within(inspector).getByText("服务提供方 · 腾讯云 TCR"),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      within(inspector).getByRole("button", { name: "更换版本仓库" }),
+    );
+    fireEvent.click(within(inspector).getByRole("radio", { name: /备用 TCR/ }));
+    expect(
+      (await api.listDeploymentPaths("/demo/sample"))[0]?.registryConnectionId,
+    ).toBe("registry-fact");
+    const registryConfirm = within(inspector).getByRole("button", {
+      name: "使用这个连接",
+    });
+    expect(
+      within(inspector)
+        .getAllByRole("button")
+        .filter(
+          (button) =>
+            button.getAttribute("data-workspace-button-variant") === "default",
+        ),
+    ).toEqual([registryConfirm]);
+    fireEvent.click(
+      within(inspector).getByRole("button", { name: "返回当前配置" }),
+    );
+    expect(
+      (await api.listDeploymentPaths("/demo/sample"))[0]?.registryConnectionId,
+    ).toBe("registry-fact");
+
+    fireEvent.click(
+      within(inspector).getByRole("button", { name: "更换版本仓库" }),
+    );
+    fireEvent.click(within(inspector).getByRole("radio", { name: /备用 TCR/ }));
+    fireEvent.click(
+      within(inspector).getByRole("button", { name: "使用这个连接" }),
+    );
+    await waitFor(async () =>
+      expect(
+        (await api.listDeploymentPaths("/demo/sample"))[0]
+          ?.registryConnectionId,
+      ).toBe("registry-next"),
+    );
+
+    inspector = await screen.findByRole("dialog", { name: "部署运行" });
+    fireEvent.click(
+      within(inspector).getByRole("radio", { name: /备用服务器/ }),
+    );
+    expect((await api.listDeploymentPaths("/demo/sample"))[0]?.serverId).toBe(
+      "server-fact",
+    );
+    const serverConfirm = within(inspector).getByRole("button", {
+      name: "使用这个服务器",
+    });
+    expect(serverConfirm).toHaveAttribute(
+      "data-workspace-button-variant",
+      "default",
+    );
+    fireEvent.click(serverConfirm);
+    await waitFor(async () =>
+      expect((await api.listDeploymentPaths("/demo/sample"))[0]?.serverId).toBe(
+        "server-next",
+      ),
+    );
   });
 
   it("添加新项目后自动生成一条从本地到服务器的固定线路", async () => {
     renderWorkspace();
-    expect(await screen.findByText("部署工作流")).toBeInTheDocument();
+    expect(await screen.findByRole("main")).toHaveAttribute(
+      "data-workspace-shell",
+      "deployment",
+    );
     const dialog = await screen.findByRole("dialog", { name: "版本构建" });
     fireEvent.click(within(dialog).getByRole("button", { name: "关闭" }));
     expect(
@@ -993,7 +1542,7 @@ describe("DeploymentPathWorkspace", () => {
     );
   });
 
-  it("已就绪版本仓库只显示摘要，更换和新增配置互斥展示", async () => {
+  it("版本仓库查看、选择和新增三态严格互斥展示", async () => {
     vi.spyOn(api, "listConnections").mockResolvedValue([
       {
         id: "source-ready",
@@ -1032,11 +1581,21 @@ describe("DeploymentPathWorkspace", () => {
     );
     const dialog = await screen.findByRole("dialog", { name: "版本存储" });
 
-    expect(within(dialog).getByText("版本仓库已连接")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("服务提供方 · 腾讯云 TCR"),
+    ).toBeInTheDocument();
     expect(
       within(dialog).queryByLabelText("版本仓库地址"),
     ).not.toBeInTheDocument();
-    expect(within(dialog).queryByText("版本记录")).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("选择配置中心已有连接"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("连接新的版本仓库"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("已经完成的节点和当前在线服务会保留"),
+    ).not.toBeInTheDocument();
 
     fireEvent.click(
       within(dialog).getByRole("button", { name: "更换版本仓库" }),
@@ -1047,13 +1606,225 @@ describe("DeploymentPathWorkspace", () => {
     expect(
       within(dialog).queryByLabelText("版本仓库地址"),
     ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("服务提供方 · 腾讯云 TCR"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("连接新的版本仓库"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("已经完成的节点和当前在线服务会保留"),
+    ).not.toBeInTheDocument();
 
     fireEvent.click(
       within(dialog).getByRole("button", { name: "添加新的版本仓库" }),
     );
     expect(within(dialog).getByLabelText("版本仓库地址")).toBeInTheDocument();
+    expect(within(dialog).getByText("连接新的版本仓库")).toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("服务提供方 · 腾讯云 TCR"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("选择配置中心已有连接"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("已经完成的节点和当前在线服务会保留"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("版本仓库修复态不混入查看、选择或新增内容", async () => {
+    vi.spyOn(api, "listConnections").mockResolvedValue([
+      {
+        id: "registry-ready",
+        kind: "registry",
+        provider: "tcr",
+        name: "腾讯云 TCR",
+        status: "ready",
+        lastCheckedAt: "2026-07-19T00:00:00Z",
+        capabilities: [],
+        metadata: {
+          endpoint: "ccr.ccs.tencentyun.com",
+          namespace: "demo",
+        },
+      },
+    ]);
+    await saveDeploymentPath({
+      id: "path-registry-repair",
+      projectPath: "/demo/sample",
+      name: "上线",
+      sourceConnectionId: null,
+      registryConnectionId: "registry-ready",
+      serverId: null,
+      configProfileIds: [],
+      address: "",
+      routes: [],
+      state: "needs_action",
+      lastRunId: "run-registry-repair",
+      lastSuccessfulRevision: null,
+    });
+    const run: DeploymentRun = {
+      id: "run-registry-repair",
+      projectPath: "/demo/sample",
+      projectName: "sample",
+      environment: "deployment",
+      status: "needs_action",
+      currentStage: "registry",
+      buildSerial: "1003",
+      commitSha: "0123456789abcdef0123456789abcdef01234567",
+      sourceTitle: "当前本地项目",
+      sourceRunId: null,
+      candidateTag: null,
+      artifacts: [],
+      actionKind: "deployment-path-retry",
+      actionUrl: null,
+      issueCode: "AD-REG-101",
+      repository: "demo/sample",
+      branch: "main",
+      message: "版本仓库授权已经失效",
+      completedSteps: ["build"],
+      startedAt: "2026-07-19T00:00:00Z",
+      updatedAt: "2026-07-19T00:01:00Z",
+    };
+
+    renderWorkspace(false, [run]);
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /版本存储/,
+      }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: "版本存储" });
+
+    expect(
+      within(dialog).getByText("版本仓库授权已经失效"),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(
+        "已经完成的节点和当前在线服务会保留，只处理这里的问题。",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "更换版本仓库" }),
+    ).toBeInTheDocument();
     expect(
       within(dialog).queryByText("版本仓库已连接"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("选择配置中心已有连接"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("连接新的版本仓库"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByLabelText("版本仓库地址"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("服务器查看、选择、访问地址和运行配置不会同时展示", async () => {
+    const server = {
+      id: "server-ready",
+      name: "生产服务器",
+      host: "203.0.113.10",
+      user: "ubuntu",
+      port: 22,
+      keyPath: "/Users/demo/.ssh/abcdeploy_ed25519",
+      keyPathExists: true,
+      hostFingerprint: "SHA256:server",
+      lastCheckedAt: "2026-07-19T00:00:00Z",
+    };
+    vi.spyOn(api, "listServers").mockResolvedValue([server]);
+    vi.spyOn(api, "loadRuntimeConfig").mockResolvedValue({
+      environment: "path-path-server-modes",
+      filename: ".env.path-path-server-modes",
+      sourceFiles: [],
+      content: "",
+      templateContent: "",
+      requiredVariables: [],
+      stored: true,
+      authorizationRequired: false,
+    });
+    await saveDeploymentPath({
+      id: "path-server-modes",
+      projectPath: "/demo/sample",
+      name: "上线",
+      sourceConnectionId: null,
+      registryConnectionId: null,
+      serverId: server.id,
+      configProfileIds: [],
+      address: "app.example.com",
+      routes: [{ service: "web", host: "app.example.com", path: "/" }],
+      state: "draft",
+      lastRunId: null,
+      lastSuccessfulRevision: null,
+    });
+
+    renderWorkspace(false);
+    fireEvent.click(
+      await screen.findByRole("button", { name: /部署运行：运行服务器可用/ }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: "部署运行" });
+
+    expect(
+      within(dialog).getByText("服务提供方 · Linux 服务器"),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("选择配置中心已有服务器"),
+    ).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("项目访问地址")).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByLabelText("服务器地址"),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "更换运行服务器" }),
+    );
+    expect(
+      within(dialog).getByText("选择配置中心已有服务器"),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("服务提供方 · Linux 服务器"),
+    ).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("项目访问地址")).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByLabelText("服务器地址"),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "返回当前配置" }),
+    );
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "维护访问地址" }),
+    );
+    expect(within(dialog).getByText("项目访问地址")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("访问地址")).toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("服务提供方 · Linux 服务器"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("选择配置中心已有服务器"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByLabelText("服务器地址"),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "返回服务器摘要" }),
+    );
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "维护运行配置" }),
+    );
+    expect(
+      await within(dialog).findByText(/运行配置|所有配置都已有值/),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("服务提供方 · Linux 服务器"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("选择配置中心已有服务器"),
+    ).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("项目访问地址")).not.toBeInTheDocument();
+    expect(within(dialog).queryByLabelText("访问地址")).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByLabelText("服务器地址"),
     ).not.toBeInTheDocument();
   });
 
@@ -1280,5 +2051,163 @@ describe("DeploymentPathWorkspace", () => {
       screen.getByRole("button", { name: /部署运行：运行服务器可用/ }),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "开始上线" })).toBeEnabled();
+  });
+
+  it("四个节点事实全部就绪时派生显示可以上线且不篡改持久化状态", async () => {
+    vi.spyOn(api, "listConnections").mockResolvedValue(
+      deploymentConnectionFixtures(),
+    );
+    vi.spyOn(api, "listServers").mockResolvedValue([deploymentServerFixture()]);
+    vi.spyOn(api, "loadRuntimeConfig").mockResolvedValue({
+      environment: "path-path-facts",
+      filename: ".env.path-path-facts",
+      sourceFiles: [],
+      content: "",
+      templateContent: "",
+      requiredVariables: [],
+      stored: true,
+      authorizationRequired: false,
+    });
+    await saveFactCompletePath();
+
+    renderWorkspace(false);
+
+    expect(
+      await screen.findByRole("button", { name: /^上线 可以上线$/ }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("可以上线").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByRole("button", { name: "开始上线" })).toBeEnabled();
+    expect(
+      screen.queryByRole("button", { name: /^上线 尚未配置$/ }),
+    ).not.toBeInTheDocument();
+    await expect(api.listDeploymentPaths("/demo/sample")).resolves.toEqual([
+      expect.objectContaining({ id: "path-facts", state: "draft" }),
+    ]);
+  });
+
+  it("代码平台授权失效时保留连接事实并只提供重新授权动作", async () => {
+    vi.spyOn(api, "listConnections").mockResolvedValue(
+      deploymentConnectionFixtures("needs_authorization", "ready"),
+    );
+    vi.spyOn(api, "listServers").mockResolvedValue([deploymentServerFixture()]);
+    vi.spyOn(api, "loadRuntimeConfig").mockResolvedValue({
+      environment: "path-path-source-auth",
+      filename: ".env.path-path-source-auth",
+      sourceFiles: [],
+      content: "",
+      templateContent: "",
+      requiredVariables: [],
+      stored: true,
+      authorizationRequired: false,
+    });
+    await saveFactCompletePath("path-source-auth");
+
+    renderWorkspace(false);
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /版本构建：授权失效，已保存连接“我的 CNB 连接”，需要重新授权/,
+      }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: "版本构建" });
+
+    expect(within(dialog).getByText("已保留的连接信息")).toBeInTheDocument();
+    expect(within(dialog).getByText("我的 CNB 连接")).toBeInTheDocument();
+    expect(within(dialog).getByText("demo/sample")).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "重新授权构建服务" }),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).queryByRole("button", { name: "更换构建服务" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "重新授权构建服务" }),
+    );
+    expect(within(dialog).getByText("连接新的构建服务")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("访问令牌")).toBeInTheDocument();
+  });
+
+  it("版本仓库连接失效时保留仓库事实并只提供重新连接动作", async () => {
+    vi.spyOn(api, "listConnections").mockResolvedValue(
+      deploymentConnectionFixtures("ready", "error"),
+    );
+    vi.spyOn(api, "listServers").mockResolvedValue([deploymentServerFixture()]);
+    vi.spyOn(api, "loadRuntimeConfig").mockResolvedValue({
+      environment: "path-path-registry-error",
+      filename: ".env.path-path-registry-error",
+      sourceFiles: [],
+      content: "",
+      templateContent: "",
+      requiredVariables: [],
+      stored: true,
+      authorizationRequired: false,
+    });
+    await saveFactCompletePath("path-registry-error");
+
+    renderWorkspace(false);
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /版本存储：连接失效，已保存连接“公司 TCR”，需要重新验证/,
+      }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: "版本存储" });
+
+    expect(within(dialog).getByText("已保留的连接信息")).toBeInTheDocument();
+    expect(within(dialog).getByText("公司 TCR")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("ccr.ccs.tencentyun.com"),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "重新连接版本仓库" }),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).queryByRole("button", { name: "更换版本仓库" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("服务器密钥缺失时节点进入修复态并从正常流程生成替代密钥", async () => {
+    vi.spyOn(api, "listConnections").mockResolvedValue(
+      deploymentConnectionFixtures(),
+    );
+    vi.spyOn(api, "listServers").mockResolvedValue([
+      deploymentServerFixture(false),
+    ]);
+    vi.spyOn(api, "loadRuntimeConfig").mockResolvedValue({
+      environment: "path-path-server-key-missing",
+      filename: ".env.path-path-server-key-missing",
+      sourceFiles: [],
+      content: "",
+      templateContent: "",
+      requiredVariables: [],
+      stored: true,
+      authorizationRequired: false,
+    });
+    await saveFactCompletePath("path-server-key-missing");
+
+    renderWorkspace(false);
+    const serverNode = await screen.findByRole("button", {
+      name: /部署运行：服务器密钥缺失，已保存服务器“线上服务器”，需要重新建立安全连接/,
+    });
+    expect(serverNode).toHaveAttribute("data-provider", "Linux 服务器");
+    fireEvent.click(serverNode);
+    const dialog = await screen.findByRole("dialog", { name: "部署运行" });
+
+    expect(within(dialog).getByText("已保留的服务器信息")).toBeInTheDocument();
+    expect(within(dialog).getByText("Linux 服务器")).toBeInTheDocument();
+    expect(within(dialog).getByText("线上服务器")).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "重新连接运行服务器" }),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).queryByRole("button", { name: "更换运行服务器" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "重新连接运行服务器" }),
+    );
+    expect(within(dialog).getByText("连接新的服务器")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("服务器地址")).toHaveValue(
+      "203.0.113.80",
+    );
   });
 });

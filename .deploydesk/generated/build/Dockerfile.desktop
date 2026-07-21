@@ -1,0 +1,49 @@
+# 由 ABCDeploy 根据项目结构生成，可提交并供本地、测试和生产共同使用。
+FROM node:22-bookworm-slim AS build
+
+ENV COREPACK_NPM_REGISTRY=https://registry.npmmirror.com \
+    npm_config_registry=https://registry.npmmirror.com \
+    NO_PROXY=registry.npmmirror.com \
+    no_proxy=registry.npmmirror.com
+
+WORKDIR /app
+RUN corepack enable \
+    && for attempt in 1 2 3; do \
+         HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= corepack pnpm --version && break; \
+         test "$attempt" = 3 && exit 1; \
+         sleep $((attempt * 2)); \
+       done
+COPY . .
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
+    for attempt in 1 2 3; do \
+      HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= corepack pnpm install --frozen-lockfile && break; \
+      test "$attempt" = 3 && exit 1; \
+      sleep $((attempt * 2)); \
+    done
+RUN corepack pnpm --filter @abcdeploy/desktop run build \
+    && output_index="$(find /app/apps/desktop/dist -type f -name index.html -print -quit)" \
+    && test -n "$output_index" \
+    && mkdir -p /opt/static \
+    && cp -R "$(dirname "$output_index")/." /opt/static/
+
+FROM caddy:2-alpine AS runtime
+
+ENV LISTEN_PORT=80 \
+    API_HOST=api \
+    API_PORT=3000
+
+COPY --from=build /opt/static /srv
+RUN printf '%s\n' \
+    ':{$LISTEN_PORT} {' \
+    '  encode zstd gzip' \
+    '  handle /api/* {' \
+    '    reverse_proxy {$API_HOST}:{$API_PORT}' \
+    '  }' \
+    '  handle {' \
+    '    root * /srv' \
+    '    try_files {path} /index.html' \
+    '    file_server' \
+    '  }' \
+    '}' > /etc/caddy/Caddyfile
+
+EXPOSE 80

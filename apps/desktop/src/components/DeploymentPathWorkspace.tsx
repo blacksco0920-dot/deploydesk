@@ -1,13 +1,13 @@
 import {
   ArrowLeft,
   Check,
-  ChevronRight,
+  Circle,
   CircleAlert,
   CloudCog,
-  ExternalLink,
   FolderCode,
   History,
   LoaderCircle,
+  MoreHorizontal,
   PackageOpen,
   Pencil,
   Plus,
@@ -15,7 +15,13 @@ import {
   Rocket,
   Server,
   Trash2,
+  X,
 } from "lucide-react";
+import SemiButton, {
+  type ButtonProps as SemiButtonProps,
+} from "@douyinfe/semi-ui/lib/es/button";
+import SemiDropdown from "@douyinfe/semi-ui/lib/es/dropdown";
+import SemiTooltip from "@douyinfe/semi-ui/lib/es/tooltip";
 import {
   lazy,
   Suspense,
@@ -34,6 +40,7 @@ import {
   connectCnb,
   deleteDeploymentPath,
   generateSshIdentity,
+  getDeploymentPathCanvasLayout,
   installServerKeyWithPassword,
   listConnections,
   listDeploymentPathRuns,
@@ -44,6 +51,7 @@ import {
   replaceRegistryCredentials,
   redeployDeploymentPathVersion,
   saveDeploymentPath,
+  saveDeploymentPathCanvasLayout,
   setAppSetting,
   takeOverDeploymentPathRoutes,
 } from "../api";
@@ -56,7 +64,6 @@ import type {
   ServerResource,
   WorkspacePreview,
 } from "../types";
-import { Button } from "./ui/button";
 import {
   Dialog,
   DialogContent,
@@ -67,21 +74,11 @@ import {
 } from "./ui/dialog";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-} from "./ui/sheet";
 import { RuntimeConfigFields } from "./RuntimeConfigFields";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "./ui/tooltip";
-import type { DeploymentWorkflowNodeModel } from "./DeploymentWorkflowCanvas";
+import type {
+  DeploymentWorkflowNodeModel,
+  DeploymentWorkflowNodePositions,
+} from "./DeploymentWorkflowCanvas";
 
 const DeploymentWorkflowCanvas = lazy(() =>
   import("./DeploymentWorkflowCanvas").then((module) => ({
@@ -124,6 +121,56 @@ interface NodeStatus {
   tone: NodeTone;
   summary: string;
   provider?: string;
+}
+
+type WorkspaceButtonVariant = "default" | "destructive" | "ghost" | "secondary";
+
+type WorkspaceButtonProps = Omit<SemiButtonProps, "size" | "theme" | "type"> & {
+  size?: "default" | "icon" | "sm";
+  variant?: WorkspaceButtonVariant;
+};
+
+/**
+ * Keep every visible workspace action on Semi's interaction primitives while
+ * preserving the compact button vocabulary used by the product shell.
+ */
+function WorkspaceButton({
+  size = "default",
+  style,
+  variant = "default",
+  ...props
+}: WorkspaceButtonProps) {
+  const iconOnly = size === "icon";
+  const theme =
+    variant === "ghost"
+      ? "borderless"
+      : variant === "secondary"
+        ? "light"
+        : "solid";
+  const type =
+    variant === "destructive"
+      ? "danger"
+      : variant === "default"
+        ? "primary"
+        : "tertiary";
+
+  return (
+    <SemiButton
+      {...props}
+      data-workspace-button-variant={variant}
+      size="small"
+      style={{
+        borderRadius: 8,
+        height: 32,
+        minWidth: iconOnly ? 32 : undefined,
+        paddingInline: iconOnly ? 0 : 14,
+        width: iconOnly ? 32 : undefined,
+        ...style,
+      }}
+      theme={theme}
+      type={type}
+    />
+  );
 }
 
 function messageOf(error: unknown) {
@@ -245,11 +292,16 @@ function connectionReady(connection: ConnectionResource | undefined) {
   );
 }
 
-function statusCopy(tone: NodeTone) {
-  if (tone === "ready") return "已就绪";
-  if (tone === "working") return "处理中";
-  if (tone === "error") return "需要修复";
-  return "尚未完成";
+function connectionNeedsRepair(connection: ConnectionResource | undefined) {
+  return Boolean(
+    connection && ["needs_authorization", "error"].includes(connection.status),
+  );
+}
+
+function connectionProviderLabel(connection: ConnectionResource) {
+  if (connection.provider.toLowerCase() === "cnb") return "CNB";
+  if (connection.provider.toLowerCase() === "tcr") return "腾讯云 TCR";
+  return connection.provider.toUpperCase();
 }
 
 function runProblemNode(run: DeploymentRun | undefined): PathNode | null {
@@ -344,6 +396,56 @@ function deploymentPathStateLabel(state: DeploymentPath["state"]) {
     online: "已上线",
     ready: "可以上线",
   }[state];
+}
+
+function DeploymentPathStateBadge({
+  state,
+}: {
+  state: DeploymentPath["state"];
+}) {
+  const label = deploymentPathStateLabel(state);
+  const presentation = {
+    deploying: {
+      className: "bg-[var(--accent-soft)] text-[var(--accent)]",
+      icon: LoaderCircle,
+      tone: "processing",
+    },
+    draft: {
+      className: "bg-[var(--muted)] text-[var(--muted-foreground)]",
+      icon: Circle,
+      tone: "neutral",
+    },
+    needs_action: {
+      className: "bg-[var(--warning-soft)] text-[var(--warning)]",
+      icon: CircleAlert,
+      tone: "warning",
+    },
+    online: {
+      className: "bg-[var(--success-soft)] text-[var(--success)]",
+      icon: Check,
+      tone: "success",
+    },
+    ready: {
+      className: "bg-[var(--success-soft)] text-[var(--success)]",
+      icon: Check,
+      tone: "success",
+    },
+  }[state];
+  const Icon = presentation.icon;
+
+  return (
+    <span
+      aria-label={`线路状态：${label}`}
+      className={`inline-flex h-5 shrink-0 items-center gap-1 rounded-full px-2 text-xs leading-none ${presentation.className}`}
+      data-path-state-tone={presentation.tone}
+    >
+      <Icon
+        aria-hidden="true"
+        className={`size-3.5 ${state === "deploying" ? "animate-spin-slow" : ""}`}
+      />
+      {label}
+    </span>
+  );
 }
 
 function deploymentRunStatusLabel(status: DeploymentRun["status"]) {
@@ -462,13 +564,22 @@ export function DeploymentPathWorkspace({
   const [activePathId, setActivePathId] = useState("");
   const [activeNode, setActiveNode] = useState<PathNode | null>(null);
   const [nodePanelMode, setNodePanelMode] = useState<NodePanelMode>("summary");
+  // Selecting a reusable resource is deliberately a two-step interaction:
+  // clicking a candidate only changes this local draft; the deployment path
+  // is persisted after the user confirms the single primary action.
+  const [resourceSelectionDraftId, setResourceSelectionDraftId] = useState("");
   const [showRunHistory, setShowRunHistory] = useState(false);
   const [resourceView, setResourceView] = useState<"paths" | "connections">(
     "paths",
   );
+  const [openPathMenuId, setOpenPathMenuId] = useState("");
   const [editingName, setEditingName] = useState(false);
+  const [pathActionTargetId, setPathActionTargetId] = useState("");
   const [confirmingDeletePath, setConfirmingDeletePath] = useState(false);
   const [confirmingDeploy, setConfirmingDeploy] = useState(false);
+  const [canvasLayoutPathId, setCanvasLayoutPathId] = useState("");
+  const [canvasNodePositions, setCanvasNodePositions] =
+    useState<DeploymentWorkflowNodePositions | null>(null);
   const [nameDraft, setNameDraft] = useState("");
   const [repositoryDraft, setRepositoryDraft] = useState("");
   const [cnbToken, setCnbToken] = useState("");
@@ -491,6 +602,7 @@ export function DeploymentPathWorkspace({
   const inspectorTriggerRef = useRef<HTMLElement | null>(null);
   const autoCreateAttempted = useRef(false);
   const activePathRef = useRef<DeploymentPath | null>(null);
+  const canvasLayoutSaveChainRef = useRef<Promise<void>>(Promise.resolve());
 
   const repository = manifestValue(workspace.manifestYaml, [
     "providers",
@@ -582,9 +694,55 @@ export function DeploymentPathWorkspace({
   }, [onError, refreshResources]);
 
   const activePath = paths.find((candidate) => candidate.id === activePathId);
+  const pathActionTarget = paths.find(
+    (candidate) => candidate.id === pathActionTargetId,
+  );
+  const managedPath = pathActionTarget ?? activePath;
   useEffect(() => {
     activePathRef.current = activePath ?? null;
   }, [activePath]);
+  useEffect(() => {
+    const pathId = activePath?.id;
+    if (!pathId) {
+      setCanvasLayoutPathId("");
+      setCanvasNodePositions(null);
+      return;
+    }
+
+    let active = true;
+    setCanvasLayoutPathId("");
+    getDeploymentPathCanvasLayout(path, pathId)
+      .then((layout) => {
+        if (!active) return;
+        setCanvasNodePositions(layout);
+        setCanvasLayoutPathId(pathId);
+      })
+      .catch(() => {
+        if (!active) return;
+        // Layout is presentation state. A storage read failure must never
+        // prevent the deployment workflow from opening with its defaults.
+        setCanvasNodePositions(null);
+        setCanvasLayoutPathId(pathId);
+      });
+    return () => {
+      active = false;
+    };
+  }, [activePath?.id, path]);
+
+  const persistCanvasNodePositions = useCallback(
+    (positions: DeploymentWorkflowNodePositions) => {
+      const pathId = activePathRef.current?.id;
+      if (!pathId) return;
+      setCanvasNodePositions(positions);
+      canvasLayoutSaveChainRef.current = canvasLayoutSaveChainRef.current
+        .catch(() => undefined)
+        .then(() => saveDeploymentPathCanvasLayout(path, pathId, positions))
+        .catch((error) => {
+          onError(`画布位置保存失败：${messageOf(error)}`);
+        });
+    },
+    [onError, path],
+  );
   const selectedSource = connections.find(
     (connection) => connection.id === activePath?.sourceConnectionId,
   );
@@ -622,12 +780,18 @@ export function DeploymentPathWorkspace({
     const localReady =
       workspace.inspection.services.length > 0 && workspace.validation.valid;
     const repositoryReady = repositoryConfigured(repository);
+    const sourceNeedsRepair = connectionNeedsRepair(selectedSource);
+    const registryNeedsRepair = connectionNeedsRepair(selectedRegistry);
     const buildReady = repositoryReady && connectionReady(selectedSource);
     const registryReady =
       Boolean(manifestRegistry && manifestNamespace) &&
       connectionReady(selectedRegistry);
+    const serverKeyMissing = Boolean(
+      selectedServer && !selectedServer.keyPathExists,
+    );
     const serverReady = Boolean(
       selectedServer &&
+      selectedServer.keyPathExists &&
       activePath?.routes.length &&
       activePath.routes.every((route) => route.host.trim()) &&
       runtimeConfigChecked &&
@@ -649,29 +813,45 @@ export function DeploymentPathWorkspace({
         provider: "本地项目",
       },
       build: {
-        label: buildReady
-          ? "构建服务可用"
-          : connectionReady(selectedSource)
-            ? "需要设置代码仓库"
-            : "需要连接构建服务",
+        label: sourceNeedsRepair
+          ? selectedSource?.status === "needs_authorization"
+            ? "授权失效"
+            : "连接失效"
+          : buildReady
+            ? "构建服务可用"
+            : connectionReady(selectedSource)
+              ? "需要设置代码仓库"
+              : "需要连接构建服务",
         tone:
-          problemNode === "build" ? "error" : buildReady ? "ready" : "waiting",
+          problemNode === "build" || sourceNeedsRepair
+            ? "error"
+            : buildReady
+              ? "ready"
+              : "waiting",
         summary:
           problemNode === "build"
             ? freshLocalSnapshotRequired
               ? "需要重新读取当前项目"
               : (activeRun?.message ?? "构建服务需要处理")
-            : buildReady
-              ? "连接可用"
-              : connectionReady(selectedSource)
-                ? "还差代码仓库"
-                : "还没有完成连接",
+            : sourceNeedsRepair
+              ? `已保存连接“${selectedSource?.name}”，需要${selectedSource?.status === "needs_authorization" ? "重新授权" : "重新验证"}`
+              : buildReady
+                ? "连接可用"
+                : connectionReady(selectedSource)
+                  ? "还差代码仓库"
+                  : "还没有完成连接",
         provider: selectedSource?.provider.toUpperCase() || "CNB",
       },
       registry: {
-        label: registryReady ? "版本仓库可用" : "需要连接版本仓库",
+        label: registryNeedsRepair
+          ? selectedRegistry?.status === "needs_authorization"
+            ? "授权失效"
+            : "连接失效"
+          : registryReady
+            ? "版本仓库可用"
+            : "需要连接版本仓库",
         tone:
-          problemNode === "registry"
+          problemNode === "registry" || registryNeedsRepair
             ? "error"
             : registryReady
               ? "ready"
@@ -679,27 +859,31 @@ export function DeploymentPathWorkspace({
         summary:
           problemNode === "registry"
             ? (activeRun?.message ?? "版本仓库需要处理")
-            : registryReady
-              ? "登录信息可用"
-              : "还没有完成连接",
+            : registryNeedsRepair
+              ? `已保存连接“${selectedRegistry?.name}”，需要${selectedRegistry?.status === "needs_authorization" ? "重新授权" : "重新验证"}`
+              : registryReady
+                ? "登录信息可用"
+                : "还没有完成连接",
         provider: selectedRegistry?.provider.toUpperCase() || "TCR",
       },
       server: {
         label: serverReady
           ? "运行服务器可用"
-          : runtimeConfigLoadFailed
-            ? "运行配置读取失败"
-            : selectedServer
-              ? !activePath?.routes.length
-                ? "需要设置访问地址"
-                : !runtimeConfigChecked
-                  ? "正在检查运行配置"
-                  : runtimeConfigRequired && !runtimeConfigReady
-                    ? "需要填写运行配置"
-                    : "需要检查运行服务器"
-              : "需要连接运行服务器",
+          : serverKeyMissing
+            ? "服务器密钥缺失"
+            : runtimeConfigLoadFailed
+              ? "运行配置读取失败"
+              : selectedServer
+                ? !activePath?.routes.length
+                  ? "需要设置访问地址"
+                  : !runtimeConfigChecked
+                    ? "正在检查运行配置"
+                    : runtimeConfigRequired && !runtimeConfigReady
+                      ? "需要填写运行配置"
+                      : "需要检查运行服务器"
+                : "需要连接运行服务器",
         tone:
-          problemNode === "server"
+          problemNode === "server" || serverKeyMissing
             ? "error"
             : serverReady
               ? "ready"
@@ -709,26 +893,38 @@ export function DeploymentPathWorkspace({
             ? routeAddressRepairRequired
               ? "还差可用访问地址"
               : (activeRun?.message ?? "运行服务器需要处理")
-            : selectedServer
-              ? !activePath?.routes.length
-                ? "还差访问地址"
-                : runtimeConfigLoadFailed
-                  ? "无法读取运行配置，请重新检查"
-                  : !runtimeConfigChecked
-                    ? "正在检查运行配置"
-                    : runtimeConfigRequired &&
-                        !runtimeConfigReady &&
-                        !freshLocalSnapshotRequired
-                      ? "还差运行配置"
-                      : `${activePath.routes.length} 个访问地址`
-              : "还没有选择服务器",
-        provider: selectedServer?.host,
+            : serverKeyMissing
+              ? `已保存服务器“${selectedServer?.name}”，需要重新建立安全连接`
+              : selectedServer
+                ? !activePath?.routes.length
+                  ? "还差访问地址"
+                  : runtimeConfigLoadFailed
+                    ? "无法读取运行配置，请重新检查"
+                    : !runtimeConfigChecked
+                      ? "正在检查运行配置"
+                      : runtimeConfigRequired &&
+                          !runtimeConfigReady &&
+                          !freshLocalSnapshotRequired
+                        ? "还差运行配置"
+                        : `${activePath.routes.length} 个访问地址`
+                : "还没有选择服务器",
+        provider: "Linux 服务器",
       },
     };
     return Object.fromEntries(
       nodeMeta.map((node) => {
         const taskTone = projectedTaskTone(activeRun, node.id);
         if (!taskTone) return [node.id, baseStatuses[node.id]];
+        // Live connection facts take precedence over a stale task projection:
+        // an expired credential or missing SSH key must stay visibly repairable.
+        if (
+          (node.id === "build" && sourceNeedsRepair) ||
+          (node.id === "registry" && registryNeedsRepair) ||
+          (node.id === "server" && serverKeyMissing) ||
+          (node.id === "local" && !localReady)
+        ) {
+          return [node.id, baseStatuses[node.id]];
+        }
         const current = taskNode(activeRun);
         return [
           node.id,
@@ -771,6 +967,15 @@ export function DeploymentPathWorkspace({
   const allReady = nodeMeta.every(
     (node) => nodeStatuses[node.id].tone === "ready",
   );
+  const displayedActivePathState: DeploymentPath["state"] =
+    activePath?.state === "draft" && allReady && !activeRun
+      ? "ready"
+      : (activePath?.state ?? "draft");
+  function displayedPathState(candidate: DeploymentPath) {
+    return candidate.id === activePath?.id
+      ? displayedActivePathState
+      : candidate.state;
+  }
   const firstBlockedNode = nodeMeta.find(
     (node) => nodeStatuses[node.id].tone !== "ready",
   )?.id;
@@ -778,22 +983,32 @@ export function DeploymentPathWorkspace({
     firstBlockedNode === "local"
       ? "检查本地项目"
       : firstBlockedNode === "build"
-        ? connectionReady(selectedSource)
-          ? "设置代码仓库"
-          : "连接构建服务"
+        ? connectionNeedsRepair(selectedSource)
+          ? selectedSource?.status === "needs_authorization"
+            ? "重新授权构建服务"
+            : "修复构建服务连接"
+          : connectionReady(selectedSource)
+            ? "设置代码仓库"
+            : "连接构建服务"
         : firstBlockedNode === "registry"
-          ? "连接版本仓库"
+          ? connectionNeedsRepair(selectedRegistry)
+            ? selectedRegistry?.status === "needs_authorization"
+              ? "重新授权版本仓库"
+              : "修复版本仓库连接"
+            : "连接版本仓库"
           : firstBlockedNode === "server"
             ? routeAddressRepairRequired
               ? "更换访问地址"
               : selectedServer
-                ? !activePath?.routes.length
-                  ? "设置访问地址"
-                  : runtimeConfigLoadFailed
-                    ? "检查运行配置"
-                    : runtimeConfigRequired && !runtimeConfigReady
-                      ? "填写运行配置"
-                      : "检查运行服务器"
+                ? !selectedServer.keyPathExists
+                  ? "重新连接运行服务器"
+                  : !activePath?.routes.length
+                    ? "设置访问地址"
+                    : runtimeConfigLoadFailed
+                      ? "检查运行配置"
+                      : runtimeConfigRequired && !runtimeConfigReady
+                        ? "填写运行配置"
+                        : "检查运行服务器"
                 : "连接运行服务器"
             : "开始上线";
 
@@ -882,6 +1097,7 @@ export function DeploymentPathWorkspace({
     if (problemNode === node) return "repair";
     if (node === "local") return "summary";
     if (node === "build") {
+      if (connectionNeedsRepair(selectedSource)) return "repair";
       if (selectedSource && connectionReady(selectedSource)) {
         return repositoryConfigured(repository) ? "summary" : "repository";
       }
@@ -890,6 +1106,7 @@ export function DeploymentPathWorkspace({
         : "create";
     }
     if (node === "registry") {
+      if (connectionNeedsRepair(selectedRegistry)) return "repair";
       if (selectedRegistry && connectionReady(selectedRegistry))
         return "summary";
       return connections.some((connection) => connection.kind === "registry")
@@ -897,6 +1114,7 @@ export function DeploymentPathWorkspace({
         : "create";
     }
     if (!selectedServer) return servers.length ? "select" : "create";
+    if (!selectedServer.keyPathExists) return "repair";
     if (!activePath?.routes.length) return "addresses";
     if (
       runtimeConfigLoadFailed ||
@@ -916,6 +1134,7 @@ export function DeploymentPathWorkspace({
   function closeInspector() {
     setActiveNode(null);
     setShowRunHistory(false);
+    setResourceSelectionDraftId("");
     const trigger = inspectorTriggerRef.current;
     window.requestAnimationFrame(() => {
       if (trigger?.isConnected) trigger.focus();
@@ -929,6 +1148,15 @@ export function DeploymentPathWorkspace({
     setActivePathId(selectedPath.id);
     setNodePanelMode(initialPanelMode(node));
     setActiveNode(node);
+    setResourceSelectionDraftId(
+      node === "build"
+        ? (selectedPath.sourceConnectionId ?? "")
+        : node === "registry"
+          ? (selectedPath.registryConnectionId ?? "")
+          : node === "server"
+            ? (selectedPath.serverId ?? "")
+            : "",
+    );
     setNameDraft(selectedPath.name);
     setRepositoryDraft(repository);
     const pathRegistry = connections.find(
@@ -971,10 +1199,53 @@ export function DeploymentPathWorkspace({
         host: pathServer.host,
         user: pathServer.user,
         port: pathServer.port,
-        keyPath: pathServer.keyPath,
+        // A persisted path is only a fact when the key still exists. Clearing
+        // a missing path makes the normal server flow generate a replacement
+        // identity instead of retrying forever with a dead file reference.
+        keyPath: pathServer.keyPathExists ? pathServer.keyPath : "",
         hostFingerprint: pathServer.hostFingerprint,
       });
     }
+  }
+
+  function openPathSettings(selectedPath: DeploymentPath) {
+    setPathActionTargetId(selectedPath.id);
+    setNameDraft(selectedPath.name);
+    setEditingName(true);
+  }
+
+  function requestPathDeletion(selectedPath: DeploymentPath) {
+    setPathActionTargetId(selectedPath.id);
+    setEditingName(false);
+    setConfirmingDeletePath(true);
+  }
+
+  async function updatePath(
+    selectedPath: DeploymentPath,
+    changes: Partial<
+      Omit<DeploymentPath, "id" | "projectPath" | "createdAt" | "updatedAt">
+    >,
+  ) {
+    // Several node actions intentionally save more than once in one async
+    // chain (for example: save a repaired route, then attach the prepared
+    // retry task). React has not necessarily rendered the first save before
+    // the second one starts, so an active path uses the synchronous reference
+    // to its newest persisted record. List actions on another path must use
+    // that explicit candidate and must not switch the canvas selection.
+    const latest =
+      activePathRef.current?.id === selectedPath.id
+        ? activePathRef.current
+        : selectedPath;
+    const saved = await saveDeploymentPath({
+      ...latest,
+      ...changes,
+      projectPath: path,
+    });
+    if (activePathRef.current?.id === saved.id) {
+      activePathRef.current = saved;
+    }
+    await refreshResources();
+    return saved;
   }
 
   async function updateActivePath(
@@ -983,24 +1254,7 @@ export function DeploymentPathWorkspace({
     >,
   ) {
     if (!activePath) return null;
-    // Several node actions intentionally save more than once in one async
-    // chain (for example: save a repaired route, then attach the prepared
-    // retry task). React has not necessarily rendered the first save before
-    // the second one starts, so spreading the render-time `activePath` here
-    // can silently restore the previous routes or connection binding. Keep a
-    // synchronous reference to the last persisted record so every subsequent
-    // write is based on the newest deployment-line state.
-    const latest =
-      activePathRef.current?.id === activePath.id
-        ? activePathRef.current
-        : activePath;
-    const saved = await saveDeploymentPath({
-      ...latest,
-      ...changes,
-      projectPath: path,
-    });
-    activePathRef.current = saved;
-    await refreshResources();
+    const saved = await updatePath(activePath, changes);
     setActivePathId(saved.id);
     return saved;
   }
@@ -1027,9 +1281,10 @@ export function DeploymentPathWorkspace({
   }
 
   async function savePathName() {
+    if (!managedPath) return;
     setBusy("name");
     try {
-      await updateActivePath({ name: nameDraft });
+      await updatePath(managedPath, { name: nameDraft });
       setEditingName(false);
     } catch (error) {
       onError(messageOf(error));
@@ -1066,23 +1321,12 @@ export function DeploymentPathWorkspace({
       await persistRepositoryDraft(nextRepository);
       await updateActivePath({ sourceConnectionId: connectionId });
       await markNodeRepaired("build");
+      setResourceSelectionDraftId("");
       if (firstBlockedNode === "build") {
         advanceAfterBuild();
       } else {
         setActiveNode(null);
       }
-    } catch (error) {
-      onError(messageOf(error));
-    } finally {
-      setBusy("");
-    }
-  }
-
-  async function chooseSourceBeforeRepository(connectionId: string) {
-    setBusy("source");
-    try {
-      await updateActivePath({ sourceConnectionId: connectionId });
-      setNodePanelMode("repository");
     } catch (error) {
       onError(messageOf(error));
     } finally {
@@ -1156,6 +1400,7 @@ export function DeploymentPathWorkspace({
         throw new Error("版本仓库已验证，但连接记录没有刷新成功");
       await updateActivePath({ registryConnectionId: connection.id });
       await markNodeRepaired("registry");
+      setResourceSelectionDraftId("");
       setRegistryPassword("");
       setNodePanelMode(servers.length ? "select" : "create");
       setActiveNode("server");
@@ -1186,6 +1431,7 @@ export function DeploymentPathWorkspace({
       setRegistryNamespace(namespace);
       await updateActivePath({ registryConnectionId: connection.id });
       await markNodeRepaired("registry");
+      setResourceSelectionDraftId("");
       setNodePanelMode(servers.length ? "select" : "create");
       setActiveNode("server");
     } catch (error) {
@@ -1230,6 +1476,7 @@ export function DeploymentPathWorkspace({
       if (!check.ok) throw new Error(check.summary);
       await updateActivePath({ serverId: server.id, address: addressDraft });
       await markNodeRepaired("server");
+      setResourceSelectionDraftId("");
       setServerDraft(form);
       setRouteDrafts((current) =>
         automaticRouteDrafts(current, workspace, server),
@@ -1442,15 +1689,20 @@ export function DeploymentPathWorkspace({
     }
   }
 
-  async function removeActivePath() {
-    if (!activePath || activePath.state === "deploying") return;
+  async function removeManagedPath() {
+    if (!managedPath || managedPath.state === "deploying") return;
+    const removingActivePath = managedPath.id === activePath?.id;
     setBusy("delete");
     try {
-      await deleteDeploymentPath(path, activePath.id);
+      await deleteDeploymentPath(path, managedPath.id);
       // An explicitly deleted final path must stay deleted instead of being
       // recreated by the one-time new-project convenience flow.
       autoCreateAttempted.current = true;
-      setActiveNode(null);
+      if (removingActivePath) {
+        activePathRef.current = null;
+        setActiveNode(null);
+        setShowRunHistory(false);
+      }
       setConfirmingDeletePath(false);
       await refreshResources();
     } catch (error) {
@@ -1462,14 +1714,14 @@ export function DeploymentPathWorkspace({
 
   function panelBackButton(target: NodePanelMode, label: string) {
     return (
-      <Button
+      <WorkspaceButton
         className="mb-5 -ml-3"
         onClick={() => setNodePanelMode(target)}
         variant="ghost"
       >
         <ArrowLeft />
         {label}
-      </Button>
+      </WorkspaceButton>
     );
   }
 
@@ -1487,21 +1739,78 @@ export function DeploymentPathWorkspace({
         ? "访问地址正在由服务器原配置使用"
         : activeRun?.message || nodeStatuses[activeNode!].summary;
     return (
-      <div className="mt-8 space-y-5">
-        <div className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm dark:border-amber-800 dark:bg-amber-950/20">
+      <div className="space-y-4 pt-4">
+        <div className="rounded-xl border border-[var(--warning)]/35 bg-[var(--warning-soft)] p-4 text-xs leading-[18px]">
           <div className="flex items-start gap-3">
-            <CircleAlert className="mt-0.5 size-5 shrink-0 text-amber-700" />
+            <CircleAlert className="mt-0.5 size-4 shrink-0 text-[var(--warning)]" />
             <div>
-              <div className="font-semibold">{message}</div>
-              <p className="mt-2 leading-6 text-[var(--muted-foreground)]">
+              <div className="text-sm font-semibold">{message}</div>
+              <p className="mt-1 leading-[18px] text-[var(--muted-foreground)]">
                 已经完成的节点和当前在线服务会保留，只处理这里的问题。
               </p>
             </div>
           </div>
         </div>
 
+        {activeNode === "build" &&
+        selectedSource &&
+        connectionNeedsRepair(selectedSource) ? (
+          <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+            <div className="text-sm font-semibold">已保留的连接信息</div>
+            <dl className="mt-3 grid grid-cols-[72px_1fr] gap-2 border-t border-[var(--border)] pt-3 text-xs">
+              <dt className="text-[var(--muted-foreground)]">Provider</dt>
+              <dd className="m-0 text-right">
+                {connectionProviderLabel(selectedSource)}
+              </dd>
+              <dt className="text-[var(--muted-foreground)]">Connection</dt>
+              <dd className="m-0 text-right">{selectedSource.name}</dd>
+              <dt className="text-[var(--muted-foreground)]">代码仓库</dt>
+              <dd className="m-0 break-all text-right">{repository}</dd>
+            </dl>
+          </div>
+        ) : null}
+
+        {activeNode === "registry" &&
+        selectedRegistry &&
+        connectionNeedsRepair(selectedRegistry) ? (
+          <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+            <div className="text-sm font-semibold">已保留的连接信息</div>
+            <dl className="mt-3 grid grid-cols-[72px_1fr] gap-2 border-t border-[var(--border)] pt-3 text-xs">
+              <dt className="text-[var(--muted-foreground)]">Provider</dt>
+              <dd className="m-0 text-right">
+                {connectionProviderLabel(selectedRegistry)}
+              </dd>
+              <dt className="text-[var(--muted-foreground)]">Connection</dt>
+              <dd className="m-0 text-right">{selectedRegistry.name}</dd>
+              <dt className="text-[var(--muted-foreground)]">仓库地址</dt>
+              <dd className="m-0 break-all text-right">
+                {selectedRegistry.metadata.endpoint || manifestRegistry}
+              </dd>
+            </dl>
+          </div>
+        ) : null}
+
+        {activeNode === "server" &&
+        selectedServer &&
+        !selectedServer.keyPathExists ? (
+          <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+            <div className="text-sm font-semibold">已保留的服务器信息</div>
+            <dl className="mt-3 grid grid-cols-[72px_1fr] gap-2 border-t border-[var(--border)] pt-3 text-xs">
+              <dt className="text-[var(--muted-foreground)]">Provider</dt>
+              <dd className="m-0 text-right">Linux 服务器</dd>
+              <dt className="text-[var(--muted-foreground)]">Connection</dt>
+              <dd className="m-0 text-right">{selectedServer.name}</dd>
+              <dt className="text-[var(--muted-foreground)]">连接地址</dt>
+              <dd className="m-0 break-all text-right">
+                {selectedServer.user}@{selectedServer.host}:
+                {selectedServer.port}
+              </dd>
+            </dl>
+          </div>
+        ) : null}
+
         {activeNode === "local" ? (
-          <Button
+          <WorkspaceButton
             className="w-full"
             disabled={busy === "deploy"}
             onClick={() => void deployActivePath(true)}
@@ -1512,9 +1821,20 @@ export function DeploymentPathWorkspace({
               <RefreshCw />
             )}
             重新读取项目并上线
-          </Button>
+          </WorkspaceButton>
+        ) : activeNode === "build" &&
+          selectedSource &&
+          connectionNeedsRepair(selectedSource) ? (
+          <WorkspaceButton
+            className="w-full"
+            onClick={() => setNodePanelMode("create")}
+          >
+            {selectedSource.status === "needs_authorization"
+              ? "重新授权构建服务"
+              : "重新连接构建服务"}
+          </WorkspaceButton>
         ) : activeNode === "build" ? (
-          <Button
+          <WorkspaceButton
             className="w-full"
             onClick={() =>
               setNodePanelMode(
@@ -1525,9 +1845,20 @@ export function DeploymentPathWorkspace({
             }
           >
             更换构建服务
-          </Button>
+          </WorkspaceButton>
+        ) : activeNode === "registry" &&
+          selectedRegistry &&
+          connectionNeedsRepair(selectedRegistry) ? (
+          <WorkspaceButton
+            className="w-full"
+            onClick={() => setNodePanelMode("create")}
+          >
+            {selectedRegistry.status === "needs_authorization"
+              ? "重新授权版本仓库"
+              : "重新连接版本仓库"}
+          </WorkspaceButton>
         ) : activeNode === "registry" ? (
-          <Button
+          <WorkspaceButton
             className="w-full"
             onClick={() =>
               setNodePanelMode(
@@ -1538,16 +1869,23 @@ export function DeploymentPathWorkspace({
             }
           >
             更换版本仓库
-          </Button>
+          </WorkspaceButton>
+        ) : selectedServer && !selectedServer.keyPathExists ? (
+          <WorkspaceButton
+            className="w-full"
+            onClick={() => setNodePanelMode("create")}
+          >
+            重新连接运行服务器
+          </WorkspaceButton>
         ) : activeRun?.actionKind === "deployment-path-route-check" ? (
           <div className="space-y-3">
-            <Button
+            <WorkspaceButton
               className="w-full"
               onClick={() => setNodePanelMode("addresses")}
             >
               更换访问地址
-            </Button>
-            <Button
+            </WorkspaceButton>
+            <WorkspaceButton
               className="w-full"
               disabled={busy === "refresh"}
               onClick={() => void refreshActiveRun()}
@@ -1559,10 +1897,10 @@ export function DeploymentPathWorkspace({
                 <RefreshCw />
               )}
               重新检查当前地址
-            </Button>
+            </WorkspaceButton>
           </div>
         ) : activeRun?.actionKind === "deployment-path-route-takeover" ? (
-          <Button
+          <WorkspaceButton
             className="w-full"
             disabled={busy === "takeover"}
             onClick={() => void takeOverActiveRoutes()}
@@ -1571,9 +1909,9 @@ export function DeploymentPathWorkspace({
               <LoaderCircle className="animate-spin" />
             ) : null}
             确认接管并继续上线
-          </Button>
+          </WorkspaceButton>
         ) : activeRun?.actionKind === "deployment-path-preparation-retry" ? (
-          <Button
+          <WorkspaceButton
             className="w-full"
             disabled={busy === "deploy"}
             onClick={() => void deployActivePath()}
@@ -1584,16 +1922,16 @@ export function DeploymentPathWorkspace({
               <Rocket />
             )}
             初始化服务器并继续
-          </Button>
+          </WorkspaceButton>
         ) : (
-          <Button
+          <WorkspaceButton
             className="w-full"
             onClick={() =>
               setNodePanelMode(servers.length ? "select" : "create")
             }
           >
             更换运行服务器
-          </Button>
+          </WorkspaceButton>
         )}
 
         <details className="rounded-xl border border-[var(--border)] px-4 py-3 text-xs text-[var(--muted-foreground)]">
@@ -1611,10 +1949,10 @@ export function DeploymentPathWorkspace({
 
   function renderLocalPanel() {
     return (
-      <div className="mt-8 space-y-5">
-        <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm dark:border-emerald-900 dark:bg-emerald-950/20">
-          <div className="flex items-center gap-2 font-semibold">
-            <Check className="size-4 text-emerald-600" />
+      <div className="space-y-4 pt-4">
+        <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] p-4 text-sm shadow-sm">
+          <div className="flex items-center gap-2 text-sm font-semibold">
+            <Check className="size-4 text-[var(--success)]" />
             项目已经识别
           </div>
           <div className="mt-2 text-[var(--muted-foreground)]">
@@ -1639,9 +1977,9 @@ export function DeploymentPathWorkspace({
         <p className="text-xs leading-5 text-[var(--muted-foreground)]">
           每次点击上线时，系统都会重新读取你电脑里当时的项目内容。
         </p>
-        <Button className="w-full" onClick={() => setActiveNode(null)}>
+        <WorkspaceButton className="w-full" onClick={closeInspector}>
           完成
-        </Button>
+        </WorkspaceButton>
       </div>
     );
   }
@@ -1650,9 +1988,13 @@ export function DeploymentPathWorkspace({
     const sourceConnections = connections.filter(
       (connection) => connection.kind === "source",
     );
-    if (nodePanelMode === "repository" && selectedSource) {
+    const sourceForRepository =
+      sourceConnections.find(
+        (connection) => connection.id === resourceSelectionDraftId,
+      ) ?? selectedSource;
+    if (nodePanelMode === "repository" && sourceForRepository) {
       return (
-        <div className="mt-8 space-y-5">
+        <div className="space-y-4 pt-4">
           <div>
             <div className="text-sm font-semibold">设置项目代码仓库</div>
             <p className="mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
@@ -1660,7 +2002,7 @@ export function DeploymentPathWorkspace({
             </p>
           </div>
           <div className="rounded-xl border border-[var(--border)] bg-[var(--muted)]/35 p-4 text-sm">
-            <div className="font-medium">继续使用 {selectedSource.name}</div>
+            <div className="font-medium">将使用 {sourceForRepository.name}</div>
             <div className="mt-1 text-xs text-[var(--muted-foreground)]">
               已保存的授权会自动复用，不需要再次输入访问令牌。
             </div>
@@ -1677,39 +2019,47 @@ export function DeploymentPathWorkspace({
               例如：team/customer-portal
             </p>
           </div>
-          <Button
+          <WorkspaceButton
             className="w-full"
             disabled={
               !repositoryConfigured(repositoryDraft) || busy === "source"
             }
-            onClick={() => void selectSource(selectedSource.id)}
+            onClick={() => void selectSource(sourceForRepository.id)}
           >
             {busy === "source" ? (
               <LoaderCircle className="animate-spin" />
             ) : null}
             验证并保存代码仓库
-          </Button>
-          <Button
+          </WorkspaceButton>
+          <WorkspaceButton
             className="w-full"
             onClick={() => setNodePanelMode("select")}
             variant="secondary"
           >
             更换构建服务
-          </Button>
+          </WorkspaceButton>
         </div>
       );
     }
     if (nodePanelMode === "summary" && selectedSource) {
       return (
-        <div className="mt-8 space-y-5">
-          <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-5 dark:border-emerald-900 dark:bg-emerald-950/20">
-            <div className="flex items-center gap-2 font-semibold">
-              <Check className="size-4 text-emerald-600" />
-              构建服务已连接
+        <div className="space-y-4 pt-4">
+          <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] p-4 shadow-sm">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-[11px] text-[var(--muted-foreground)]">
+                  服务提供方 · {connectionProviderLabel(selectedSource)}
+                </div>
+                <div className="mt-1 text-sm font-semibold">
+                  {selectedSource.name}
+                </div>
+              </div>
+              <span className="inline-flex items-center gap-1 text-xs text-[var(--success)]">
+                <Check className="size-3.5" />
+                连接正常
+              </span>
             </div>
-            <dl className="mt-5 grid grid-cols-[96px_1fr] gap-3 border-t border-emerald-200 pt-4 text-sm dark:border-emerald-900">
-              <dt className="text-[var(--muted-foreground)]">服务</dt>
-              <dd className="m-0 text-right">{selectedSource.name}</dd>
+            <dl className="mt-4 grid grid-cols-[96px_1fr] gap-2.5 border-t border-[var(--border)] pt-3 text-xs leading-[18px]">
               <dt className="text-[var(--muted-foreground)]">代码仓库</dt>
               <dd className="m-0 break-all text-right">{repository}</dd>
               <dt className="text-[var(--muted-foreground)]">最近验证</dt>
@@ -1722,34 +2072,35 @@ export function DeploymentPathWorkspace({
               </dd>
             </dl>
           </div>
-          <Button className="w-full" onClick={() => setNodePanelMode("select")}>
-            更换构建服务
-          </Button>
-          <Button
+          <WorkspaceButton
             className="w-full"
-            onClick={() => setActiveNode(null)}
-            variant="secondary"
+            onClick={() => {
+              setResourceSelectionDraftId(selectedSource.id);
+              setNodePanelMode("select");
+            }}
           >
-            完成
-          </Button>
+            更换构建服务
+          </WorkspaceButton>
         </div>
       );
     }
     if (nodePanelMode === "select") {
       return (
-        <div className="mt-8">
+        <div className="pt-4">
           {selectedSource ? panelBackButton("summary", "返回当前配置") : null}
           <div className="mb-3 text-sm font-semibold">选择配置中心已有连接</div>
-          <div className="space-y-2">
+          <div
+            aria-label="构建服务连接"
+            className="space-y-2"
+            role="radiogroup"
+          >
             {sourceConnections.map((connection) => (
               <button
-                className={`flex w-full items-center justify-between rounded-xl border p-4 text-left ${activePath?.sourceConnectionId === connection.id ? "border-[var(--focus)] bg-[var(--muted)]/55" : "border-[var(--border)]"}`}
+                aria-checked={resourceSelectionDraftId === connection.id}
+                className={`flex w-full items-center justify-between rounded-xl border p-4 text-left transition-colors ${resourceSelectionDraftId === connection.id ? "border-[var(--accent)] bg-[var(--accent-soft)]" : "border-[var(--border)] hover:bg-[var(--muted)]/45"}`}
                 key={connection.id}
-                onClick={() =>
-                  void (repositoryConfigured(repositoryDraft)
-                    ? selectSource(connection.id)
-                    : chooseSourceBeforeRepository(connection.id))
-                }
+                onClick={() => setResourceSelectionDraftId(connection.id)}
+                role="radio"
                 type="button"
               >
                 <span>
@@ -1757,30 +2108,47 @@ export function DeploymentPathWorkspace({
                     {connection.name}
                   </span>
                   <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
-                    配置中心已有连接
+                    {activePath?.sourceConnectionId === connection.id
+                      ? "当前使用"
+                      : "配置中心已有连接"}
                   </span>
                 </span>
-                {activePath?.sourceConnectionId === connection.id ? (
-                  <Check className="size-4 text-emerald-600" />
-                ) : (
-                  <ChevronRight className="size-4" />
-                )}
+                <span
+                  aria-hidden="true"
+                  className={`size-4 rounded-full border-2 ${resourceSelectionDraftId === connection.id ? "border-[5px] border-[var(--accent)]" : "border-[var(--border)]"}`}
+                />
               </button>
             ))}
           </div>
-          <Button
+          <WorkspaceButton
             className="mt-4 w-full"
+            disabled={!resourceSelectionDraftId || busy === "source"}
+            onClick={() => {
+              if (!repositoryConfigured(repositoryDraft)) {
+                setNodePanelMode("repository");
+                return;
+              }
+              void selectSource(resourceSelectionDraftId);
+            }}
+          >
+            {busy === "source" ? (
+              <LoaderCircle className="animate-spin" />
+            ) : null}
+            使用这个连接
+          </WorkspaceButton>
+          <WorkspaceButton
+            className="mt-2 w-full"
             onClick={() => setNodePanelMode("create")}
             variant="secondary"
           >
             <Plus />
             添加新的构建服务
-          </Button>
+          </WorkspaceButton>
         </div>
       );
     }
     return (
-      <div className="mt-8">
+      <div className="pt-4">
         {selectedSource || sourceConnections.length
           ? panelBackButton(
               selectedSource ? "summary" : "select",
@@ -1814,7 +2182,7 @@ export function DeploymentPathWorkspace({
             />
           </div>
           {reusableConnectionNote()}
-          <Button
+          <WorkspaceButton
             className="w-full"
             disabled={!cnbToken.trim() || busy === "source"}
             onClick={() => void connectBuildService()}
@@ -1823,7 +2191,7 @@ export function DeploymentPathWorkspace({
               <LoaderCircle className="animate-spin" />
             ) : null}
             验证并保存构建服务
-          </Button>
+          </WorkspaceButton>
         </div>
       </div>
     );
@@ -1835,15 +2203,23 @@ export function DeploymentPathWorkspace({
     );
     if (nodePanelMode === "summary" && selectedRegistry) {
       return (
-        <div className="mt-8 space-y-5">
-          <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-5 dark:border-emerald-900 dark:bg-emerald-950/20">
-            <div className="flex items-center gap-2 font-semibold">
-              <Check className="size-4 text-emerald-600" />
-              版本仓库已连接
+        <div className="space-y-4 pt-4">
+          <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] p-4 shadow-sm">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-[11px] text-[var(--muted-foreground)]">
+                  服务提供方 · {connectionProviderLabel(selectedRegistry)}
+                </div>
+                <div className="mt-1 text-sm font-semibold">
+                  {selectedRegistry.name}
+                </div>
+              </div>
+              <span className="inline-flex items-center gap-1 text-xs text-[var(--success)]">
+                <Check className="size-3.5" />
+                连接正常
+              </span>
             </div>
-            <dl className="mt-5 grid grid-cols-[96px_1fr] gap-3 border-t border-emerald-200 pt-4 text-sm dark:border-emerald-900">
-              <dt className="text-[var(--muted-foreground)]">服务</dt>
-              <dd className="m-0 text-right">{selectedRegistry.name}</dd>
+            <dl className="mt-4 grid grid-cols-[96px_1fr] gap-2.5 border-t border-[var(--border)] pt-3 text-xs leading-[18px]">
               <dt className="text-[var(--muted-foreground)]">仓库地址</dt>
               <dd className="m-0 break-all text-right">
                 {selectedRegistry.metadata.endpoint || manifestRegistry}
@@ -1854,30 +2230,35 @@ export function DeploymentPathWorkspace({
               </dd>
             </dl>
           </div>
-          <Button className="w-full" onClick={() => setNodePanelMode("select")}>
-            更换版本仓库
-          </Button>
-          <Button
+          <WorkspaceButton
             className="w-full"
-            onClick={() => setActiveNode(null)}
-            variant="secondary"
+            onClick={() => {
+              setResourceSelectionDraftId(selectedRegistry.id);
+              setNodePanelMode("select");
+            }}
           >
-            完成
-          </Button>
+            更换版本仓库
+          </WorkspaceButton>
         </div>
       );
     }
     if (nodePanelMode === "select") {
       return (
-        <div className="mt-8">
+        <div className="pt-4">
           {selectedRegistry ? panelBackButton("summary", "返回当前配置") : null}
           <div className="mb-3 text-sm font-semibold">选择配置中心已有连接</div>
-          <div className="space-y-2">
+          <div
+            aria-label="版本仓库连接"
+            className="space-y-2"
+            role="radiogroup"
+          >
             {registryConnections.map((connection) => (
               <button
-                className={`flex w-full items-center justify-between rounded-xl border p-4 text-left ${activePath?.registryConnectionId === connection.id ? "border-[var(--focus)] bg-[var(--muted)]/55" : "border-[var(--border)]"}`}
+                aria-checked={resourceSelectionDraftId === connection.id}
+                className={`flex w-full items-center justify-between rounded-xl border p-4 text-left transition-colors ${resourceSelectionDraftId === connection.id ? "border-[var(--accent)] bg-[var(--accent-soft)]" : "border-[var(--border)] hover:bg-[var(--muted)]/45"}`}
                 key={connection.id}
-                onClick={() => void selectRegistryConnection(connection)}
+                onClick={() => setResourceSelectionDraftId(connection.id)}
+                role="radio"
                 type="button"
               >
                 <span className="min-w-0">
@@ -1885,31 +2266,48 @@ export function DeploymentPathWorkspace({
                     {connection.name}
                   </span>
                   <span className="mt-1 block truncate text-xs text-[var(--muted-foreground)]">
+                    {activePath?.registryConnectionId === connection.id
+                      ? "当前使用 · "
+                      : ""}
                     {connection.metadata.endpoint} ·{" "}
                     {connection.metadata.namespace}
                   </span>
                 </span>
-                {activePath?.registryConnectionId === connection.id ? (
-                  <Check className="size-4 shrink-0 text-emerald-600" />
-                ) : (
-                  <ChevronRight className="size-4 shrink-0" />
-                )}
+                <span
+                  aria-hidden="true"
+                  className={`size-4 shrink-0 rounded-full border-2 ${resourceSelectionDraftId === connection.id ? "border-[5px] border-[var(--accent)]" : "border-[var(--border)]"}`}
+                />
               </button>
             ))}
           </div>
-          <Button
+          <WorkspaceButton
             className="mt-4 w-full"
+            disabled={!resourceSelectionDraftId || busy === "registry"}
+            onClick={() => {
+              const connection = registryConnections.find(
+                (candidate) => candidate.id === resourceSelectionDraftId,
+              );
+              if (connection) void selectRegistryConnection(connection);
+            }}
+          >
+            {busy === "registry" ? (
+              <LoaderCircle className="animate-spin" />
+            ) : null}
+            使用这个连接
+          </WorkspaceButton>
+          <WorkspaceButton
+            className="mt-2 w-full"
             onClick={() => setNodePanelMode("create")}
             variant="secondary"
           >
             <Plus />
             添加新的版本仓库
-          </Button>
+          </WorkspaceButton>
         </div>
       );
     }
     return (
-      <div className="mt-8">
+      <div className="pt-4">
         {selectedRegistry || registryConnections.length
           ? panelBackButton(
               selectedRegistry ? "summary" : "select",
@@ -1961,7 +2359,7 @@ export function DeploymentPathWorkspace({
             </div>
           </div>
           {reusableConnectionNote()}
-          <Button
+          <WorkspaceButton
             className="w-full"
             disabled={busy === "registry"}
             onClick={() => void saveRegistryConnection()}
@@ -1970,7 +2368,7 @@ export function DeploymentPathWorkspace({
               <LoaderCircle className="animate-spin" />
             ) : null}
             验证并保存版本仓库
-          </Button>
+          </WorkspaceButton>
         </div>
       </div>
     );
@@ -1978,7 +2376,7 @@ export function DeploymentPathWorkspace({
 
   function renderServerCreatePanel() {
     return (
-      <div className="mt-8">
+      <div className="pt-4">
         {selectedServer || servers.length
           ? panelBackButton(
               selectedServer ? "summary" : "select",
@@ -2052,7 +2450,7 @@ export function DeploymentPathWorkspace({
         </div>
         {serverDraft.hostFingerprint ? (
           <div className="mt-5 space-y-4">
-            <div className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-xs leading-5 dark:border-amber-800 dark:bg-amber-950/20">
+            <div className="rounded-xl border border-[var(--warning)]/35 bg-[var(--warning-soft)] p-4 text-xs leading-[18px]">
               <div className="text-sm font-semibold">确认连接这台服务器</div>
               <p className="mt-1 text-[var(--muted-foreground)]">
                 这是服务器返回的身份指纹。确认地址无误后输入一次登录密码。
@@ -2079,7 +2477,10 @@ export function DeploymentPathWorkspace({
                 密码只使用这一次，不会保存。连接成功后自动改用专用密钥。
               </p>
               {serverPasswordError ? (
-                <p className="text-xs font-medium text-red-600" role="alert">
+                <p
+                  className="text-xs font-medium text-[var(--destructive)]"
+                  role="alert"
+                >
                   {serverPasswordError}
                 </p>
               ) : null}
@@ -2091,7 +2492,7 @@ export function DeploymentPathWorkspace({
           </p>
         )}
         <div className="mt-4">{reusableConnectionNote()}</div>
-        <Button
+        <WorkspaceButton
           className="mt-4 w-full"
           disabled={
             !serverDraft.host.trim() ||
@@ -2102,14 +2503,14 @@ export function DeploymentPathWorkspace({
         >
           {busy === "server" ? <LoaderCircle className="animate-spin" /> : null}
           {serverDraft.hostFingerprint ? "确认并连接服务器" : "检查服务器"}
-        </Button>
+        </WorkspaceButton>
       </div>
     );
   }
 
   function renderServerAddressesPanel() {
     return (
-      <div className="mt-8">
+      <div className="pt-4">
         {selectedServer ? panelBackButton("summary", "返回服务器摘要") : null}
         <div className="mb-5">
           <div className="text-sm font-semibold">项目访问地址</div>
@@ -2164,7 +2565,7 @@ export function DeploymentPathWorkspace({
                     value={route.host}
                   />
                   {routeDrafts.length > 1 ? (
-                    <Button
+                    <WorkspaceButton
                       aria-label="删除这个访问地址"
                       onClick={() =>
                         setRouteDrafts((current) =>
@@ -2175,14 +2576,14 @@ export function DeploymentPathWorkspace({
                       variant="ghost"
                     >
                       <Trash2 />
-                    </Button>
+                    </WorkspaceButton>
                   ) : null}
                 </div>
               </div>
             </div>
           ))}
         </div>
-        <Button
+        <WorkspaceButton
           className="mt-3 w-full"
           onClick={() => {
             const service = workspace.inspection.services.find(
@@ -2198,8 +2599,8 @@ export function DeploymentPathWorkspace({
         >
           <Plus />
           添加访问地址
-        </Button>
-        <Button
+        </WorkspaceButton>
+        <WorkspaceButton
           className="mt-3 w-full"
           disabled={
             !routeDrafts.length ||
@@ -2212,7 +2613,7 @@ export function DeploymentPathWorkspace({
             <LoaderCircle className="animate-spin" />
           ) : null}
           保存访问地址
-        </Button>
+        </WorkspaceButton>
       </div>
     );
   }
@@ -2220,15 +2621,23 @@ export function DeploymentPathWorkspace({
   function renderServerPanel() {
     if (nodePanelMode === "summary" && selectedServer) {
       return (
-        <div className="mt-8 space-y-5">
-          <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-5 dark:border-emerald-900 dark:bg-emerald-950/20">
-            <div className="flex items-center gap-2 font-semibold">
-              <Check className="size-4 text-emerald-600" />
-              运行服务器已连接
+        <div className="space-y-4 pt-4">
+          <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] p-4 shadow-sm">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-[11px] text-[var(--muted-foreground)]">
+                  服务提供方 · Linux 服务器
+                </div>
+                <div className="mt-1 text-sm font-semibold">
+                  {selectedServer.name}
+                </div>
+              </div>
+              <span className="inline-flex items-center gap-1 text-xs text-[var(--success)]">
+                <Check className="size-3.5" />
+                连接正常
+              </span>
             </div>
-            <dl className="mt-5 grid grid-cols-[96px_1fr] gap-3 border-t border-emerald-200 pt-4 text-sm dark:border-emerald-900">
-              <dt className="text-[var(--muted-foreground)]">服务器</dt>
-              <dd className="m-0 text-right">{selectedServer.name}</dd>
+            <dl className="mt-4 grid grid-cols-[96px_1fr] gap-2.5 border-t border-[var(--border)] pt-3 text-xs leading-[18px]">
               <dt className="text-[var(--muted-foreground)]">连接地址</dt>
               <dd className="m-0 text-right">
                 {selectedServer.user}@{selectedServer.host}:
@@ -2246,39 +2655,47 @@ export function DeploymentPathWorkspace({
               </dd>
             </dl>
           </div>
-          <Button className="w-full" onClick={() => setNodePanelMode("select")}>
+          <WorkspaceButton
+            className="w-full"
+            onClick={() => {
+              setResourceSelectionDraftId(selectedServer.id);
+              setNodePanelMode("select");
+            }}
+          >
             更换运行服务器
-          </Button>
-          <Button
+          </WorkspaceButton>
+          <WorkspaceButton
             className="w-full"
             onClick={() => setNodePanelMode("addresses")}
             variant="secondary"
           >
             维护访问地址
-          </Button>
-          <Button
+          </WorkspaceButton>
+          <WorkspaceButton
             className="w-full"
             onClick={() => setNodePanelMode("runtime")}
             variant="secondary"
           >
             维护运行配置
-          </Button>
+          </WorkspaceButton>
         </div>
       );
     }
     if (nodePanelMode === "select") {
       return (
-        <div className="mt-8">
+        <div className="pt-4">
           {selectedServer ? panelBackButton("summary", "返回当前配置") : null}
           <div className="mb-3 text-sm font-semibold">
             选择配置中心已有服务器
           </div>
-          <div className="space-y-2">
+          <div aria-label="运行服务器" className="space-y-2" role="radiogroup">
             {servers.map((server) => (
               <button
-                className={`flex w-full items-center justify-between rounded-xl border p-4 text-left ${activePath?.serverId === server.id ? "border-[var(--focus)] bg-[var(--muted)]/55" : "border-[var(--border)]"}`}
+                aria-checked={resourceSelectionDraftId === server.id}
+                className={`flex w-full items-center justify-between rounded-xl border p-4 text-left transition-colors ${resourceSelectionDraftId === server.id ? "border-[var(--accent)] bg-[var(--accent-soft)]" : "border-[var(--border)] hover:bg-[var(--muted)]/45"}`}
                 key={server.id}
-                onClick={() => void selectServer(server)}
+                onClick={() => setResourceSelectionDraftId(server.id)}
+                role="radio"
                 type="button"
               >
                 <span>
@@ -2286,32 +2703,47 @@ export function DeploymentPathWorkspace({
                     {server.name}
                   </span>
                   <span className="mt-1 block text-xs text-[var(--muted-foreground)]">
+                    {activePath?.serverId === server.id ? "当前使用 · " : ""}
                     {server.user}@{server.host}:{server.port}
                   </span>
                 </span>
-                {activePath?.serverId === server.id ? (
-                  <Check className="size-4 text-emerald-600" />
-                ) : (
-                  <ChevronRight className="size-4" />
-                )}
+                <span
+                  aria-hidden="true"
+                  className={`size-4 rounded-full border-2 ${resourceSelectionDraftId === server.id ? "border-[5px] border-[var(--accent)]" : "border-[var(--border)]"}`}
+                />
               </button>
             ))}
           </div>
-          <Button
+          <WorkspaceButton
             className="mt-4 w-full"
+            disabled={!resourceSelectionDraftId || busy === "server"}
+            onClick={() => {
+              const server = servers.find(
+                (candidate) => candidate.id === resourceSelectionDraftId,
+              );
+              if (server) void selectServer(server);
+            }}
+          >
+            {busy === "server" ? (
+              <LoaderCircle className="animate-spin" />
+            ) : null}
+            使用这个服务器
+          </WorkspaceButton>
+          <WorkspaceButton
+            className="mt-2 w-full"
             onClick={() => setNodePanelMode("create")}
             variant="secondary"
           >
             <Plus />
             添加新的服务器
-          </Button>
+          </WorkspaceButton>
         </div>
       );
     }
     if (nodePanelMode === "create") return renderServerCreatePanel();
     if (nodePanelMode === "addresses") return renderServerAddressesPanel();
     return (
-      <div className="mt-8">
+      <div className="pt-4">
         {panelBackButton("summary", "返回服务器摘要")}
         {activePath ? (
           <RuntimeConfigFields
@@ -2440,7 +2872,7 @@ export function DeploymentPathWorkspace({
                     </span>
                   </div>
                   {run.status === "success" && run.artifacts.length ? (
-                    <Button
+                    <WorkspaceButton
                       disabled={
                         busy === `version:${run.id}` ||
                         run.id === activePath?.lastRunId
@@ -2452,7 +2884,7 @@ export function DeploymentPathWorkspace({
                       {run.id === activePath?.lastRunId
                         ? "当前版本"
                         : "重新上线"}
-                    </Button>
+                    </WorkspaceButton>
                   ) : null}
                 </div>
                 <dl className="mt-4 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-2 text-xs">
@@ -2581,44 +3013,53 @@ export function DeploymentPathWorkspace({
 
   if (!activePath) {
     return (
-      <main className="flex h-full min-h-0 flex-col bg-[#f7f7fb] dark:bg-[#18181c]">
+      <main
+        className="flex h-full min-h-0 flex-col bg-[var(--background)] text-sm "
+        data-workspace-shell="deployment"
+      >
         <header
-          className="flex h-14 shrink-0 items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-4"
+          className="flex h-[52px] shrink-0 items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-3"
+          data-workspace-header
           data-tauri-drag-region
         >
-          <div className="flex min-w-0 items-center gap-3">
-            <Button
+          <div className="flex min-w-0 items-center gap-2">
+            <SemiButton
               aria-label="返回所有项目"
+              icon={<ArrowLeft className="size-4" />}
               onClick={onBack}
-              size="icon"
-              variant="ghost"
-            >
-              <ArrowLeft />
-            </Button>
-            <div className="min-w-0">
-              <strong className="block truncate text-sm">
-                {workspace.inspection.project_name}
-              </strong>
-              <span className="block text-[10px] text-[var(--muted-foreground)]">
-                部署工作流
-              </span>
-            </div>
+              size="small"
+              style={{ borderRadius: 8, height: 32, width: 32 }}
+              theme="borderless"
+              type="tertiary"
+            />
+            <strong className="truncate text-sm font-semibold">
+              {workspace.inspection.project_name}
+            </strong>
           </div>
-          <Button
+          <SemiButton
             disabled={busy === "create"}
+            icon={<Plus className="size-4" />}
+            loading={busy === "create"}
             onClick={() => void createPath()}
+            size="small"
+            style={{
+              backgroundColor: "var(--primary)",
+              borderRadius: 8,
+              height: 32,
+              paddingInline: 14,
+            }}
+            theme="solid"
+            type="primary"
           >
-            {busy === "create" ? (
-              <LoaderCircle className="animate-spin" />
-            ) : (
-              <Plus />
-            )}
             创建上线线路
-          </Button>
+          </SemiButton>
         </header>
 
-        <div className="grid min-h-0 flex-1 grid-cols-[196px_minmax(0,1fr)]">
-          <aside className="flex min-h-0 flex-col border-r border-[var(--border)] bg-[var(--surface)]">
+        <div className="grid min-h-0 flex-1 grid-cols-[208px_minmax(0,1fr)]">
+          <aside
+            className="flex min-h-0 flex-col border-r border-[var(--border)] bg-[var(--surface)] "
+            data-workspace-resource-panel
+          >
             <div className="grid grid-cols-2 gap-1 border-b border-[var(--border)] p-2">
               <button
                 className={`rounded-lg px-3 py-2 text-xs ${resourceView === "paths" ? "bg-[var(--muted)] font-medium" : "text-[var(--muted-foreground)]"}`}
@@ -2638,17 +3079,18 @@ export function DeploymentPathWorkspace({
             <div className="min-h-0 flex-1 overflow-auto px-4 py-5">
               {resourceView === "paths" ? (
                 <>
-                  <div className="flex items-center justify-between text-[11px] font-medium text-[var(--muted-foreground)]">
+                  <div className="flex items-center justify-between text-xs font-semibold text-[var(--muted-foreground)]">
                     <span>部署线路</span>
-                    <Button
+                    <SemiButton
                       aria-label="新增线路"
                       disabled={busy === "create"}
+                      icon={<Plus className="size-4" />}
                       onClick={() => void createPath()}
-                      size="icon"
-                      variant="ghost"
-                    >
-                      <Plus />
-                    </Button>
+                      size="small"
+                      style={{ borderRadius: 7, height: 28, width: 28 }}
+                      theme="borderless"
+                      type="tertiary"
+                    />
                   </div>
                   <p className="mt-4 text-xs leading-5 text-[var(--muted-foreground)]">
                     还没有线路。创建后会自动放入四类基础节点。
@@ -2656,7 +3098,7 @@ export function DeploymentPathWorkspace({
                 </>
               ) : (
                 <>
-                  <div className="text-[11px] font-medium text-[var(--muted-foreground)]">
+                  <div className="text-xs font-semibold text-[var(--muted-foreground)]">
                     已保存连接
                   </div>
                   <div className="mt-3 space-y-2 text-xs">
@@ -2668,7 +3110,7 @@ export function DeploymentPathWorkspace({
                         <strong className="block truncate">
                           {resource.name}
                         </strong>
-                        <span className="mt-1 block truncate text-[10px] text-[var(--muted-foreground)]">
+                        <span className="mt-1 block truncate text-xs text-[var(--muted-foreground)]">
                           {"provider" in resource
                             ? resource.provider.toUpperCase()
                             : resource.host}
@@ -2694,17 +3136,17 @@ export function DeploymentPathWorkspace({
               backgroundSize: "16px 16px",
             }}
           >
-            <div className="max-w-md rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-8 py-9 text-center shadow-sm">
-              <span className="mx-auto grid size-11 place-items-center rounded-xl bg-[#eef0ff] text-[#5b5cf0] dark:bg-[#292a4b]">
+            <div className="max-w-md rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-8 py-9 text-center shadow-sm">
+              <span className="mx-auto grid size-10 place-items-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent)] ">
                 <Rocket className="size-5" />
               </span>
-              <h1 className="mb-0 mt-5 text-lg font-semibold">
+              <h1 className="mb-0 mt-5 text-base font-semibold">
                 创建第一条上线线路
               </h1>
               <p className="mb-5 mt-2 text-sm leading-6 text-[var(--muted-foreground)]">
                 系统会从当前项目出发，依次准备版本构建、版本存储和运行服务器。
               </p>
-              <Button
+              <WorkspaceButton
                 disabled={busy === "create"}
                 onClick={() => void createPath()}
               >
@@ -2714,7 +3156,7 @@ export function DeploymentPathWorkspace({
                   <Plus />
                 )}
                 创建上线线路
-              </Button>
+              </WorkspaceButton>
             </div>
           </section>
         </div>
@@ -2745,71 +3187,83 @@ export function DeploymentPathWorkspace({
         );
         const inspectorOpen = Boolean(activeNode || showRunHistory);
         const primaryBusy = ["deploy", "refresh"].includes(busy);
+        const inspectorMode = showRunHistory
+          ? "history"
+          : nodePanelMode === "repair"
+            ? "repair"
+            : nodePanelMode === "select"
+              ? "select"
+              : nodePanelMode === "summary"
+                ? "view"
+                : "edit";
         return (
-          <main className="flex h-full min-h-0 flex-col bg-[#f7f7fb] dark:bg-[#18181c]">
+          <main
+            className="flex h-full min-h-0 flex-col bg-[var(--background)] text-sm "
+            data-workspace-shell="deployment"
+          >
             <header
-              className="flex h-14 shrink-0 items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-4"
+              className="flex h-[52px] shrink-0 items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-3"
+              data-workspace-header
               data-tauri-drag-region
             >
-              <div className="flex min-w-0 items-center gap-3">
-                <Button
+              <div className="flex min-w-0 items-center gap-2">
+                <SemiButton
                   aria-label="返回所有项目"
+                  icon={<ArrowLeft className="size-4" />}
                   onClick={onBack}
-                  size="icon"
-                  variant="ghost"
-                >
-                  <ArrowLeft />
-                </Button>
-                <div className="min-w-0">
-                  <strong className="block truncate text-sm">
-                    {workspace.inspection.project_name}
-                  </strong>
-                  <span className="block text-[10px] text-[var(--muted-foreground)]">
-                    部署工作流
-                  </span>
-                </div>
-                <span className="ml-2 inline-flex items-center gap-1.5 text-[11px] text-[var(--subtle-foreground)]">
-                  配置自动保存
-                </span>
+                  size="small"
+                  style={{ borderRadius: 8, height: 32, width: 32 }}
+                  theme="borderless"
+                  type="tertiary"
+                />
+                <strong className="truncate text-sm font-semibold">
+                  {workspace.inspection.project_name}
+                </strong>
+                <DeploymentPathStateBadge state={displayedActivePathState} />
               </div>
               <div className="flex items-center gap-2">
-                <TooltipProvider delayDuration={300}>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        aria-label="查看运行记录"
-                        onClick={() => {
-                          rememberInspectorTrigger();
-                          setActiveNode(null);
-                          setShowRunHistory(true);
-                        }}
-                        size="icon"
-                        variant="secondary"
-                      >
-                        <History />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>运行记录</TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-                <Button
+                <SemiTooltip content="运行记录" position="bottom">
+                  <SemiButton
+                    aria-label="查看运行记录"
+                    icon={<History className="size-4" />}
+                    onClick={() => {
+                      rememberInspectorTrigger();
+                      setActiveNode(null);
+                      setShowRunHistory(true);
+                    }}
+                    size="small"
+                    style={{ borderRadius: 8, height: 32, width: 32 }}
+                    theme="light"
+                    type="tertiary"
+                  />
+                </SemiTooltip>
+                <SemiButton
                   disabled={primaryBusy || activePath.state === "deploying"}
+                  icon={<Rocket className="size-4" />}
+                  loading={primaryBusy || activePath.state === "deploying"}
                   onClick={runStudioPrimaryAction}
+                  size="small"
+                  style={{
+                    backgroundColor: "var(--primary)",
+                    borderRadius: 8,
+                    height: 32,
+                    paddingInline: 14,
+                  }}
+                  theme="solid"
+                  type="primary"
                 >
-                  {primaryBusy || activePath.state === "deploying" ? (
-                    <LoaderCircle className="animate-spin" />
-                  ) : (
-                    <Rocket />
-                  )}
                   {studioPrimaryLabel()}
-                </Button>
+                </SemiButton>
               </div>
             </header>
 
             <div
-              className={`grid min-h-0 flex-1 ${inspectorOpen ? "grid-cols-[196px_minmax(0,1fr)_380px]" : "grid-cols-[196px_minmax(0,1fr)]"}`}
+              className={`relative grid min-h-0 flex-1 grid-cols-[208px_minmax(0,1fr)] ${inspectorOpen ? "xl:grid-cols-[208px_minmax(0,1fr)_360px]" : ""}`}
             >
-              <aside className="flex min-h-0 flex-col border-r border-[var(--border)] bg-[var(--surface)]">
+              <aside
+                className="flex min-h-0 flex-col border-r border-[var(--border)] bg-[var(--surface)] "
+                data-workspace-resource-panel
+              >
                 <div className="grid grid-cols-2 gap-1 border-b border-[var(--border)] p-2">
                   <button
                     className={`rounded-lg px-3 py-2 text-xs ${resourceView === "paths" ? "bg-[var(--muted)] font-medium" : "text-[var(--muted-foreground)]"}`}
@@ -2830,47 +3284,117 @@ export function DeploymentPathWorkspace({
                 <div className="min-h-0 flex-1 overflow-auto px-2 py-3">
                   {resourceView === "paths" ? (
                     <>
-                      <div className="mb-2 flex items-center justify-between px-2">
-                        <span className="text-[11px] font-medium text-[var(--muted-foreground)]">
+                      <div className="mb-1 flex min-h-8 items-center justify-between px-2">
+                        <span className="text-xs font-semibold text-[var(--muted-foreground)]">
                           部署线路
                         </span>
-                        <Button
+                        <SemiButton
                           aria-label="新增线路"
                           disabled={busy === "create"}
+                          icon={<Plus className="size-4" />}
                           onClick={() => void createPath()}
-                          size="icon"
-                          variant="ghost"
-                        >
-                          <Plus />
-                        </Button>
+                          size="small"
+                          style={{ borderRadius: 7, height: 28, width: 28 }}
+                          theme="borderless"
+                          type="tertiary"
+                        />
                       </div>
-                      <div className="space-y-1">
+                      <div aria-label="部署线路列表" className="space-y-0.5">
                         {paths.map((candidate) => (
-                          <button
-                            aria-current={
-                              candidate.id === activePath.id
-                                ? "page"
-                                : undefined
-                            }
-                            className={`flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-xs ${candidate.id === activePath.id ? "bg-[#eef0ff] text-[#4f46e5] dark:bg-[#292a4b] dark:text-[#aaa7ff]" : "hover:bg-[var(--muted)]"}`}
+                          <div
+                            className={`group flex min-h-12 items-center gap-1 rounded-lg px-1 transition-colors ${candidate.id === activePath.id || openPathMenuId === candidate.id ? "bg-[var(--accent-soft)] " : "hover:bg-[var(--muted)]"}`}
                             key={candidate.id}
-                            onClick={() => {
-                              setActivePathId(candidate.id);
-                              setActiveNode(null);
-                              setShowRunHistory(false);
-                            }}
-                            type="button"
                           >
-                            <span className="truncate">{candidate.name}</span>
-                            <span
-                              className={`shrink-0 text-[10px] font-medium ${candidate.state === "online" ? "text-emerald-600" : candidate.state === "needs_action" ? "text-amber-600" : "text-[var(--muted-foreground)]"}`}
+                            <button
+                              aria-label={`${candidate.name} ${deploymentPathStateLabel(displayedPathState(candidate))}`}
+                              aria-current={
+                                candidate.id === activePath.id
+                                  ? "page"
+                                  : undefined
+                              }
+                              className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-1 py-1 text-left outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus)]"
+                              onClick={() => {
+                                setActivePathId(candidate.id);
+                                setActiveNode(null);
+                                setShowRunHistory(false);
+                                setOpenPathMenuId("");
+                              }}
+                              type="button"
                             >
-                              {deploymentPathStateLabel(candidate.state)}
-                            </span>
-                          </button>
+                              <span className="grid size-7 shrink-0 place-items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted-foreground)]">
+                                <CloudCog className="size-3.5" />
+                              </span>
+                              <span className="min-w-0 flex-1">
+                                <strong
+                                  className={`block truncate text-sm font-medium ${candidate.id === activePath.id ? "text-[var(--accent)]" : "text-[var(--foreground)]"}`}
+                                >
+                                  {candidate.name}
+                                </strong>
+                                <span className="mt-0.5 flex items-center gap-1.5 truncate text-xs text-[var(--muted-foreground)]">
+                                  <i
+                                    aria-hidden="true"
+                                    className={`size-1.5 shrink-0 rounded-full ${["online", "ready"].includes(displayedPathState(candidate)) ? "bg-[var(--success)]" : displayedPathState(candidate) === "needs_action" ? "bg-[var(--warning)]" : "bg-[var(--subtle-foreground)]"}`}
+                                  />
+                                  {deploymentPathStateLabel(
+                                    displayedPathState(candidate),
+                                  )}
+                                </span>
+                              </span>
+                            </button>
+                            <SemiDropdown
+                              onVisibleChange={(visible) =>
+                                setOpenPathMenuId(visible ? candidate.id : "")
+                              }
+                              position="bottomRight"
+                              render={
+                                <SemiDropdown.Menu>
+                                  <SemiDropdown.Item
+                                    icon={<Pencil className="size-3.5" />}
+                                    onClick={() => {
+                                      setOpenPathMenuId("");
+                                      openPathSettings(candidate);
+                                    }}
+                                  >
+                                    重命名线路
+                                  </SemiDropdown.Item>
+                                  <SemiDropdown.Item
+                                    disabled={
+                                      candidate.state === "deploying" ||
+                                      busy === "delete"
+                                    }
+                                    icon={<Trash2 className="size-3.5" />}
+                                    onClick={() => {
+                                      setOpenPathMenuId("");
+                                      requestPathDeletion(candidate);
+                                    }}
+                                    type="danger"
+                                  >
+                                    删除线路
+                                  </SemiDropdown.Item>
+                                </SemiDropdown.Menu>
+                              }
+                              trigger="click"
+                              visible={openPathMenuId === candidate.id}
+                            >
+                              <SemiButton
+                                aria-label={`管理线路：${candidate.name}`}
+                                className={`${candidate.id === activePath.id || openPathMenuId === candidate.id ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"} transition-opacity`}
+                                icon={<MoreHorizontal className="size-4" />}
+                                size="small"
+                                style={{
+                                  borderRadius: 7,
+                                  height: 28,
+                                  minWidth: 28,
+                                  width: 28,
+                                }}
+                                theme="borderless"
+                                type="tertiary"
+                              />
+                            </SemiDropdown>
+                          </div>
                         ))}
                       </div>
-                      <div className="mb-2 mt-6 flex items-center justify-between px-2 text-[11px] font-medium text-[var(--muted-foreground)]">
+                      <div className="mb-1 mt-5 flex min-h-8 items-center justify-between px-2 text-xs font-semibold text-[var(--muted-foreground)]">
                         <span>节点类型</span>
                         <span>{nodeMeta.length}</span>
                       </div>
@@ -2884,14 +3408,14 @@ export function DeploymentPathWorkspace({
                               onClick={() => openNode(node.id)}
                               type="button"
                             >
-                              <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-[#eef0ff] text-[#5b5cf0] dark:bg-[#292a4b]">
+                              <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent)] ">
                                 <Icon className="size-3.5" />
                               </span>
                               <span className="min-w-0">
-                                <strong className="block truncate text-xs">
+                                <strong className="block truncate text-sm font-medium">
                                   {node.title}
                                 </strong>
-                                <span className="mt-0.5 block truncate text-[10px] text-[var(--muted-foreground)]">
+                                <span className="mt-0.5 block truncate text-xs text-[var(--muted-foreground)]">
                                   {node.description}
                                 </span>
                               </span>
@@ -2902,7 +3426,7 @@ export function DeploymentPathWorkspace({
                     </>
                   ) : (
                     <>
-                      <div className="px-2 text-[11px] font-medium text-[var(--muted-foreground)]">
+                      <div className="px-2 text-xs font-semibold text-[var(--muted-foreground)]">
                         已保存连接
                       </div>
                       <div className="mt-2 space-y-1">
@@ -2920,14 +3444,16 @@ export function DeploymentPathWorkspace({
                             type="button"
                           >
                             <span className="min-w-0">
-                              <strong className="block truncate text-xs">
+                              <strong className="block truncate text-sm font-medium">
                                 {connection.name}
                               </strong>
-                              <span className="mt-0.5 block text-[10px] uppercase text-[var(--muted-foreground)]">
+                              <span className="mt-0.5 block text-xs uppercase text-[var(--muted-foreground)]">
                                 {connection.provider}
                               </span>
                             </span>
-                            <span className="shrink-0 text-[10px] font-medium text-emerald-600">
+                            <span
+                              className={`shrink-0 text-xs font-medium ${connectionReady(connection) ? "text-[var(--success)]" : "text-[var(--warning)]"}`}
+                            >
                               {connectionReady(connection)
                                 ? "可用"
                                 : "需要验证"}
@@ -2942,15 +3468,15 @@ export function DeploymentPathWorkspace({
                             type="button"
                           >
                             <span className="min-w-0">
-                              <strong className="block truncate text-xs">
+                              <strong className="block truncate text-sm font-medium">
                                 {server.name}
                               </strong>
-                              <span className="mt-0.5 block truncate text-[10px] text-[var(--muted-foreground)]">
+                              <span className="mt-0.5 block truncate text-xs text-[var(--muted-foreground)]">
                                 {server.host}
                               </span>
                             </span>
                             <span
-                              className={`shrink-0 text-[10px] font-medium ${server.keyPathExists ? "text-emerald-600" : "text-amber-600"}`}
+                              className={`shrink-0 text-xs font-medium ${server.keyPathExists ? "text-[var(--success)]" : "text-[var(--warning)]"}`}
                             >
                               {server.keyPathExists ? "密钥已保存" : "密钥缺失"}
                             </span>
@@ -2968,50 +3494,52 @@ export function DeploymentPathWorkspace({
               </aside>
 
               <section className="relative min-h-0 min-w-0">
-                <div className="pointer-events-none absolute left-4 top-4 z-10 rounded-lg bg-white/90 px-3 py-2 shadow-sm backdrop-blur dark:bg-[#242429]/90">
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] text-[var(--muted-foreground)]">
-                      线路
-                    </span>
-                    <strong className="text-sm">{activePath.name}</strong>
-                    <button
-                      aria-label="修改线路名称"
-                      className="pointer-events-auto rounded p-1 text-[var(--muted-foreground)] hover:bg-[var(--muted)]"
-                      onClick={() => {
-                        setNameDraft(activePath.name);
-                        setEditingName(true);
-                      }}
-                      type="button"
-                    >
-                      <Pencil className="size-3.5" />
-                    </button>
-                  </div>
-                  <p className="mb-0 mt-1 max-w-[420px] text-[11px] text-[var(--muted-foreground)]">
-                    {activeRun?.message ||
-                      (firstBlockedNode
-                        ? `下一步：${nextActionLabel}`
-                        : "所有节点已就绪，可以开始上线。")}
-                  </p>
-                </div>
-                <Suspense
-                  fallback={
-                    <div className="grid h-full place-items-center text-sm text-[var(--muted-foreground)]">
-                      <span className="inline-flex items-center gap-2">
-                        <LoaderCircle className="size-4 animate-spin" />
-                        正在打开工作流
-                      </span>
-                    </div>
-                  }
-                >
-                  <DeploymentWorkflowCanvas
-                    activeNode={activeNode}
-                    fitViewRevision={
-                      inspectorOpen ? "inspector-open" : "canvas-only"
-                    }
-                    nodes={workflowNodes}
-                    onSelectNode={openNode}
+                <div className="pointer-events-none absolute left-4 top-4 z-10 flex h-8 items-center gap-1 rounded-lg border border-[var(--border)] bg-white/95 pl-3 pr-1 shadow-sm backdrop-blur bg-[var(--surface-raised)]/95">
+                  <strong className="text-sm font-medium">
+                    {activePath.name}
+                  </strong>
+                  <SemiButton
+                    aria-label="修改线路名称"
+                    className="pointer-events-auto"
+                    icon={<Pencil className="size-3.5" />}
+                    onClick={() => openPathSettings(activePath)}
+                    size="small"
+                    style={{ borderRadius: 6, height: 24, width: 24 }}
+                    theme="borderless"
+                    type="tertiary"
                   />
-                </Suspense>
+                </div>
+                {canvasLayoutPathId === activePath.id ? (
+                  <Suspense
+                    fallback={
+                      <div className="grid h-full place-items-center text-sm text-[var(--muted-foreground)]">
+                        <span className="inline-flex items-center gap-2">
+                          <LoaderCircle className="size-4 animate-spin" />
+                          正在打开工作流
+                        </span>
+                      </div>
+                    }
+                  >
+                    <DeploymentWorkflowCanvas
+                      activeNode={activeNode}
+                      fitViewRevision={
+                        inspectorOpen ? "inspector-open" : "canvas-only"
+                      }
+                      initialNodePositions={canvasNodePositions ?? undefined}
+                      key={activePath.id}
+                      nodes={workflowNodes}
+                      onNodePositionsChange={persistCanvasNodePositions}
+                      onSelectNode={openNode}
+                    />
+                  </Suspense>
+                ) : (
+                  <div className="grid h-full place-items-center text-sm text-[var(--muted-foreground)]">
+                    <span className="inline-flex items-center gap-2">
+                      <LoaderCircle className="size-4 animate-spin" />
+                      正在恢复画布布局
+                    </span>
+                  </div>
+                )}
               </section>
 
               {inspectorOpen ? (
@@ -3022,39 +3550,33 @@ export function DeploymentPathWorkspace({
                       : (nodeMeta.find((node) => node.id === activeNode)
                           ?.title ?? "节点配置")
                   }
-                  className="min-h-0 overflow-auto border-l border-[var(--border)] bg-[var(--surface)]"
+                  className="absolute inset-y-0 right-0 z-30 flex w-[360px] min-h-0 flex-col overflow-hidden border-l border-[var(--border)] bg-[var(--surface)] shadow-[-12px_0_28px_rgba(30,32,48,0.10)] xl:static xl:w-auto xl:shadow-none"
+                  data-inspector-mode={inspectorMode}
                   role="dialog"
                 >
-                  <header className="sticky top-0 z-10 flex items-start justify-between gap-3 border-b border-[var(--border)] bg-[var(--surface)] px-5 py-4">
-                    <div>
-                      <span className="text-[10px] text-[var(--muted-foreground)]">
-                        {showRunHistory ? "项目记录" : "节点配置"}
+                  <header className="flex h-[52px] shrink-0 items-center justify-between gap-3 border-b border-[var(--border)] bg-[var(--surface)] px-4">
+                    <div className="min-w-0">
+                      <span className="block text-xs text-[var(--muted-foreground)]">
+                        {showRunHistory ? "线路记录" : "节点配置"}
                       </span>
-                      <h2 className="mb-0 mt-1 text-lg font-semibold">
+                      <h2 className="mb-0 mt-0.5 truncate text-base font-semibold">
                         {showRunHistory
                           ? "运行记录"
                           : nodeMeta.find((node) => node.id === activeNode)
                               ?.title}
                       </h2>
-                      {!showRunHistory ? (
-                        <p className="mb-0 mt-1 text-xs text-[var(--muted-foreground)]">
-                          {
-                            nodeMeta.find((node) => node.id === activeNode)
-                              ?.description
-                          }
-                        </p>
-                      ) : null}
                     </div>
-                    <Button
+                    <SemiButton
                       aria-label="关闭"
+                      icon={<X className="size-4" />}
                       onClick={closeInspector}
-                      size="icon"
-                      variant="ghost"
-                    >
-                      ×
-                    </Button>
+                      size="small"
+                      style={{ borderRadius: 8, height: 32, width: 32 }}
+                      theme="borderless"
+                      type="tertiary"
+                    />
                   </header>
-                  <div className="px-5 pb-8">
+                  <div className="min-h-0 flex-1 overflow-auto px-4 pb-6 text-xs leading-[18px]">
                     {showRunHistory
                       ? renderRunHistoryPanel()
                       : renderNodePanel()}
@@ -3066,9 +3588,9 @@ export function DeploymentPathWorkspace({
             <Dialog onOpenChange={setEditingName} open={editingName}>
               <DialogContent>
                 <DialogHeader>
-                  <DialogTitle>线路设置</DialogTitle>
+                  <DialogTitle>重命名线路</DialogTitle>
                   <DialogDescription>
-                    名称只用于帮助你区分不同的部署线路。
+                    名称只用于区分部署用途，不会改变服务器或节点配置。
                   </DialogDescription>
                 </DialogHeader>
                 <div className="space-y-2">
@@ -3079,33 +3601,19 @@ export function DeploymentPathWorkspace({
                     value={nameDraft}
                   />
                 </div>
-                <div className="rounded-xl border border-red-200 bg-red-50/70 p-4 dark:border-red-900 dark:bg-red-950/20">
-                  <div className="text-sm font-medium">删除当前线路</div>
-                  <p className="mb-0 mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
-                    删除后无法恢复，但不会删除配置中心里的连接，也不会自动停止服务器上正在运行的项目。
-                  </p>
-                  <Button
-                    className="mt-3"
-                    disabled={
-                      activePath.state === "deploying" || busy === "delete"
-                    }
-                    onClick={() => {
-                      setEditingName(false);
-                      setConfirmingDeletePath(true);
-                    }}
-                    variant="destructive"
-                  >
-                    <Trash2 />
-                    删除这条线路
-                  </Button>
-                </div>
                 <DialogFooter>
-                  <Button
+                  <WorkspaceButton
+                    onClick={() => setEditingName(false)}
+                    variant="secondary"
+                  >
+                    取消
+                  </WorkspaceButton>
+                  <WorkspaceButton
                     disabled={!nameDraft.trim() || busy === "name"}
                     onClick={() => void savePathName()}
                   >
                     保存名称
-                  </Button>
+                  </WorkspaceButton>
                 </DialogFooter>
               </DialogContent>
             </Dialog>
@@ -3118,22 +3626,22 @@ export function DeploymentPathWorkspace({
                 <DialogHeader>
                   <DialogTitle>确认删除线路</DialogTitle>
                   <DialogDescription>
-                    确定删除“{activePath.name}
-                    ”吗？此操作无法撤销。配置中心里的连接和服务器上正在运行的项目不会被删除。
+                    确定删除“{managedPath?.name}
+                    ”吗？此操作无法撤销，但不会删除本地项目代码或配置中心里的连接，也不会自动停止服务器上正在运行的项目。
                   </DialogDescription>
                 </DialogHeader>
                 <DialogFooter>
-                  <Button
+                  <WorkspaceButton
                     onClick={() => setConfirmingDeletePath(false)}
                     variant="secondary"
                   >
                     取消
-                  </Button>
-                  <Button
+                  </WorkspaceButton>
+                  <WorkspaceButton
                     disabled={
-                      activePath.state === "deploying" || busy === "delete"
+                      managedPath?.state === "deploying" || busy === "delete"
                     }
-                    onClick={() => void removeActivePath()}
+                    onClick={() => void removeManagedPath()}
                     variant="destructive"
                   >
                     {busy === "delete" ? (
@@ -3142,7 +3650,7 @@ export function DeploymentPathWorkspace({
                       <Trash2 />
                     )}
                     确认删除线路
-                  </Button>
+                  </WorkspaceButton>
                 </DialogFooter>
               </DialogContent>
             </Dialog>
@@ -3170,13 +3678,13 @@ export function DeploymentPathWorkspace({
                   </div>
                 </div>
                 <DialogFooter>
-                  <Button
+                  <WorkspaceButton
                     onClick={() => setConfirmingDeploy(false)}
                     variant="secondary"
                   >
                     返回检查
-                  </Button>
-                  <Button
+                  </WorkspaceButton>
+                  <WorkspaceButton
                     onClick={() => {
                       setConfirmingDeploy(false);
                       void deployActivePath();
@@ -3184,7 +3692,7 @@ export function DeploymentPathWorkspace({
                   >
                     <Rocket />
                     确认并开始上线
-                  </Button>
+                  </WorkspaceButton>
                 </DialogFooter>
               </DialogContent>
             </Dialog>
@@ -3192,521 +3700,5 @@ export function DeploymentPathWorkspace({
         );
       })()
     : null;
-  if (studio) return studio;
-
-  return (
-    <main className="mx-auto w-full max-w-[1500px] px-6 py-8 lg:px-10">
-      <div className="mb-8 flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-semibold tracking-tight">部署线路</h1>
-          <p className="mt-2 text-sm text-[var(--muted-foreground)]">
-            从本地项目出发，经过两个自动服务，最后到达运行服务器。
-          </p>
-        </div>
-        {paths.length > 0 ? (
-          <Button onClick={() => void createPath()} variant="secondary">
-            <Plus />
-            新增线路
-          </Button>
-        ) : null}
-      </div>
-
-      {paths.length === 0 ? (
-        <section className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-8 shadow-sm">
-          <div className="mx-auto max-w-5xl py-8 text-center">
-            <div
-              className="mb-8 grid grid-cols-[1fr_auto_1fr_auto_1fr_auto_1fr] items-center gap-3"
-              aria-hidden="true"
-            >
-              {nodeMeta.map((node, index) => {
-                const Icon = node.icon;
-                return [
-                  <div
-                    className="rounded-xl border border-dashed border-[var(--border)] bg-[var(--muted)]/35 px-3 py-6"
-                    key={node.id}
-                  >
-                    <Icon className="mx-auto mb-3 size-6 text-[var(--subtle-foreground)]" />
-                    <div className="text-sm font-medium text-[var(--muted-foreground)]">
-                      {node.title}
-                    </div>
-                  </div>,
-                  index < nodeMeta.length - 1 ? (
-                    <ChevronRight
-                      className="size-5 text-[var(--subtle-foreground)]"
-                      key={`${node.id}-arrow`}
-                    />
-                  ) : null,
-                ];
-              })}
-            </div>
-            <h2 className="text-xl font-semibold">还没有部署线路</h2>
-            <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-[var(--muted-foreground)]">
-              创建后，系统会自动识别已经准备好的内容，只让你补充确实缺少的信息。
-            </p>
-            <Button
-              className="mt-6"
-              disabled={busy === "create"}
-              onClick={() => void createPath()}
-              size="lg"
-            >
-              {busy === "create" ? (
-                <LoaderCircle className="animate-spin" />
-              ) : (
-                <Rocket />
-              )}
-              创建上线线路
-            </Button>
-          </div>
-        </section>
-      ) : (
-        <div className="space-y-6">
-          <div
-            className="flex gap-2 overflow-x-auto pb-1"
-            aria-label="部署线路列表"
-          >
-            {paths.map((candidate) => (
-              <button
-                className={`rounded-full border px-4 py-2 text-sm font-medium transition-colors ${candidate.id === activePathId ? "border-[var(--foreground)] bg-[var(--foreground)] text-[var(--background)]" : "border-[var(--border)] bg-[var(--surface)] hover:bg-[var(--muted)]"}`}
-                key={candidate.id}
-                onClick={() => setActivePathId(candidate.id)}
-                type="button"
-              >
-                {candidate.name}
-              </button>
-            ))}
-          </div>
-
-          {activePath ? (
-            <section className="relative min-h-[560px] overflow-x-auto rounded-2xl border border-[var(--border)] bg-[var(--background)] bg-[radial-gradient(circle,var(--border)_1px,transparent_1px)] [background-size:22px_22px] shadow-sm">
-              <div className="min-w-[860px] p-6">
-                <header className="flex flex-wrap items-start justify-between gap-4 rounded-xl border border-[var(--border)] bg-[var(--surface)]/95 px-5 py-4 shadow-sm backdrop-blur">
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <h2 className="text-xl font-semibold">
-                        {activePath.name}
-                      </h2>
-                      <button
-                        className="rounded p-1 text-[var(--muted-foreground)] hover:bg-[var(--muted)]"
-                        onClick={() => {
-                          setNameDraft(activePath.name);
-                          setEditingName(true);
-                        }}
-                        type="button"
-                      >
-                        <Pencil className="size-4" />
-                        <span className="sr-only">修改线路名称</span>
-                      </button>
-                    </div>
-                    <p className="mt-1 text-sm text-[var(--muted-foreground)]">
-                      {activePath.state === "online"
-                        ? "项目已经在线；本地有新修改时可以再次更新。"
-                        : activePath.state === "deploying"
-                          ? "正在上线，可以关闭客户端，稍后回来继续查看。"
-                          : activePath.state === "needs_action"
-                            ? freshLocalSnapshotRequired
-                              ? "上次上线任务已经中断，所有配置都已保留。"
-                              : "上线停在一个问题上，已完成的配置不会丢失。"
-                            : allReady
-                              ? "全部准备完成，可以开始上线。"
-                              : `还差 ${nodeMeta.filter((node) => nodeStatuses[node.id].tone !== "ready").length} 项准备。`}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Button
-                      aria-label={`查看${activePath.name}的运行记录`}
-                      onClick={() => setShowRunHistory(true)}
-                      variant="secondary"
-                    >
-                      <History />
-                      运行记录
-                    </Button>
-                    {activePath.state === "online" && activePath.address ? (
-                      <Button asChild variant="secondary">
-                        <a
-                          href={normalizedAddress(activePath.address)}
-                          rel="noreferrer"
-                          target="_blank"
-                        >
-                          <ExternalLink />
-                          打开项目
-                        </a>
-                      </Button>
-                    ) : null}
-                  </div>
-                </header>
-
-                <div className="mt-20 grid grid-cols-[175px_40px_175px_40px_175px_40px_175px] items-center justify-center">
-                  {nodeMeta.map((node, index) => {
-                    const status = nodeStatuses[node.id];
-                    const Icon = node.icon;
-                    return [
-                      <button
-                        aria-label={`${node.title}：${statusCopy(status.tone)}，${status.summary}`}
-                        className={`group relative min-h-[184px] rounded-2xl border bg-[var(--surface)] p-4 text-left shadow-md outline-none transition-all hover:-translate-y-1 hover:shadow-lg focus-visible:ring-2 focus-visible:ring-[var(--focus)] ${activeNode === node.id ? "ring-2 ring-[var(--focus)] ring-offset-4 ring-offset-[var(--background)]" : ""} ${status.tone === "ready" ? "border-emerald-300 dark:border-emerald-800" : status.tone === "error" ? "border-amber-400 dark:border-amber-700" : "border-[var(--border)]"}`}
-                        key={node.id}
-                        onClick={() => openNode(node.id)}
-                        type="button"
-                      >
-                        <div className="mb-6 flex items-start justify-between gap-2">
-                          <span className="grid size-10 place-items-center rounded-lg border border-[var(--border)] bg-[var(--surface)]">
-                            <Icon className="size-5" />
-                          </span>
-                          <span
-                            className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-xs font-medium ${status.tone === "ready" ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300" : status.tone === "error" ? "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300" : "bg-[var(--muted)] text-[var(--muted-foreground)]"}`}
-                          >
-                            {status.tone === "ready" ? (
-                              <Check className="size-3" />
-                            ) : status.tone === "error" ? (
-                              <CircleAlert className="size-3" />
-                            ) : null}
-                            {statusCopy(status.tone)}
-                          </span>
-                        </div>
-                        <div className="text-base font-semibold">
-                          {node.title}
-                        </div>
-                        <div className="mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
-                          {node.description}
-                        </div>
-                        <div className="mt-4 truncate text-xs font-medium text-[var(--foreground)]">
-                          {status.summary}
-                        </div>
-                        {status.provider ? (
-                          <div className="mt-1 truncate text-[11px] text-[var(--subtle-foreground)]">
-                            {status.provider}
-                          </div>
-                        ) : null}
-                      </button>,
-                      index < nodeMeta.length - 1 ? (
-                        <div
-                          className="flex items-center"
-                          key={`${node.id}-arrow`}
-                        >
-                          <span
-                            className={`h-0.5 flex-1 ${status.tone === "ready" ? "bg-emerald-400" : status.tone === "error" ? "bg-amber-400" : "bg-[var(--border)]"}`}
-                          />
-                          <ChevronRight
-                            className={`-ml-1 size-5 ${status.tone === "ready" ? "text-emerald-500" : status.tone === "error" ? "text-amber-500" : "text-[var(--subtle-foreground)]"}`}
-                          />
-                        </div>
-                      ) : null,
-                    ];
-                  })}
-                </div>
-
-                <footer
-                  className={`mt-20 flex flex-wrap items-center justify-between gap-4 rounded-xl border bg-[var(--surface)]/95 px-5 py-4 shadow-sm backdrop-blur ${freshLocalSnapshotRequired ? "border-amber-300" : "border-[var(--border)]"}`}
-                >
-                  <div className="max-w-2xl text-sm">
-                    {freshLocalSnapshotRequired ? (
-                      <>
-                        <div className="font-semibold text-[var(--foreground)]">
-                          只需重新读取你电脑里的当前项目
-                        </div>
-                        <p className="mt-1 leading-6 text-[var(--muted-foreground)]">
-                          构建服务、版本仓库、服务器和访问地址都不需要重新设置。系统会放弃上次中断的临时任务，使用当前代码重新上线。
-                        </p>
-                      </>
-                    ) : (
-                      <span className="text-[var(--muted-foreground)]">
-                        {activeRun
-                          ? `${activeRun.message}${activeRun.commitSha ? ` · ${activeRun.commitSha.slice(0, 8)}` : ""}`
-                          : firstBlockedNode
-                            ? `下一步：${nextActionLabel}`
-                            : "系统会在上线后核对构建、服务器和访问地址。"}
-                      </span>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {activeRun &&
-                    ["queued", "running"].includes(activeRun.status) ? (
-                      <Button
-                        disabled={busy === "refresh"}
-                        onClick={() => void refreshActiveRun()}
-                        variant="secondary"
-                      >
-                        <RefreshCw
-                          className={busy === "refresh" ? "animate-spin" : ""}
-                        />
-                        刷新状态
-                      </Button>
-                    ) : null}
-                    {activeRun?.status === "needs_action" ? (
-                      freshLocalSnapshotRequired ? (
-                        <Button
-                          disabled={busy === "deploy"}
-                          onClick={() => void deployActivePath(true)}
-                          size="lg"
-                        >
-                          {busy === "deploy" ? (
-                            <LoaderCircle className="animate-spin" />
-                          ) : (
-                            <RefreshCw />
-                          )}
-                          重新读取项目并上线
-                        </Button>
-                      ) : activeRun.actionKind ===
-                        "deployment-path-preparation-retry" ? (
-                        <Button
-                          disabled={busy === "deploy"}
-                          onClick={() => void deployActivePath()}
-                          size="lg"
-                        >
-                          {busy === "deploy" ? (
-                            <LoaderCircle className="animate-spin" />
-                          ) : (
-                            <Rocket />
-                          )}
-                          {activeRun.currentStage === "prepare-server"
-                            ? "初始化服务器并继续"
-                            : "重试并继续上线"}
-                        </Button>
-                      ) : [
-                          "deployment-path-route-check",
-                          "deployment-path-route-takeover",
-                        ].includes(activeRun.actionKind || "") ? (
-                        <Button onClick={() => openNode("server")} size="lg">
-                          <Server />
-                          处理访问地址
-                        </Button>
-                      ) : (
-                        <Button
-                          disabled={busy === "refresh"}
-                          onClick={() => void refreshActiveRun()}
-                          size="lg"
-                        >
-                          {busy === "refresh" ? (
-                            <LoaderCircle className="animate-spin" />
-                          ) : (
-                            <Rocket />
-                          )}
-                          继续上线
-                        </Button>
-                      )
-                    ) : !allReady && firstBlockedNode ? (
-                      <Button onClick={() => openNode(firstBlockedNode)}>
-                        {nextActionLabel}
-                        <ChevronRight />
-                      </Button>
-                    ) : (
-                      <Button
-                        disabled={
-                          busy === "deploy" || activePath.state === "deploying"
-                        }
-                        onClick={requestDeploy}
-                        size="lg"
-                      >
-                        {busy === "deploy" ||
-                        activePath.state === "deploying" ? (
-                          <LoaderCircle className="animate-spin" />
-                        ) : (
-                          <Rocket />
-                        )}
-                        {activePath.state === "online"
-                          ? "更新上线"
-                          : "开始上线"}
-                      </Button>
-                    )}
-                  </div>
-                </footer>
-              </div>
-            </section>
-          ) : null}
-        </div>
-      )}
-
-      <Sheet
-        onOpenChange={(open) => {
-          if (!open) {
-            setActiveNode(null);
-            setServerPassword("");
-            setServerPasswordError("");
-          }
-        }}
-        open={Boolean(activeNode)}
-      >
-        <SheetContent>
-          <SheetHeader>
-            <SheetTitle>
-              {nodeMeta.find((node) => node.id === activeNode)?.title}
-            </SheetTitle>
-            <SheetDescription>
-              {nodeMeta.find((node) => node.id === activeNode)?.description}
-            </SheetDescription>
-          </SheetHeader>
-
-          {renderNodePanel()}
-        </SheetContent>
-      </Sheet>
-
-      <Sheet onOpenChange={setShowRunHistory} open={showRunHistory}>
-        <SheetContent>
-          <SheetHeader>
-            <SheetTitle>运行记录</SheetTitle>
-            <SheetDescription>
-              {activePath?.name || "当前线路"}的每次上线与不可变版本。
-            </SheetDescription>
-          </SheetHeader>
-          <div className="mt-8 space-y-3">
-            {pathRuns.length ? (
-              pathRuns.map((run) => (
-                <article
-                  className="rounded-xl border border-[var(--border)] p-4"
-                  key={run.id}
-                >
-                  <div className="flex items-start justify-between gap-4">
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-semibold">
-                        {run.sourceTitle ||
-                          `${new Date(run.startedAt).toLocaleString("zh-CN")} 的上线`}
-                      </div>
-                      <div className="mt-1 text-xs text-[var(--muted-foreground)]">
-                        {run.status === "success"
-                          ? "上线成功"
-                          : run.status === "failed"
-                            ? "上线失败"
-                            : run.status === "needs_action"
-                              ? "等待处理"
-                              : "正在上线"}
-                        {run.commitSha ? ` · ${run.commitSha.slice(0, 8)}` : ""}
-                      </div>
-                    </div>
-                    {run.status === "success" && run.artifacts.length ? (
-                      <Button
-                        disabled={
-                          busy === `version:${run.id}` ||
-                          run.id === activePath?.lastRunId
-                        }
-                        onClick={() => void redeployVersion(run)}
-                        size="sm"
-                        variant="secondary"
-                      >
-                        {busy === `version:${run.id}` ? (
-                          <LoaderCircle className="animate-spin" />
-                        ) : null}
-                        {run.id === activePath?.lastRunId
-                          ? "当前版本"
-                          : "重新上线"}
-                      </Button>
-                    ) : null}
-                  </div>
-                  <p className="mt-3 text-xs leading-5 text-[var(--muted-foreground)]">
-                    {run.message}
-                  </p>
-                  {run.artifacts.length ? (
-                    <details className="mt-3 text-xs text-[var(--muted-foreground)]">
-                      <summary className="cursor-pointer font-medium text-[var(--foreground)]">
-                        查看 {run.artifacts.length} 个版本产物
-                      </summary>
-                      <div className="mt-2 space-y-2">
-                        {run.artifacts.map((artifact) => (
-                          <div
-                            className="break-all rounded-lg bg-[var(--muted)]/55 p-2 font-mono"
-                            key={`${run.id}-${artifact.service}`}
-                          >
-                            {artifact.service} · {artifact.digest.slice(0, 20)}…
-                          </div>
-                        ))}
-                      </div>
-                    </details>
-                  ) : null}
-                </article>
-              ))
-            ) : (
-              <div className="rounded-xl border border-dashed border-[var(--border)] px-5 py-10 text-center text-sm text-[var(--muted-foreground)]">
-                这条线路还没有运行记录。
-              </div>
-            )}
-          </div>
-        </SheetContent>
-      </Sheet>
-
-      <Sheet onOpenChange={setEditingName} open={editingName}>
-        <SheetContent>
-          <SheetHeader>
-            <SheetTitle>线路设置</SheetTitle>
-            <SheetDescription>
-              名称只用于帮助你区分不同服务器线路。
-            </SheetDescription>
-          </SheetHeader>
-          <div className="mt-8 space-y-2">
-            <Label htmlFor="path-name">线路名称</Label>
-            <Input
-              id="path-name"
-              onChange={(event) => setNameDraft(event.target.value)}
-              value={nameDraft}
-            />
-          </div>
-          <Button
-            className="mt-5 w-full"
-            disabled={!nameDraft.trim() || busy === "name"}
-            onClick={() => void savePathName()}
-          >
-            保存名称
-          </Button>
-          <div className="mt-auto pt-12">
-            <Button
-              className="w-full"
-              disabled={activePath?.state === "deploying" || busy === "delete"}
-              onClick={() => void removeActivePath()}
-              variant="destructive"
-            >
-              <Trash2 />
-              删除这条线路
-            </Button>
-            <p className="mt-2 text-xs leading-5 text-[var(--muted-foreground)]">
-              删除线路不会删除配置中心里的连接，也不会自动停止服务器上正在运行的项目。
-            </p>
-          </div>
-        </SheetContent>
-      </Sheet>
-
-      <Dialog onOpenChange={setConfirmingDeploy} open={confirmingDeploy}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>确认第一次上线</DialogTitle>
-            <DialogDescription>
-              系统会使用你电脑里此刻的项目内容，生成版本并放到下面这台服务器。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3 rounded-xl border border-[var(--border)] bg-[var(--muted)]/35 p-4 text-sm">
-            <div>
-              <span className="text-[var(--muted-foreground)]">本地项目：</span>
-              {workspace.inspection.project_name}
-            </div>
-            <div>
-              <span className="text-[var(--muted-foreground)]">
-                运行服务器：
-              </span>
-              {selectedServer
-                ? `${selectedServer.name} · ${selectedServer.host}`
-                : "尚未选择"}
-            </div>
-            <div>
-              <span className="text-[var(--muted-foreground)]">访问地址：</span>
-              {activePath?.routes.map((route) => route.host).join("、") ||
-                "尚未填写"}
-            </div>
-          </div>
-          <DialogFooter>
-            <Button
-              onClick={() => setConfirmingDeploy(false)}
-              variant="secondary"
-            >
-              返回检查
-            </Button>
-            <Button
-              onClick={() => {
-                setConfirmingDeploy(false);
-                void deployActivePath();
-              }}
-            >
-              <Rocket />
-              确认并开始上线
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </main>
-  );
+  return studio;
 }

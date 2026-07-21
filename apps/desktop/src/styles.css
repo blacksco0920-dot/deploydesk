@@ -11,68 +11,151 @@
     "PingFang SC",
     "Microsoft YaHei",
     sans-serif;
-  color: #171717;
-  background: #f7f7f6;
+  color: #1d1c23;
+  background: #f5f6fa;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
-  --background: #f7f7f6;
+  --background: #f5f6fa;
+  --canvas-background: #f7f8fc;
+  --sidebar-background: #f3f4f8;
   --surface: #ffffff;
   --surface-raised: #ffffff;
-  --foreground: #171717;
-  --muted-foreground: #666663;
-  --subtle-foreground: #92928e;
-  --muted: #f0f0ee;
-  --muted-strong: #dededb;
-  --border: #e2e2df;
-  --input: #d8d8d4;
-  --primary: #20201f;
-  --primary-hover: #353533;
+  --foreground: #1d1c23;
+  --muted-foreground: #646676;
+  --subtle-foreground: #9294a1;
+  --muted: #f0f1f5;
+  --muted-strong: #d9dbe4;
+  --selection-muted: #e8e9ef;
+  --border: #e4e6ed;
+  --input: #d6d8e1;
+  --primary: #5b5ceb;
+  --primary-hover: #4b4dd8;
   --primary-foreground: #ffffff;
-  --accent: #0f766e;
-  --accent-hover: #0b625c;
-  --accent-soft: #e8f4f2;
-  --info-soft: #edf7f6;
-  --focus: rgb(15 118 110 / 25%);
-  --success: #18794e;
+  --accent: #5b5ceb;
+  --accent-hover: #4b4dd8;
+  --accent-soft: #f0f0ff;
+  --info-soft: #f0f0ff;
+  --focus: rgb(91 92 235 / 28%);
+  --success: #16a36a;
   --success-soft: #eaf6ef;
-  --warning: #a45a0a;
+  --warning: #c27612;
   --warning-soft: #fff4df;
-  --destructive: #b42318;
-  --destructive-hover: #951f16;
+  --destructive: #d94b4b;
+  --destructive-hover: #c43f3f;
   --destructive-soft: #fdf0ef;
+  --shadow-sm: 0 1px 4px rgb(25 28 42 / 6%);
+  --shadow-md: 0 10px 28px rgb(25 28 42 / 12%);
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not(.light) {
-    color: #f2f2f0;
-    background: #171716;
-    --background: #171716;
-    --surface: #1f1f1e;
-    --surface-raised: #252524;
-    --foreground: #f2f2f0;
-    --muted-foreground: #aaa9a4;
-    --subtle-foreground: #777772;
-    --muted: #292928;
-    --muted-strong: #3b3b38;
-    --border: #343432;
-    --input: #42423f;
-    --primary: #eeeeeb;
-    --primary-hover: #ffffff;
-    --primary-foreground: #181817;
-    --accent: #5fc4b8;
-    --accent-hover: #79d4c9;
-    --accent-soft: #173b37;
-    --info-soft: #173b37;
-    --focus: rgb(95 196 184 / 30%);
+    color: #f2f2f5;
+    background: #17171b;
+    --background: #17171b;
+    --canvas-background: #1a1b21;
+    --sidebar-background: #1c1d22;
+    --surface: #202126;
+    --surface-raised: #27282f;
+    --foreground: #f2f2f5;
+    --muted-foreground: #a8a9b3;
+    --subtle-foreground: #777985;
+    --muted: #2a2b32;
+    --muted-strong: #3b3d46;
+    --selection-muted: #303139;
+    --border: #353740;
+    --input: #454751;
+    --primary: #8586ff;
+    --primary-hover: #9a9bff;
+    --primary-foreground: #111118;
+    --accent: #8586ff;
+    --accent-hover: #9a9bff;
+    --accent-soft: #303052;
+    --info-soft: #303052;
+    --focus: rgb(133 134 255 / 34%);
     --success: #6ccc99;
     --success-soft: #183c2b;
     --warning: #e3a24d;
     --warning-soft: #402f18;
-    --destructive: #d8544a;
-    --destructive-hover: #e36b62;
+    --destructive: #e06464;
+    --destructive-hover: #ea7b7b;
     --destructive-soft: #48231f;
   }
+}
+
+/*
+ * ABCDeploy owns the product semantics; Semi consumes the same tokens.
+ * Keeping this bridge in the global entry prevents individual Semi controls
+ * from falling back to a second colour system, including in dark mode.
+ */
+body {
+  --semi-color-primary: var(--primary);
+  --semi-color-primary-hover: var(--primary-hover);
+  --semi-color-primary-active: var(--primary-hover);
+  --semi-color-primary-disabled: color-mix(
+    in srgb,
+    var(--primary) 36%,
+    var(--surface)
+  );
+  --semi-color-primary-light-default: var(--accent-soft);
+  --semi-color-primary-light-hover: color-mix(
+    in srgb,
+    var(--accent) 14%,
+    var(--surface)
+  );
+  --semi-color-primary-light-active: color-mix(
+    in srgb,
+    var(--accent) 20%,
+    var(--surface)
+  );
+  --semi-color-secondary: var(--accent);
+  --semi-color-secondary-hover: var(--accent-hover);
+  --semi-color-secondary-active: var(--accent-hover);
+  --semi-color-secondary-light-default: var(--accent-soft);
+  --semi-color-info: var(--accent);
+  --semi-color-info-hover: var(--accent-hover);
+  --semi-color-info-active: var(--accent-hover);
+  --semi-color-info-light-default: var(--info-soft);
+  --semi-color-success: var(--success);
+  --semi-color-success-hover: var(--success);
+  --semi-color-success-active: var(--success);
+  --semi-color-success-light-default: var(--success-soft);
+  --semi-color-warning: var(--warning);
+  --semi-color-warning-hover: var(--warning);
+  --semi-color-warning-active: var(--warning);
+  --semi-color-warning-light-default: var(--warning-soft);
+  --semi-color-danger: var(--destructive);
+  --semi-color-danger-hover: var(--destructive-hover);
+  --semi-color-danger-active: var(--destructive-hover);
+  --semi-color-danger-light-default: var(--destructive-soft);
+  --semi-color-focus-border: var(--accent);
+  --semi-color-link: var(--accent);
+  --semi-color-link-hover: var(--accent-hover);
+  --semi-color-link-active: var(--accent-hover);
+  --semi-color-link-visited: var(--accent);
+  --semi-color-border: var(--border);
+  --semi-color-nav-bg: var(--surface);
+  --semi-color-fill-0: color-mix(in srgb, var(--muted) 62%, transparent);
+  --semi-color-fill-1: var(--muted);
+  --semi-color-fill-2: var(--selection-muted);
+  --semi-color-bg-0: var(--background);
+  --semi-color-bg-1: var(--surface);
+  --semi-color-bg-2: var(--surface-raised);
+  --semi-color-bg-3: var(--surface-raised);
+  --semi-color-bg-4: var(--surface-raised);
+  --semi-color-text-0: var(--foreground);
+  --semi-color-text-1: var(--foreground);
+  --semi-color-text-2: var(--muted-foreground);
+  --semi-color-text-3: var(--subtle-foreground);
+  --semi-color-disabled-text: var(--subtle-foreground);
+  --semi-color-disabled-border: var(--border);
+  --semi-color-disabled-bg: var(--muted);
+  --semi-color-disabled-fill: var(--muted);
+  --semi-color-shadow: rgb(25 28 42 / 6%);
+  --semi-shadow-elevated: var(--shadow-md);
+  --semi-border-radius-small: 8px;
+  --semi-border-radius-medium: 8px;
+  --semi-border-radius-large: 12px;
 }
 
 @media (prefers-contrast: more) {
@@ -83,7 +166,7 @@
     --muted-strong: #c5c5bf;
     --border: #92928b;
     --input: #71716b;
-    --focus: rgb(15 118 110 / 80%);
+    --focus: rgb(91 92 235 / 85%);
   }
 }
 
@@ -95,7 +178,7 @@
     --muted-strong: #555550;
     --border: #777771;
     --input: #92928b;
-    --focus: rgb(121 212 201 / 90%);
+    --focus: rgb(154 155 255 / 92%);
   }
 }
 
@@ -104,6 +187,8 @@
     color: CanvasText;
     background: Canvas;
     --background: Canvas;
+    --canvas-background: Canvas;
+    --sidebar-background: Canvas;
     --surface: Canvas;
     --surface-raised: Canvas;
     --foreground: CanvasText;
@@ -111,6 +196,7 @@
     --subtle-foreground: GrayText;
     --muted: Canvas;
     --muted-strong: GrayText;
+    --selection-muted: Canvas;
     --border: CanvasText;
     --input: CanvasText;
     --primary: ButtonText;
@@ -220,6 +306,29 @@ select {
   border: 3px solid transparent;
   border-radius: 999px;
   background-clip: padding-box;
+}
+
+/*
+ * FlowGram exposes pan/zoom controls in the canvas. Its legacy edge
+ * scrollbars duplicate those controls and visually clash with the Coze-style
+ * floating toolbar, so keep the interaction model canvas-native.
+ */
+.deployment-workflow-canvas .gedit-playground-scroll-bottom,
+.deployment-workflow-canvas .gedit-playground-scroll-right,
+.deployment-workflow-canvas .gedit-playground-scroll-bottom-block,
+.deployment-workflow-canvas .gedit-playground-scroll-right-block {
+  display: none !important;
+}
+
+.deployment-workflow-canvas,
+.deployment-workflow-canvas * {
+  scrollbar-width: none;
+}
+
+.deployment-workflow-canvas *::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
 }
 
 @keyframes spin {

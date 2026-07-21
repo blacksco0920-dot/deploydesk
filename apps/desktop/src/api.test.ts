@@ -63,6 +63,193 @@ describe("browser demo managed infrastructure", () => {
     });
   });
 
+  it("persists canvas layouts independently for every project and deployment path", async () => {
+    const {
+      clearDeploymentPathCanvasLayout,
+      getDeploymentPathCanvasLayout,
+      saveDeploymentPathCanvasLayout,
+    } = await import("./api");
+    const firstLayout = {
+      local: { x: 10, y: 20 },
+      build: { x: 330, y: 21 },
+      registry: { x: 650, y: 22 },
+      server: { x: 970, y: 23 },
+    };
+    const secondPathLayout = {
+      ...firstLayout,
+      local: { x: -120, y: 88 },
+    };
+    const secondProjectLayout = {
+      ...firstLayout,
+      server: { x: 1200.5, y: -40.25 },
+    };
+
+    await saveDeploymentPathCanvasLayout(
+      "/demo/project one",
+      "path/primary",
+      firstLayout,
+    );
+    await saveDeploymentPathCanvasLayout(
+      "/demo/project one",
+      "path/secondary",
+      secondPathLayout,
+    );
+    await saveDeploymentPathCanvasLayout(
+      "/demo/project two",
+      "path/primary",
+      secondProjectLayout,
+    );
+
+    await expect(
+      getDeploymentPathCanvasLayout("/demo/project one", "path/primary"),
+    ).resolves.toEqual(firstLayout);
+    await expect(
+      getDeploymentPathCanvasLayout("/demo/project one", "path/secondary"),
+    ).resolves.toEqual(secondPathLayout);
+    await expect(
+      getDeploymentPathCanvasLayout("/demo/project two", "path/primary"),
+    ).resolves.toEqual(secondProjectLayout);
+
+    await clearDeploymentPathCanvasLayout("/demo/project one", "path/primary");
+    await expect(
+      getDeploymentPathCanvasLayout("/demo/project one", "path/primary"),
+    ).resolves.toBeNull();
+    await expect(
+      getDeploymentPathCanvasLayout("/demo/project one", "path/secondary"),
+    ).resolves.toEqual(secondPathLayout);
+  });
+
+  it("rejects malformed, incomplete, unknown, and non-finite canvas coordinates", async () => {
+    const {
+      getDeploymentPathCanvasLayout,
+      saveDeploymentPathCanvasLayout,
+      setAppSetting,
+    } = await import("./api");
+    const projectPath = "/demo/layout-validation";
+    const pathId = "path-validation";
+    const settingKey = `project.${encodeURIComponent(projectPath)}.deployment-path.${encodeURIComponent(pathId)}.canvas-layout.v1`;
+    const validLayout = {
+      local: { x: 10, y: 20 },
+      build: { x: 330, y: 20 },
+      registry: { x: 650, y: 20 },
+      server: { x: 970, y: 20 },
+    };
+    const invalidSerializedLayouts = [
+      "{not-json",
+      JSON.stringify({ ...validLayout, server: undefined }),
+      JSON.stringify({
+        local: validLayout.local,
+        build: validLayout.build,
+        registry: validLayout.registry,
+        stranger: validLayout.server,
+      }),
+      JSON.stringify({
+        ...validLayout,
+        local: { x: "10", y: 20 },
+      }),
+      `{"local":{"x":1e999,"y":20},"build":{"x":330,"y":20},"registry":{"x":650,"y":20},"server":{"x":970,"y":20}}`,
+      JSON.stringify({
+        ...validLayout,
+        server: { x: 970, y: 20, z: 30 },
+      }),
+    ];
+
+    for (const serialized of invalidSerializedLayouts) {
+      await setAppSetting(settingKey, serialized);
+      await expect(
+        getDeploymentPathCanvasLayout(projectPath, pathId),
+      ).resolves.toBeNull();
+    }
+
+    await expect(
+      saveDeploymentPathCanvasLayout(projectPath, pathId, {
+        ...validLayout,
+        server: { x: Number.POSITIVE_INFINITY, y: 20 },
+      }),
+    ).rejects.toThrow("部署线路画布布局无效");
+  });
+
+  it("clears a deployment path canvas layout after deleting the path", async () => {
+    const {
+      deleteDeploymentPath,
+      getDeploymentPathCanvasLayout,
+      listDeploymentPaths,
+      saveDeploymentPath,
+      saveDeploymentPathCanvasLayout,
+    } = await import("./api");
+    const projectPath = "/demo/delete-layout";
+    const pathId = "path-delete-layout";
+    await saveDeploymentPath({
+      id: pathId,
+      projectPath,
+      name: "待删除线路",
+      sourceConnectionId: null,
+      registryConnectionId: null,
+      serverId: null,
+      configProfileIds: [],
+      address: "",
+      routes: [],
+    });
+    await saveDeploymentPathCanvasLayout(projectPath, pathId, {
+      local: { x: 10, y: 20 },
+      build: { x: 330, y: 20 },
+      registry: { x: 650, y: 20 },
+      server: { x: 970, y: 20 },
+    });
+
+    await expect(deleteDeploymentPath(projectPath, pathId)).resolves.toBe(true);
+    await expect(listDeploymentPaths(projectPath)).resolves.toEqual([]);
+    await expect(
+      getDeploymentPathCanvasLayout(projectPath, pathId),
+    ).resolves.toBeNull();
+  });
+
+  it("keeps a successful path deletion authoritative when layout cleanup fails", async () => {
+    const {
+      deleteDeploymentPath,
+      listDeploymentPaths,
+      saveDeploymentPath,
+      saveDeploymentPathCanvasLayout,
+    } = await import("./api");
+    const projectPath = "/demo/delete-layout-cleanup-failure";
+    const pathId = "path-cleanup-failure";
+    await saveDeploymentPath({
+      id: pathId,
+      projectPath,
+      name: "清理失败线路",
+      sourceConnectionId: null,
+      registryConnectionId: null,
+      serverId: null,
+      configProfileIds: [],
+      address: "",
+      routes: [],
+    });
+    await saveDeploymentPathCanvasLayout(projectPath, pathId, {
+      local: { x: 10, y: 20 },
+      build: { x: 330, y: 20 },
+      registry: { x: 650, y: 20 },
+      server: { x: 970, y: 20 },
+    });
+
+    const originalSetItem = Storage.prototype.setItem;
+    const setItem = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementation(function (this: Storage, key, value) {
+        if (key.endsWith(".canvas-layout.v1")) {
+          throw new Error("layout storage unavailable");
+        }
+        return originalSetItem.call(this, key, value);
+      });
+    try {
+      await expect(deleteDeploymentPath(projectPath, pathId)).resolves.toBe(
+        true,
+      );
+      await expect(listDeploymentPaths(projectPath)).resolves.toEqual([]);
+    } finally {
+      setItem.mockRestore();
+    }
+  });
+
   it("lists stable connection resources and never returns stored credential material", async () => {
     const path = "/demo/connection-resources";
     localStorage.setItem(

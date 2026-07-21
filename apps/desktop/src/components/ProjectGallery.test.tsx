@@ -3,9 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { RecentProject } from "../types";
 import { ProjectGallery } from "./ProjectGallery";
 
-function project(
-  overrides: Partial<RecentProject> = {},
-): RecentProject {
+function project(overrides: Partial<RecentProject> = {}): RecentProject {
   return {
     activeRunCount: 0,
     currentStep: "workspace",
@@ -48,18 +46,79 @@ describe("ProjectGallery", () => {
     expect(
       screen.getByRole("heading", { name: "所有项目" }),
     ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "添加项目" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "添加项目" }),
+    ).toBeInTheDocument();
+    const pageHeader = screen.getByRole("banner");
+    expect(pageHeader).toContainElement(
+      screen.getByRole("heading", { name: "所有项目" }),
+    );
+    expect(pageHeader).toContainElement(
+      screen.getByRole("textbox", { name: "搜索项目" }),
+    );
     expect(
       screen.getByRole("button", { name: /示例商城，已经上线/ }),
     ).toBeInTheDocument();
     expect(screen.getByText("3 个服务")).toBeInTheDocument();
+    expect(screen.getByText("打开工作流 ›")).toBeInTheDocument();
     expect(screen.queryByText("运行记录")).not.toBeInTheDocument();
     expect(screen.queryByText(/本机环境/)).not.toBeInTheDocument();
 
-    fireEvent.click(
-      screen.getByRole("button", { name: /示例商城，已经上线/ }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: /示例商城，已经上线/ }));
     expect(onOpen).toHaveBeenCalledWith(current);
+  });
+
+  it("项目卡片直接给出与当前状态一致的下一步", () => {
+    renderGallery([
+      project(),
+      project({
+        id: "attention",
+        latestStatus: "failed",
+        name: "需要处理的项目",
+        path: "/projects/attention",
+      }),
+      project({
+        id: "setup",
+        latestEnvironment: null,
+        latestStatus: null,
+        name: "待设置项目",
+        path: "/projects/setup",
+      }),
+    ]);
+
+    expect(screen.getByText("打开工作流 ›")).toBeInTheDocument();
+    expect(screen.getByText("继续处理 ›")).toBeInTheDocument();
+    expect(screen.getByText("继续设置 ›")).toBeInTheDocument();
+  });
+
+  it("只有真实上线成功的项目使用绿色成功状态，未开始项目保持中性", () => {
+    renderGallery([
+      project(),
+      project({
+        id: "not-started",
+        latestEnvironment: null,
+        latestStatus: null,
+        name: "尚未开始项目",
+        path: "/projects/not-started",
+      }),
+    ]);
+
+    const onlineCard = screen
+      .getByRole("button", { name: /示例商城，已经上线/ })
+      .closest("article");
+    const notStartedCard = screen
+      .getByRole("button", { name: /尚未开始项目，尚未开始上线/ })
+      .closest("article");
+
+    expect(onlineCard?.querySelector("[data-project-status-tone]")).toHaveAttribute(
+      "data-project-status-tone",
+      "success",
+    );
+    expect(
+      notStartedCard?.querySelector("[data-project-status-tone]"),
+    ).toHaveAttribute("data-project-status-tone", "neutral");
+    expect(notStartedCard?.querySelector(".lucide-check-circle-2")).toBeNull();
+    expect(notStartedCard?.querySelector(".lucide-circle")).not.toBeNull();
   });
 
   it("搜索和状态筛选只改变项目卡片，不引入额外一级页面", () => {
@@ -96,13 +155,12 @@ describe("ProjectGallery", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("隐藏项目需要二次确认且明确只移除入口", () => {
+  it("隐藏项目需要通过真实菜单二次确认且明确只移除入口", async () => {
     const current = project();
     const { onForget } = renderGallery([current]);
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "从列表隐藏 示例商城" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "项目操作：示例商城" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "从列表隐藏" }));
     const dialog = screen.getByRole("dialog");
     expect(
       within(dialog).getByRole("heading", {
@@ -112,6 +170,8 @@ describe("ProjectGallery", () => {
     expect(dialog).toHaveTextContent("项目代码、连接、线路和上线记录都会保留");
     fireEvent.click(within(dialog).getByRole("button", { name: "从列表隐藏" }));
     expect(onForget).toHaveBeenCalledWith(current);
+    // Semi Dropdown defers its final position cleanup to a short timer.
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
   });
 
   it("没有项目时给出唯一的添加动作", () => {

@@ -1,6 +1,7 @@
 import {
   AlertCircle,
   CheckCircle2,
+  Circle,
   Clock3,
   FolderOpen,
   LoaderCircle,
@@ -9,6 +10,7 @@ import {
   Search,
   Trash2,
 } from "lucide-react";
+import SemiDropdown from "@douyinfe/semi-ui/lib/es/dropdown";
 import { useMemo, useState } from "react";
 import type { DeploymentRun, RecentProject } from "../types";
 import {
@@ -90,6 +92,11 @@ export function ProjectGallery({
           verificationTask,
         );
         return {
+          action: projectCardAction(
+            project,
+            state,
+            releaseReady.has(project.path),
+          ),
           project,
           state,
           status: recentProjectStatus(
@@ -132,41 +139,44 @@ export function ProjectGallery({
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--background)]">
       <header
-        className="flex h-14 shrink-0 items-center justify-end border-b border-[var(--border)] bg-[var(--surface)] px-5"
+        className="h-[52px] shrink-0 border-b border-[var(--border)] bg-[var(--surface)] px-6"
         data-tauri-drag-region
       >
-        <div className="flex items-center gap-2">
-          <label className="relative block w-56">
-            <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-[var(--subtle-foreground)]" />
-            <Input
-              aria-label="搜索项目"
-              className="pl-9"
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="搜索项目"
-              value={query}
-            />
-          </label>
-          <Button disabled={selectingProject} onClick={onSelect}>
-            {selectingProject ? (
-              <LoaderCircle className="animate-spin-slow" />
-            ) : (
-              <Plus />
-            )}
-            添加项目
-          </Button>
-        </div>
-      </header>
-
-      <main className="min-h-0 flex-1 overflow-auto px-7 py-7">
-        <div className="mx-auto w-full max-w-[1440px]">
-          <div>
-            <h1 className="m-0 text-2xl font-semibold">所有项目</h1>
-            <p className="mt-2 text-sm text-[var(--muted-foreground)]">
+        <div className="mx-auto flex h-full w-full max-w-[1440px] items-center justify-between gap-6">
+          <div className="min-w-0">
+            <h1 className="m-0 truncate text-base font-semibold leading-5">
+              所有项目
+            </h1>
+            <p className="m-0 mt-0.5 truncate text-xs leading-4 text-[var(--muted-foreground)]">
               选择一个项目继续上线，或从电脑添加新的项目。
             </p>
           </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <label className="relative block w-56">
+              <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-[var(--subtle-foreground)]" />
+              <Input
+                aria-label="搜索项目"
+                className="pl-9"
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="搜索项目"
+                value={query}
+              />
+            </label>
+            <Button disabled={selectingProject} onClick={onSelect}>
+              {selectingProject ? (
+                <LoaderCircle className="animate-spin-slow" />
+              ) : (
+                <Plus />
+              )}
+              添加项目
+            </Button>
+          </div>
+        </div>
+      </header>
 
-          <div className="mt-5 flex items-center gap-2">
+      <main className="min-h-0 flex-1 overflow-auto px-6 pb-6 pt-4">
+        <div className="mx-auto w-full max-w-[1440px]">
+          <div className="flex items-center gap-2">
             {(
               [
                 ["all", "全部"],
@@ -218,7 +228,7 @@ export function ProjectGallery({
               aria-label="项目列表"
               className="mt-5 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4"
             >
-              {projectCards.map(({ project, state, status }) => (
+              {projectCards.map(({ action, project, state, status }) => (
                 <article
                   className="group relative min-h-[164px] rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 shadow-sm transition-shadow hover:shadow-md"
                   key={project.id}
@@ -231,44 +241,66 @@ export function ProjectGallery({
                   />
                   <div className="relative pointer-events-none flex items-start justify-between gap-4">
                     <div className="min-w-0">
-                      <h2 className="m-0 truncate text-base font-semibold">
+                      <h2 className="m-0 truncate text-sm font-semibold leading-5">
                         {project.name}
                       </h2>
                       <p className="mt-1 truncate text-xs text-[var(--muted-foreground)]">
                         {project.path}
                       </p>
                     </div>
-                    <span className="grid size-11 shrink-0 place-items-center rounded-xl bg-[var(--accent-soft)] text-[var(--accent)]">
+                    <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-[var(--accent-soft)] text-[var(--accent)]">
                       <FolderOpen className="size-5" />
                     </span>
                   </div>
                   <div className="relative pointer-events-none mt-6 flex items-center gap-2 text-xs">
-                    <ProjectStatusIcon state={state} />
+                    <ProjectStatusIcon project={project} state={state} />
                     <span>{status}</span>
                   </div>
-                  <div className="relative pointer-events-none mt-4 flex items-center justify-between border-t border-[var(--border)] pt-3 text-[11px] text-[var(--subtle-foreground)]">
-                    <span>{project.serviceCount} 个服务</span>
-                    <span className="inline-flex items-center gap-1">
-                      <Clock3 className="size-3" />
-                      {formatRelativeTime(project.lastOpenedAt)}
+                  <div className="relative pointer-events-none mt-4 flex items-center justify-between gap-3 border-t border-[var(--border)] pt-3 text-xs">
+                    <span className="inline-flex min-w-0 items-center gap-2 text-[var(--subtle-foreground)]">
+                      <span className="shrink-0">
+                        {project.serviceCount} 个服务
+                      </span>
+                      <span className="inline-flex min-w-0 items-center gap-1 truncate">
+                        <Clock3 className="size-3" />
+                        {formatRelativeTime(project.lastOpenedAt)}
+                      </span>
+                    </span>
+                    <span className="shrink-0 font-medium text-[var(--accent)] transition-opacity group-hover:opacity-0 group-focus-within:opacity-0">
+                      {action} ›
                     </span>
                   </div>
-                  <Button
-                    aria-label={`从列表隐藏 ${project.name}`}
-                    className="absolute bottom-2 right-2 z-10 opacity-0 group-hover:opacity-100 focus:opacity-100"
-                    onClick={() => setPendingRemoval(project)}
-                    size="icon"
-                    variant="ghost"
+                  <SemiDropdown
+                    position="bottomRight"
+                    render={
+                      <SemiDropdown.Menu>
+                        <SemiDropdown.Item
+                          icon={<Trash2 className="size-3.5" />}
+                          onClick={() => setPendingRemoval(project)}
+                          type="danger"
+                        >
+                          从列表隐藏
+                        </SemiDropdown.Item>
+                      </SemiDropdown.Menu>
+                    }
+                    trigger="click"
                   >
-                    <MoreHorizontal />
-                  </Button>
+                    <Button
+                      aria-label={`项目操作：${project.name}`}
+                      className="absolute bottom-2 right-2 z-10 opacity-0 transition-opacity group-hover:opacity-100 focus:opacity-100"
+                      size="icon"
+                      variant="ghost"
+                    >
+                      <MoreHorizontal />
+                    </Button>
+                  </SemiDropdown>
                 </article>
               ))}
             </section>
           ) : (
             <section className="mt-5 flex min-h-[320px] flex-col items-center justify-center rounded-xl border border-dashed border-[var(--border)] bg-[var(--surface)] text-center">
               <FolderOpen className="size-6 text-[var(--subtle-foreground)]" />
-              <h2 className="mb-0 mt-4 text-base font-semibold">
+              <h2 className="mb-0 mt-4 text-sm font-semibold">
                 {projects.length ? "没有匹配的项目" : "添加第一个项目"}
               </h2>
               <p className="mb-5 mt-2 text-sm text-[var(--muted-foreground)]">
@@ -319,14 +351,56 @@ export function ProjectGallery({
   );
 }
 
-function ProjectStatusIcon({ state }: { state: ProjectListState }) {
+function projectCardAction(
+  project: RecentProject,
+  state: ProjectListState,
+  releaseReady: boolean,
+) {
+  if (state === "automatic") return "查看进度";
+  if (state === "user-action") return "继续处理";
+  if (releaseReady) return "开始上线";
+  if (project.latestStatus === "success") return "打开工作流";
+  return "继续设置";
+}
+
+function ProjectStatusIcon({
+  project,
+  state,
+}: {
+  project: RecentProject;
+  state: ProjectListState;
+}) {
+  let tone: "neutral" | "processing" | "success" | "warning" = "neutral";
+  if (state === "automatic") tone = "processing";
+  else if (state === "user-action") tone = "warning";
+  else if (project.latestStatus === "success") tone = "success";
+
   if (state === "automatic") {
-    return <LoaderCircle className="size-3.5 animate-spin-slow text-[var(--accent)]" />;
+    return (
+      <span aria-hidden="true" data-project-status-tone={tone}>
+        <LoaderCircle className="size-3.5 animate-spin-slow text-[var(--accent)]" />
+      </span>
+    );
   }
   if (state === "user-action") {
-    return <AlertCircle className="size-3.5 text-[var(--warning)]" />;
+    return (
+      <span aria-hidden="true" data-project-status-tone={tone}>
+        <AlertCircle className="size-3.5 text-[var(--warning)]" />
+      </span>
+    );
   }
-  return <CheckCircle2 className="size-3.5 text-[var(--success)]" />;
+  if (tone === "success") {
+    return (
+      <span aria-hidden="true" data-project-status-tone={tone}>
+        <CheckCircle2 className="size-3.5 text-[var(--success)]" />
+      </span>
+    );
+  }
+  return (
+    <span aria-hidden="true" data-project-status-tone={tone}>
+      <Circle className="size-3.5 text-[var(--subtle-foreground)]" />
+    </span>
+  );
 }
 
 function formatRelativeTime(value: string) {
@@ -337,5 +411,7 @@ function formatRelativeTime(value: string) {
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `${hours} 小时前`;
   const days = Math.floor(hours / 24);
-  return days < 30 ? `${days} 天前` : new Date(value).toLocaleDateString("zh-CN");
+  return days < 30
+    ? `${days} 天前`
+    : new Date(value).toLocaleDateString("zh-CN");
 }

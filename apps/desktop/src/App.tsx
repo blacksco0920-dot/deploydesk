@@ -1466,7 +1466,7 @@ function App() {
   );
 }
 
-function ProjectLoadingState({
+export function ProjectLoadingState({
   mode,
   path,
   project,
@@ -1479,44 +1479,48 @@ function ProjectLoadingState({
   const name =
     project?.name ?? path.split(/[\\/]/).filter(Boolean).pop() ?? "项目";
   return (
-    <div className="grid h-full min-h-0 grid-rows-[58px_minmax(0,1fr)] bg-[var(--background)]">
-      <header className="flex items-center border-b border-[var(--border)] bg-[var(--surface)] px-6">
+    <div className="grid h-full min-h-0 grid-rows-[52px_minmax(0,1fr)] bg-[var(--canvas-background)]">
+      <header className="flex items-center justify-between gap-4 border-b border-[var(--border)] bg-[var(--surface)] px-4">
         <div className="min-w-0">
-          <strong className="block truncate text-sm font-semibold">
+          <strong className="block truncate text-sm font-semibold leading-5">
             {name}
           </strong>
-          <span className="block max-w-[540px] truncate text-[11px] text-[var(--muted-foreground)]">
-            {path}
+          <span className="block truncate text-xs leading-4 text-[var(--muted-foreground)]">
+            部署工作流
           </span>
         </div>
+        <span className="inline-flex shrink-0 items-center gap-2 text-xs text-[var(--muted-foreground)]">
+          <LoaderCircle className="size-3.5 animate-spin-slow text-[var(--accent)]" />
+          正在准备
+        </span>
       </header>
-      <main className="min-h-0 overflow-auto">
-        <div className="mx-auto w-full max-w-[1060px] px-6 py-7">
-          <div className="mb-8 flex min-h-11 items-center gap-6 border-b border-[var(--border)]">
-            {["发布中心", "在本机运行", "版本", "项目设置"].map((label) => (
-              <div
-                className="py-3 text-sm text-[var(--muted-foreground)]"
-                key={label}
-              >
-                {label}
-              </div>
-            ))}
+      <main
+        className="grid min-h-0 place-items-center px-6"
+        style={{
+          backgroundImage:
+            "radial-gradient(circle, rgba(126,128,145,.22) 1px, transparent 1px)",
+          backgroundSize: "18px 18px",
+        }}
+      >
+        <section
+          aria-live="polite"
+          className="flex w-full max-w-[360px] items-start gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 shadow-sm"
+        >
+          <LoaderCircle className="mt-0.5 size-4 shrink-0 animate-spin-slow text-[var(--accent)]" />
+          <div className="min-w-0">
+            <h1 className="m-0 text-sm font-semibold leading-5">
+              {recognizing ? "正在读取项目" : "正在恢复工作流"}
+            </h1>
+            <p className="mb-0 mt-1 text-xs leading-5 text-[var(--muted-foreground)]">
+              {recognizing
+                ? "正在识别项目服务，完成后会直接显示部署线路。"
+                : "正在恢复上次保存的线路和画布位置，不会重新执行上线。"}
+            </p>
+            <p className="mb-0 mt-2 truncate text-[11px] leading-4 text-[var(--subtle-foreground)]">
+              {path}
+            </p>
           </div>
-          <h1 className="m-0 text-[28px] font-semibold leading-tight">
-            {recognizing ? "正在识别项目" : "正在恢复项目"}
-          </h1>
-          <p className="mt-2 text-sm leading-6 text-[var(--muted-foreground)]">
-            {recognizing
-              ? "正在只读检查项目结构和服务，不会运行项目代码，也不会读取配置值。"
-              : "已经找到上次打开的位置，正在读取项目服务、版本和部署记录。"}
-          </p>
-          <div className="mt-6 flex items-center gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-5 py-5 text-sm text-[var(--muted-foreground)]">
-            <LoaderCircle className="size-5 shrink-0 animate-spin-slow text-[var(--accent)]" />
-            {recognizing
-              ? "识别完成后会告诉你发现了什么，以及下一步需要做什么。"
-              : "页面准备好后会在这里直接恢复，不会重新执行部署。"}
-          </div>
-        </div>
+        </section>
       </main>
     </div>
   );

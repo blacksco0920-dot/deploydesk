@@ -18,7 +18,34 @@ const projects = [
 ];
 
 let currentProjectId = null;
+let lineSequence = 0;
 const runStepMs = window.__PROTOTYPE_TEST__ ? 5 : 900;
+const lineStoragePrefix = "abcdeploy.prototype.lines.v1";
+const lineSelectionStoragePrefix = "abcdeploy.prototype.selected-line.v1";
+const linePositionStoragePrefix = "abcdeploy.prototype.node-positions.v1";
+const NODE_WIDTH = 200;
+const NODE_HEIGHT = 118;
+
+const defaultDeploymentLines = [
+  {
+    id: "online",
+    name: "上线",
+    target: "119.91.112.80",
+    connection: "腾讯云新服务器",
+    detail: "119.91.112.80 · ubuntu",
+    fact: "3 个服务 · 3 个地址",
+    healthy: true,
+  },
+  {
+    id: "test",
+    name: "测试服务器",
+    target: "42.193.229.35",
+    connection: "测试服务器",
+    detail: "42.193.229.35 · ubuntu",
+    fact: "3 个服务 · 1 个地址",
+    healthy: false,
+  },
+];
 
 const providerCatalog = {
   source: {
@@ -77,13 +104,12 @@ const providerCatalog = {
 
 const nodePositions = {
   source: [80, 280],
-  build: [350, 280],
-  artifact: [620, 280],
-  deploy: [890, 280],
-  deployBranch: [890, 500],
+  build: [324, 280],
+  artifact: [568, 280],
+  deploy: [812, 280],
 };
 
-function makeNode(id, type, hidden = false) {
+function makeNode(id, type) {
   const meta = providerCatalog[type];
   return {
     id,
@@ -96,7 +122,6 @@ function makeNode(id, type, hidden = false) {
     fact: meta.fact,
     config: "ready",
     run: "idle",
-    hidden,
   };
 }
 
@@ -105,25 +130,26 @@ const nodes = {
   build: makeNode("build", "build"),
   artifact: makeNode("artifact", "artifact"),
   deploy: makeNode("deploy", "deploy"),
-  deployBranch: makeNode("deployBranch", "deploy", true),
 };
 
 const edges = [
   ["source", "build"],
   ["build", "artifact"],
   ["artifact", "deploy"],
-  ["artifact", "deployBranch"],
 ];
 
 const state = {
   selectedNode: "build",
+  selectedLine: "online",
   inspectorMode: "view",
+  canvasTool: "select",
   scenario: "ready",
   zoom: 0.86,
   panX: 16,
   panY: 36,
   timers: [],
   selectedCandidate: null,
+  managingLine: null,
 };
 
 const studioBody = $("#studioBody");
@@ -134,9 +160,7 @@ const edgeLayer = $("#edgeLayer");
 const inspectorContent = $("#inspectorContent");
 const inspectorFooter = $("#inspectorFooter");
 const inspectorTitle = $("#inspectorTitle");
-const inspectorType = $("#inspectorType");
 const inspectorIcon = $("#inspectorIcon");
-const nodeLibrary = $("#nodeLibrary");
 const runButton = $("#runButton");
 const runButtonText = $("#runButtonText");
 const scenarioSelect = $("#scenarioSelect");
@@ -148,9 +172,254 @@ const projectSearch = $("#projectSearch");
 const addProjectDialog = $("#addProjectDialog");
 const runConfirmDialog = $("#runConfirmDialog");
 const successDialog = $("#successDialog");
+const lineList = $("#lineList");
+const renameLineDialog = $("#renameLineDialog");
+const deleteLineDialog = $("#deleteLineDialog");
 
 function currentProject() {
   return projects.find((project) => project.id === currentProjectId) || null;
+}
+
+function lineStorageKey(projectId) {
+  return `${lineStoragePrefix}:${projectId}`;
+}
+
+function lineSelectionStorageKey(projectId) {
+  return `${lineSelectionStoragePrefix}:${projectId}`;
+}
+
+function linePositionStorageKey(projectId, lineId) {
+  return `${linePositionStoragePrefix}:${projectId}:${lineId}`;
+}
+
+function readStoredJson(key) {
+  try {
+    const value = window.localStorage.getItem(key);
+    return value ? JSON.parse(value) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredJson(key, value) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // 原型仍可在禁用本地存储的浏览器环境中使用，只是不跨刷新保留。
+  }
+}
+
+function readStoredValue(key) {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredValue(key, value) {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // 与 writeStoredJson 保持同样的降级策略。
+  }
+}
+
+function removeStoredValue(key) {
+  try {
+    window.localStorage.removeItem(key);
+  } catch {
+    // 删除失败不阻断当前页面里的线路管理。
+  }
+}
+
+function normalizeLine(line, index) {
+  if (!line || typeof line !== "object") return null;
+  const id = typeof line.id === "string" && /^[a-zA-Z0-9_-]+$/.test(line.id) ? line.id : `restored-${index + 1}`;
+  return {
+    id,
+    name: typeof line.name === "string" && line.name.trim() ? line.name.trim().slice(0, 24) : `部署线路 ${index + 1}`,
+    target: typeof line.target === "string" && line.target ? line.target : "尚未绑定服务器",
+    connection: typeof line.connection === "string" && line.connection ? line.connection : "尚未选择服务器",
+    detail: typeof line.detail === "string" ? line.detail : "",
+    fact: typeof line.fact === "string" ? line.fact : "等待设置访问地址",
+    healthy: Boolean(line.healthy),
+  };
+}
+
+function defaultLinesForProject(project) {
+  const count = project.id === "demo-shop" ? 2 : 1;
+  return defaultDeploymentLines.slice(0, count).map((line) => ({ ...line }));
+}
+
+function ensureProjectLines(project) {
+  if (Array.isArray(project.lines)) return project.lines;
+  const stored = readStoredJson(lineStorageKey(project.id));
+  const seen = new Set();
+  const restored = Array.isArray(stored)
+    ? stored
+      .map(normalizeLine)
+      .filter((line) => line && !seen.has(line.id) && seen.add(line.id))
+    : [];
+  project.lines = Array.isArray(stored) ? restored : defaultLinesForProject(project);
+  return project.lines;
+}
+
+function saveProjectLines(project = currentProject()) {
+  if (!project) return;
+  writeStoredJson(lineStorageKey(project.id), ensureProjectLines(project));
+}
+
+function currentLine() {
+  const project = currentProject();
+  return project ? ensureProjectLines(project).find((line) => line.id === state.selectedLine) || null : null;
+}
+
+function serializeNodePositions() {
+  return Object.fromEntries(Object.entries(nodes).map(([id, node]) => [id, { x: node.x, y: node.y }]));
+}
+
+function saveCurrentLinePositions() {
+  const project = currentProject();
+  const line = currentLine();
+  if (!project || !line) return;
+  writeStoredJson(linePositionStorageKey(project.id, line.id), serializeNodePositions());
+}
+
+function restoreCurrentLinePositions() {
+  const project = currentProject();
+  const line = currentLine();
+  for (const [id, node] of Object.entries(nodes)) {
+    node.x = nodePositions[id][0];
+    node.y = nodePositions[id][1];
+  }
+  if (!project || !line) return;
+  const saved = readStoredJson(linePositionStorageKey(project.id, line.id));
+  if (!saved || typeof saved !== "object") return;
+  Object.entries(saved).forEach(([id, position]) => {
+    if (!nodes[id] || !position || !Number.isFinite(position.x) || !Number.isFinite(position.y)) return;
+    nodes[id].x = Math.max(20, position.x);
+    nodes[id].y = Math.max(90, position.y);
+  });
+}
+
+function applyCurrentLineDetails() {
+  const line = currentLine();
+  studioBody.classList.toggle("no-lines", !line);
+  if (!line) {
+    $("#canvasLineName").textContent = "暂无线路";
+    return;
+  }
+  nodes.deploy.connection = line.connection;
+  nodes.deploy.detail = line.detail;
+  nodes.deploy.fact = line.fact;
+  $("#canvasLineName").textContent = line.name;
+}
+
+function renderLineList() {
+  const project = currentProject();
+  if (!project) {
+    lineList.innerHTML = "";
+    return;
+  }
+  const lines = ensureProjectLines(project);
+  lineList.innerHTML = lines.length ? lines.map((line) => `
+    <div class="line-row ${line.id === state.selectedLine ? "active" : ""}" data-line-row="${escapeHtml(line.id)}">
+      <button class="line-select" type="button" data-line="${escapeHtml(line.id)}" aria-label="打开线路：${escapeHtml(line.name)}" aria-current="${line.id === state.selectedLine ? "true" : "false"}">
+        <span class="line-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="7" r="2"/><circle cx="18" cy="17" r="2"/><path d="M8 7h3a4 4 0 0 1 4 4v2a4 4 0 0 0 3 4"/></svg></span>
+        <span class="line-copy"><strong>${escapeHtml(line.name)}</strong><small>${escapeHtml(line.target)}</small></span>
+        <i class="line-health ${line.healthy ? "healthy" : ""}" aria-hidden="true"></i>
+      </button>
+      <span class="line-actions">
+        <button class="line-more" type="button" data-line-more="${escapeHtml(line.id)}" aria-label="管理线路：${escapeHtml(line.name)}" aria-expanded="false" title="更多操作">•••</button>
+        <span class="line-menu" role="menu">
+          <button type="button" role="menuitem" data-line-action="rename" data-line-id="${escapeHtml(line.id)}">重命名</button>
+          <button class="danger" type="button" role="menuitem" data-line-action="delete" data-line-id="${escapeHtml(line.id)}">删除线路</button>
+        </span>
+      </span>
+    </div>`).join("") : `
+    <div class="line-list-empty">
+      <strong>暂无线路</strong>
+      <small>创建后自动生成固定四节点</small>
+      <button type="button" data-create-line>创建线路</button>
+    </div>`;
+
+  $$('[data-line]', lineList).forEach((button) => button.addEventListener("click", () => switchLine(button.dataset.line)));
+  $$('[data-line-more]', lineList).forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const row = button.closest(".line-row");
+    const opening = !row.classList.contains("menu-open");
+    $$(".line-row.menu-open", lineList).forEach((item) => {
+      item.classList.remove("menu-open");
+      $("[data-line-more]", item)?.setAttribute("aria-expanded", "false");
+    });
+    row.classList.toggle("menu-open", opening);
+    button.setAttribute("aria-expanded", String(opening));
+  }));
+  $$('[data-line-action="rename"]', lineList).forEach((button) => button.addEventListener("click", () => openRenameLine(button.dataset.lineId)));
+  $$('[data-line-action="delete"]', lineList).forEach((button) => button.addEventListener("click", () => openDeleteLine(button.dataset.lineId)));
+  $$('[data-create-line]', lineList).forEach((button) => button.addEventListener("click", createDeploymentLine));
+}
+
+function switchLine(lineId, { savePrevious = true } = {}) {
+  const project = currentProject();
+  if (!project || !ensureProjectLines(project).some((line) => line.id === lineId)) return;
+  if (savePrevious && state.selectedLine !== lineId) saveCurrentLinePositions();
+  state.selectedLine = lineId;
+  if (!state.selectedNode || !nodes[state.selectedNode]) state.selectedNode = "build";
+  studioBody.classList.remove("no-lines");
+  writeStoredValue(lineSelectionStorageKey(project.id), lineId);
+  restoreCurrentLinePositions();
+  applyCurrentLineDetails();
+  renderLineList();
+  renderNodes();
+  renderInspector();
+  updateRunButton();
+  window.requestAnimationFrame(fitCanvas);
+}
+
+function openRenameLine(lineId = state.selectedLine) {
+  const project = currentProject();
+  const line = project && ensureProjectLines(project).find((item) => item.id === lineId);
+  if (!line) return;
+  state.managingLine = lineId;
+  $("#renameLineInput").value = line.name;
+  openDialog(renameLineDialog);
+  window.setTimeout(() => $("#renameLineInput").select(), 0);
+}
+
+function openDeleteLine(lineId) {
+  const project = currentProject();
+  if (!project) return;
+  const lines = ensureProjectLines(project);
+  const line = lines.find((item) => item.id === lineId);
+  if (!line) return;
+  state.managingLine = lineId;
+  $("#deleteLineName").textContent = line.name;
+  openDialog(deleteLineDialog);
+}
+
+function createDeploymentLine() {
+  const project = currentProject();
+  if (!project) return;
+  const lines = ensureProjectLines(project);
+  const template = currentLine() || defaultDeploymentLines[0];
+  let id;
+  do {
+    lineSequence += 1;
+    id = `line-${Date.now()}-${lineSequence}`;
+  } while (lines.some((line) => line.id === id));
+  const line = {
+    ...template,
+    id,
+    name: `新部署线路 ${lines.length + 1}`,
+    healthy: false,
+  };
+  lines.push(line);
+  saveProjectLines(project);
+  switchLine(id);
+  openRenameLine(id);
+  showToast("新线路已生成固定四节点，可直接选择连接并调整布局");
 }
 
 function openDialog(dialog) {
@@ -220,6 +489,7 @@ function showHomePage(page = "projects") {
 }
 
 function showHome(page = "projects") {
+  saveCurrentLinePositions();
   persistCurrentWorkflow();
   workflowView.hidden = true;
   homeView.hidden = false;
@@ -252,7 +522,7 @@ function persistCurrentWorkflow() {
   if (!project) return;
   project.nodeState = serializeNodes();
   if (project.status !== "online" && project.status !== "running" && project.status !== "failed") {
-    project.status = visibleNodes().every((node) => node.config === "ready") ? "ready" : "setup";
+    project.status = currentLine() && visibleNodes().every((node) => node.config === "ready") ? "ready" : "setup";
   }
 }
 
@@ -261,9 +531,24 @@ function openWorkflow(projectId) {
   if (!project) return;
   const resumingLiveRun = currentProjectId === projectId && project.status === "running" && state.timers.length > 0;
   currentProjectId = projectId;
+  const lines = ensureProjectLines(project);
+  const storedLine = readStoredValue(lineSelectionStorageKey(project.id));
+  state.selectedLine = lines.some((line) => line.id === storedLine) ? storedLine : lines[0]?.id || null;
   homeView.hidden = true;
   workflowView.hidden = false;
   $("#workflowProjectName").textContent = project.name;
+  if (!state.selectedLine) {
+    clearTimers();
+    state.selectedNode = null;
+    removeStoredValue(lineSelectionStorageKey(project.id));
+    studioBody.classList.add("no-lines", "inspector-closed");
+    applyCurrentLineDetails();
+    renderLineList();
+    renderNodes();
+    renderInspector();
+    updateRunButton();
+    return;
+  }
   if (!resumingLiveRun) {
     if (project.nodeState) {
       clearTimers();
@@ -271,6 +556,7 @@ function openWorkflow(projectId) {
       syncCurrentProjectToSource();
       const firstBroken = visibleNodes().find((node) => node.config !== "ready");
       selectNode(firstBroken?.id || "build");
+      if (!firstBroken && project.status !== "running") studioBody.classList.add("inspector-closed");
       renderNodes();
       updateRunButton();
     } else {
@@ -283,11 +569,17 @@ function openWorkflow(projectId) {
     updateRunButton();
   }
   scenarioSelect.value = project.status === "running" ? "running" : project.scenario || (project.status === "online" ? "ready" : "setup");
+  restoreCurrentLinePositions();
+  applyCurrentLineDetails();
+  renderLineList();
+  renderNodes();
+  renderInspector();
+  updateRunButton();
   window.requestAnimationFrame(fitCanvas);
 }
 
 function visibleNodes() {
-  return Object.values(nodes).filter((node) => !node.hidden);
+  return currentLine() ? Object.values(nodes) : [];
 }
 
 function statusLabel(node) {
@@ -307,7 +599,12 @@ function runLabel(run) {
 }
 
 function nodeGlyph(type) {
-  return { source: "</>", build: "⚙", artifact: "◇", deploy: "▤" }[type];
+  return {
+    source: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 9 5 12l3 3M16 9l3 3-3 3M14 5l-4 14" /></svg>',
+    build: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1" /><circle cx="12" cy="12" r="4" /></svg>',
+    artifact: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4-8 4-8-4 8-4Z" /><path d="m4 12 8 4 8-4M4 17l8 4 8-4" /></svg>',
+    deploy: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="6" rx="2" /><rect x="4" y="14" width="16" height="6" rx="2" /><path d="M8 7h.01M8 17h.01" /></svg>',
+  }[type];
 }
 
 function renderNodes() {
@@ -329,10 +626,9 @@ function renderNodes() {
           <div class="node-heading">
             <span class="node-icon">${nodeGlyph(node.type)}</span>
             <span><strong>${meta.title}</strong><small>${escapeHtml(node.provider)}</small></span>
-            <span class="node-status ${node.config}">${status}</span>
+            <span class="node-status ${node.config}" aria-label="${status}" title="${status}"><span class="visually-hidden">${status}</span></span>
           </div>
-          <p class="node-description">${meta.description}</p>
-          <div class="node-fact"><b>${escapeHtml(node.connection)}</b><span class="run-${node.run}">${runLabel(node.run)}</span></div>
+          <div class="node-fact"><span>连接</span><b>${escapeHtml(node.connection)}</b><em class="run-${node.run}">${node.run === "idle" ? "" : runLabel(node.run)}</em></div>
         </article>`;
     })
     .join("");
@@ -340,10 +636,11 @@ function renderNodes() {
   $$(".workflow-node", nodeLayer).forEach((element) => {
     let drag = null;
     element.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0) return;
+      if (event.button !== 0 || state.canvasTool !== "select") return;
       const node = nodes[element.dataset.nodeId];
       drag = { startX: node.x, startY: node.y, x: event.clientX, y: event.clientY, moved: false };
-      element.setPointerCapture(event.pointerId);
+      element.setPointerCapture?.(event.pointerId);
+      element.classList.add("dragging");
       event.stopPropagation();
     });
     element.addEventListener("pointermove", (event) => {
@@ -358,8 +655,25 @@ function renderNodes() {
       element.style.top = `${node.y}px`;
       renderEdges();
     });
-    element.addEventListener("pointerup", () => {
-      if (!drag?.moved) selectNode(element.dataset.nodeId);
+    element.addEventListener("pointerup", (event) => {
+      if (drag?.moved) {
+        saveCurrentLinePositions();
+        persistCurrentWorkflow();
+      } else if (drag) {
+        selectNode(element.dataset.nodeId);
+      }
+      element.classList.remove("dragging");
+      if (typeof element.releasePointerCapture === "function" && element.hasPointerCapture?.(event.pointerId)) {
+        element.releasePointerCapture(event.pointerId);
+      }
+      drag = null;
+    });
+    element.addEventListener("pointercancel", () => {
+      if (drag?.moved) {
+        saveCurrentLinePositions();
+        persistCurrentWorkflow();
+      }
+      element.classList.remove("dragging");
       drag = null;
     });
     element.addEventListener("keydown", (event) => {
@@ -375,22 +689,21 @@ function renderNodes() {
 
 function renderEdges() {
   const markup = edgeLayer.querySelector("defs")?.outerHTML || "";
-  const paths = edges
-    .filter(([sourceId, targetId]) => !nodes[sourceId].hidden && !nodes[targetId].hidden)
+  const paths = currentLine() ? edges
     .map(([sourceId, targetId]) => {
       const source = nodes[sourceId];
       const target = nodes[targetId];
-      const x1 = source.x + 220;
-      const y1 = source.y + 71;
+      const x1 = source.x + NODE_WIDTH;
+      const y1 = source.y + NODE_HEIGHT / 2;
       const x2 = target.x;
-      const y2 = target.y + 71;
+      const y2 = target.y + NODE_HEIGHT / 2;
       const curve = Math.max(70, Math.abs(x2 - x1) * 0.48);
       let edgeState = "";
       if (source.run === "success" && target.run === "success") edgeState = "success";
       if (target.run === "running") edgeState = "running";
       return `<path class="edge-path ${edgeState}" d="M${x1} ${y1} C${x1 + curve} ${y1},${x2 - curve} ${y2},${x2} ${y2}"></path>`;
     })
-    .join("");
+    .join("") : "";
   edgeLayer.innerHTML = markup + paths;
 }
 
@@ -399,33 +712,62 @@ function applyCanvasTransform() {
   $("#zoomValue").textContent = `${Math.round(state.zoom * 100)}%`;
 }
 
+function setCanvasTool(tool) {
+  if (tool !== "select" && tool !== "hand") return;
+  state.canvasTool = tool;
+  canvasViewport.dataset.tool = tool;
+  [["selectTool", "select"], ["handTool", "hand"]].forEach(([id, value]) => {
+    const active = value === tool;
+    $(`#${id}`).classList.toggle("active", active);
+    $(`#${id}`).setAttribute("aria-pressed", String(active));
+  });
+}
+
 function fitCanvas() {
   const width = canvasViewport.clientWidth || 760;
-  const requiredWidth = nodes.deployBranch.hidden ? 1190 : 1190;
-  state.zoom = Math.min(1, Math.max(0.58, (width - 50) / requiredWidth));
-  state.panX = 18;
-  state.panY = nodes.deployBranch.hidden ? 34 : -10;
+  const height = canvasViewport.clientHeight || 600;
+  const visible = visibleNodes();
+  if (!visible.length) return;
+  const minX = Math.min(...visible.map((node) => node.x));
+  const minY = Math.min(...visible.map((node) => node.y));
+  const maxX = Math.max(...visible.map((node) => node.x + NODE_WIDTH));
+  const maxY = Math.max(...visible.map((node) => node.y + NODE_HEIGHT));
+  const contentWidth = Math.max(NODE_WIDTH, maxX - minX);
+  const contentHeight = Math.max(NODE_HEIGHT, maxY - minY);
+  const horizontalPadding = 64;
+  const topInset = 56;
+  const bottomInset = 72;
+  const availableWidth = Math.max(120, width - horizontalPadding * 2);
+  const availableHeight = Math.max(120, height - topInset - bottomInset);
+  state.zoom = Math.min(1, Math.max(0.5, Math.min(availableWidth / contentWidth, availableHeight / contentHeight)));
+  state.panX = (width - contentWidth * state.zoom) / 2 - minX * state.zoom;
+  state.panY = topInset + (availableHeight - contentHeight * state.zoom) / 2 - minY * state.zoom;
   applyCanvasTransform();
 }
 
 function selectNode(id, mode) {
-  if (!nodes[id] || nodes[id].hidden) return;
+  if (!currentLine() || !nodes[id]) return;
   state.selectedNode = id;
   const node = nodes[id];
   state.inspectorMode = mode || (node.config === "expired" ? "repair" : node.config === "missing" ? "select" : "view");
   state.selectedCandidate = node.connection;
   studioBody.classList.remove("inspector-closed");
-  nodeLibrary.hidden = true;
   renderNodes();
   renderInspector();
 }
 
 function renderInspector() {
   const node = nodes[state.selectedNode];
+  if (!currentLine() || !node) {
+    inspectorTitle.textContent = "节点配置";
+    inspectorIcon.innerHTML = "";
+    inspectorContent.innerHTML = "";
+    inspectorFooter.innerHTML = "";
+    return;
+  }
   const meta = providerCatalog[node.type];
   inspectorTitle.textContent = meta.title;
-  inspectorType.textContent = meta.title;
-  inspectorIcon.textContent = nodeGlyph(node.type);
+  inspectorIcon.innerHTML = nodeGlyph(node.type);
 
   if (state.inspectorMode === "view") renderInspectorView(node, meta);
   if (state.inspectorMode === "select") renderInspectorSelect(node, meta);
@@ -453,7 +795,7 @@ function renderInspectorView(node, meta) {
         <button type="button" data-action="verify">重新验证</button>
       </div>
     </section>
-    <div class="notice info" style="margin-top:12px"><strong>连接可以复用</strong>这个节点保存的是连接引用；凭据由配置中心和系统密钥库统一维护。</div>`;
+    <p class="credential-note">凭据由配置中心统一维护，画布仅保存连接引用。</p>`;
   inspectorFooter.innerHTML = "";
   bindInspectorActions();
 }
@@ -600,7 +942,6 @@ function resetNodes() {
     node.fact = meta.fact;
     node.config = "ready";
     node.run = "idle";
-    if (id === "deployBranch") node.hidden = true;
   }
 }
 
@@ -625,7 +966,11 @@ function applyScenario(name) {
     selectNode("build", "view");
   } else {
     selectNode("build", "view");
+    studioBody.classList.add("inspector-closed");
   }
+  restoreCurrentLinePositions();
+  applyCurrentLineDetails();
+  renderLineList();
   renderNodes();
   updateRunButton();
   fitCanvas();
@@ -633,6 +978,11 @@ function applyScenario(name) {
 }
 
 function updateRunButton() {
+  if (!currentLine()) {
+    runButton.disabled = true;
+    runButtonText.textContent = "创建线路后上线";
+    return;
+  }
   const broken = visibleNodes().find((node) => node.config !== "ready");
   const project = currentProject();
   const running = project?.status === "running" || visibleNodes().some((node) => node.run === "running" || node.run === "pending");
@@ -641,6 +991,10 @@ function updateRunButton() {
 }
 
 function startRun() {
+  if (!currentLine()) {
+    showToast("先创建一条部署线路");
+    return;
+  }
   const broken = visibleNodes().find((node) => node.config !== "ready");
   if (broken) {
     selectNode(broken.id);
@@ -713,25 +1067,6 @@ function showToast(message) {
   showToast.timer = window.setTimeout(() => toast.classList.remove("show"), 2400);
 }
 
-function addDeploymentBranch() {
-  const branch = nodes.deployBranch;
-  if (!branch.hidden) {
-    selectNode("deployBranch");
-    showToast("这条线路已经有第二个部署运行节点");
-    return;
-  }
-  branch.hidden = false;
-  branch.connection = "尚未选择服务器";
-  branch.detail = "";
-  branch.config = "missing";
-  branch.fact = "等待设置访问地址";
-  nodeLibrary.hidden = true;
-  selectNode("deployBranch", "select");
-  fitCanvas();
-  persistCurrentWorkflow();
-  showToast("已添加部署运行节点，可以选择另一台服务器");
-}
-
 scenarioSelect.addEventListener("change", () => {
   const project = currentProject();
   if (project) {
@@ -751,54 +1086,81 @@ $("#backToProjects").addEventListener("click", () => showHome("projects"));
 $("#closeInspector").addEventListener("click", () => studioBody.classList.add("inspector-closed"));
 $("#historyButton").addEventListener("click", () => openDialog($("#historyDialog")));
 $("#closeHistory").addEventListener("click", () => closeDialog($("#historyDialog")));
-$("#addNodeButton").addEventListener("click", () => {
-  nodeLibrary.hidden = !nodeLibrary.hidden;
-  if (!nodeLibrary.hidden) $("#nodeSearch").focus();
+$("#addLineButton").addEventListener("click", createDeploymentLine);
+$("#createFirstLineButton").addEventListener("click", createDeploymentLine);
+$("#renameCurrentLineButton").addEventListener("click", () => openRenameLine());
+
+[$("#closeRenameLine"), $("#cancelRenameLine")].forEach((button) => button.addEventListener("click", () => closeDialog(renameLineDialog)));
+$("#confirmRenameLine").addEventListener("click", () => {
+  const project = currentProject();
+  const line = project && ensureProjectLines(project).find((item) => item.id === state.managingLine);
+  if (!line) return;
+  const name = $("#renameLineInput").value.trim();
+  if (!name) {
+    showToast("线路名称不能为空");
+    $("#renameLineInput").focus();
+    return;
+  }
+  line.name = name.slice(0, 24);
+  saveProjectLines(project);
+  renderLineList();
+  applyCurrentLineDetails();
+  closeDialog(renameLineDialog);
+  state.managingLine = null;
+  showToast("线路名称已保存");
 });
-$("#connectionsTab").addEventListener("click", () => showHome("connections"));
-$("#addLineButton").addEventListener("click", () => showToast("新线路会自动生成四类基础节点，只需选择目标服务器"));
+$("#renameLineInput").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    $("#confirmRenameLine").click();
+  }
+});
+
+[$("#closeDeleteLine"), $("#cancelDeleteLine")].forEach((button) => button.addEventListener("click", () => closeDialog(deleteLineDialog)));
+$("#confirmDeleteLine").addEventListener("click", () => {
+  const project = currentProject();
+  if (!project) return;
+  const lineId = state.managingLine;
+  const lines = ensureProjectLines(project);
+  if (!lineId || !lines.some((line) => line.id === lineId)) return;
+  project.lines = lines.filter((line) => line.id !== lineId);
+  removeStoredValue(linePositionStorageKey(project.id, lineId));
+  saveProjectLines(project);
+  closeDialog(deleteLineDialog);
+  state.managingLine = null;
+  if (state.selectedLine === lineId && project.lines.length) {
+    switchLine(project.lines[0].id, { savePrevious: false });
+  } else if (state.selectedLine === lineId) {
+    state.selectedLine = null;
+    state.selectedNode = null;
+    removeStoredValue(lineSelectionStorageKey(project.id));
+    studioBody.classList.add("no-lines", "inspector-closed");
+    applyCurrentLineDetails();
+    renderLineList();
+    renderNodes();
+    renderInspector();
+    updateRunButton();
+  } else {
+    renderLineList();
+  }
+  showToast("线路已删除；项目代码和复用连接不受影响");
+});
 
 $$('[data-focus-node]').forEach((button) => button.addEventListener("click", () => selectNode(button.dataset.focusNode)));
-$$('[data-library-node]').forEach((button) => button.addEventListener("click", () => {
-  const type = button.dataset.libraryNode;
-  if (type === "deploy") addDeploymentBranch();
-  else {
-    selectNode(type);
-    showToast(`当前线路已经包含“${providerCatalog[type].title}”节点`);
-  }
-}));
-
-$("#nodeSearch").addEventListener("input", (event) => {
-  const query = event.target.value.trim().toLowerCase();
-  $$('[data-library-node]').forEach((button) => {
-    button.hidden = query && !button.textContent.toLowerCase().includes(query);
-  });
-});
-
-$$('[data-line]').forEach((button) => button.addEventListener("click", () => {
-  $$('[data-line]').forEach((row) => row.classList.toggle("active", row === button));
-  const test = button.dataset.line === "test";
-  $("#canvasLineName").textContent = test ? "测试服务器" : "上线";
-  nodes.deploy.connection = test ? "测试服务器" : "腾讯云新服务器";
-  nodes.deploy.detail = test ? "42.193.229.35 · ubuntu" : "119.91.112.80 · ubuntu";
-  nodes.deploy.fact = test ? "3 个服务 · 1 个地址" : "3 个服务 · 3 个地址";
-  renderNodes();
-  if (state.selectedNode === "deploy") renderInspector();
-  persistCurrentWorkflow();
-}));
 
 $("#zoomIn").addEventListener("click", () => { state.zoom = Math.min(1.4, state.zoom + 0.1); applyCanvasTransform(); });
-$("#zoomOut").addEventListener("click", () => { state.zoom = Math.max(0.5, state.zoom - 0.1); applyCanvasTransform(); });
+$("#zoomOut").addEventListener("click", () => { state.zoom = Math.max(0.2, state.zoom - 0.1); applyCanvasTransform(); });
 $("#fitCanvas").addEventListener("click", fitCanvas);
 $("#zoomValue").addEventListener("click", fitCanvas);
+$("#selectTool").addEventListener("click", () => setCanvasTool("select"));
+$("#handTool").addEventListener("click", () => setCanvasTool("hand"));
 
 let pan = null;
 canvasViewport.addEventListener("pointerdown", (event) => {
-  if (event.target.closest(".workflow-node")) return;
+  if (event.button !== 0 || state.canvasTool !== "hand") return;
   pan = { x: event.clientX, y: event.clientY, panX: state.panX, panY: state.panY };
-  canvasViewport.setPointerCapture(event.pointerId);
+  canvasViewport.setPointerCapture?.(event.pointerId);
   canvasViewport.classList.add("panning");
-  nodeLibrary.hidden = true;
 });
 canvasViewport.addEventListener("pointermove", (event) => {
   if (!pan) return;
@@ -806,19 +1168,34 @@ canvasViewport.addEventListener("pointermove", (event) => {
   state.panY = pan.panY + event.clientY - pan.y;
   applyCanvasTransform();
 });
-canvasViewport.addEventListener("pointerup", () => { pan = null; canvasViewport.classList.remove("panning"); });
+function finishCanvasPan(event) {
+  pan = null;
+  canvasViewport.classList.remove("panning");
+  if (typeof canvasViewport.releasePointerCapture === "function" && canvasViewport.hasPointerCapture?.(event.pointerId)) {
+    canvasViewport.releasePointerCapture(event.pointerId);
+  }
+}
+canvasViewport.addEventListener("pointerup", finishCanvasPan);
+canvasViewport.addEventListener("pointercancel", finishCanvasPan);
 canvasViewport.addEventListener("wheel", (event) => {
   if (!event.ctrlKey && !event.metaKey) return;
   event.preventDefault();
-  state.zoom = Math.min(1.4, Math.max(0.5, state.zoom + (event.deltaY < 0 ? 0.06 : -0.06)));
+  state.zoom = Math.min(1.4, Math.max(0.2, state.zoom + (event.deltaY < 0 ? 0.06 : -0.06)));
   applyCanvasTransform();
 }, { passive: false });
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
-    if (!nodeLibrary.hidden) nodeLibrary.hidden = true;
-    else studioBody.classList.add("inspector-closed");
+    studioBody.classList.add("inspector-closed");
   }
+});
+
+document.addEventListener("click", (event) => {
+  if (event.target.closest(".line-actions")) return;
+  $$(".line-row.menu-open", lineList).forEach((row) => {
+    row.classList.remove("menu-open");
+    $("[data-line-more]", row)?.setAttribute("aria-expanded", "false");
+  });
 });
 
 window.addEventListener("resize", fitCanvas);
@@ -872,4 +1249,5 @@ $("#successBackHome").addEventListener("click", () => {
 });
 
 renderHomeProjects();
+setCanvasTool("select");
 showHome("projects");

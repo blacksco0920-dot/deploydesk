@@ -383,6 +383,127 @@ function deploymentPathsSettingKey(path: string) {
   return `project.${encodeURIComponent(path)}.deployment-paths.v1`;
 }
 
+export const DEPLOYMENT_PATH_CANVAS_NODE_IDS = [
+  "local",
+  "build",
+  "registry",
+  "server",
+] as const;
+
+export type DeploymentPathCanvasNodeId =
+  (typeof DEPLOYMENT_PATH_CANVAS_NODE_IDS)[number];
+
+export interface DeploymentPathCanvasPosition {
+  x: number;
+  y: number;
+}
+
+export type DeploymentPathCanvasLayout = Record<
+  DeploymentPathCanvasNodeId,
+  DeploymentPathCanvasPosition
+>;
+
+function deploymentPathCanvasLayoutSettingKey(
+  projectPath: string,
+  pathId: string,
+) {
+  return `project.${encodeURIComponent(projectPath)}.deployment-path.${encodeURIComponent(pathId)}.canvas-layout.v1`;
+}
+
+function normalizeDeploymentPathCanvasLayout(
+  candidate: unknown,
+): DeploymentPathCanvasLayout | null {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return null;
+  }
+
+  const layout = candidate as Record<string, unknown>;
+  const nodeIds = Object.keys(layout);
+  if (
+    nodeIds.length !== DEPLOYMENT_PATH_CANVAS_NODE_IDS.length ||
+    nodeIds.some(
+      (nodeId) =>
+        !DEPLOYMENT_PATH_CANVAS_NODE_IDS.includes(
+          nodeId as DeploymentPathCanvasNodeId,
+        ),
+    )
+  ) {
+    return null;
+  }
+
+  const positions = {} as DeploymentPathCanvasLayout;
+  for (const nodeId of DEPLOYMENT_PATH_CANVAS_NODE_IDS) {
+    const candidatePosition = layout[nodeId];
+    if (
+      !candidatePosition ||
+      typeof candidatePosition !== "object" ||
+      Array.isArray(candidatePosition)
+    ) {
+      return null;
+    }
+    const position = candidatePosition as Record<string, unknown>;
+    const coordinateNames = Object.keys(position);
+    if (
+      coordinateNames.length !== 2 ||
+      !coordinateNames.includes("x") ||
+      !coordinateNames.includes("y") ||
+      typeof position.x !== "number" ||
+      !Number.isFinite(position.x) ||
+      typeof position.y !== "number" ||
+      !Number.isFinite(position.y)
+    ) {
+      return null;
+    }
+    positions[nodeId] = { x: position.x, y: position.y };
+  }
+  return positions;
+}
+
+/**
+ * Canvas geometry is application state scoped to one project and deployment
+ * path. Invalid or outdated values are ignored so they cannot prevent the
+ * workflow from opening with its default layout.
+ */
+export async function getDeploymentPathCanvasLayout(
+  projectPath: string,
+  pathId: string,
+): Promise<DeploymentPathCanvasLayout | null> {
+  const value = await getAppSetting(
+    deploymentPathCanvasLayoutSettingKey(projectPath, pathId),
+  );
+  if (!value) return null;
+  try {
+    return normalizeDeploymentPathCanvasLayout(JSON.parse(value));
+  } catch {
+    return null;
+  }
+}
+
+export async function saveDeploymentPathCanvasLayout(
+  projectPath: string,
+  pathId: string,
+  layout: DeploymentPathCanvasLayout,
+): Promise<void> {
+  const normalized = normalizeDeploymentPathCanvasLayout(layout);
+  if (!normalized) {
+    throw new Error("部署线路画布布局无效");
+  }
+  await setAppSetting(
+    deploymentPathCanvasLayoutSettingKey(projectPath, pathId),
+    JSON.stringify(normalized),
+  );
+}
+
+export async function clearDeploymentPathCanvasLayout(
+  projectPath: string,
+  pathId: string,
+): Promise<void> {
+  await setAppSetting(
+    deploymentPathCanvasLayoutSettingKey(projectPath, pathId),
+    "",
+  );
+}
+
 function parseDeploymentPaths(
   value: string | null,
   projectPath: string,
@@ -538,10 +659,19 @@ export async function deleteDeploymentPath(
   pathId: string,
 ): Promise<boolean> {
   if (isTauri()) {
-    return invoke<boolean>("delete_deployment_path", {
+    const deleted = await invoke<boolean>("delete_deployment_path", {
       projectPath,
       pathId,
     });
+    if (deleted) {
+      try {
+        await clearDeploymentPathCanvasLayout(projectPath, pathId);
+      } catch {
+        // The path is already gone. Stale presentation state must not turn a
+        // successful destructive operation into a reported failure.
+      }
+    }
+    return deleted;
   }
   const paths = await listDeploymentPaths(projectPath);
   const next = paths.filter((candidate) => candidate.id !== pathId);
@@ -550,6 +680,12 @@ export async function deleteDeploymentPath(
     deploymentPathsSettingKey(projectPath),
     JSON.stringify(next),
   );
+  try {
+    await clearDeploymentPathCanvasLayout(projectPath, pathId);
+  } catch {
+    // Keep the successfully persisted deletion authoritative even if the
+    // independent canvas-layout cleanup cannot be written.
+  }
   return true;
 }
 

@@ -16,16 +16,18 @@ export function ApplicationFrame({
   onShowProjects,
 }: ApplicationFrameProps) {
   if (activeView === "project") {
-    return <div className="h-full min-h-0 bg-[var(--background)]">{children}</div>;
+    return (
+      <div className="h-full min-h-0 bg-[var(--background)]">{children}</div>
+    );
   }
 
   return (
-    <div className="grid h-full min-h-0 grid-cols-[204px_minmax(0,1fr)] bg-[var(--background)]">
-      <aside className="flex min-h-0 flex-col border-r border-[var(--border)] bg-[var(--surface)] px-3 py-3">
-        <div className="flex h-11 items-center px-2">
+    <div className="grid h-full min-h-0 grid-cols-[208px_minmax(0,1fr)] bg-[var(--background)]">
+      <aside className="flex min-h-0 flex-col border-r border-[var(--border)] bg-[var(--sidebar-background)] px-3 py-3">
+        <div className="flex h-10 items-center px-2">
           <Brand />
         </div>
-        <nav aria-label="主导航" className="mt-5 space-y-1">
+        <nav aria-label="主导航" className="mt-4 space-y-1">
           <ApplicationNavButton
             active={activeView === "projects"}
             icon={LayoutGrid}
@@ -59,7 +61,7 @@ function ApplicationNavButton({
   return (
     <button
       aria-current={active ? "page" : undefined}
-      className={`flex h-10 w-full items-center gap-3 rounded-lg px-3 text-left text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-[var(--focus)] ${active ? "bg-[var(--muted)] font-medium text-[var(--foreground)]" : "text-[var(--muted-foreground)] hover:bg-[var(--muted)]/70 hover:text-[var(--foreground)]"}`}
+      className={`flex h-10 w-full items-center gap-3 rounded-lg px-3 text-left text-sm font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-[var(--focus)] ${active ? "bg-[var(--selection-muted)] text-[var(--foreground)]" : "text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]"}`}
       onClick={onClick}
       type="button"
     >
